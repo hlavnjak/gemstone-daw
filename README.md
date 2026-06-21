@@ -72,9 +72,10 @@ src/
 ## Build & run (Linux)
 
 ```sh
-make run      # build and run the DAW
-make build    # build only
-make clean    # cargo clean (keeps the committed plugin binaries)
+make run        # build and run the DAW
+make build      # build only
+make clean      # cargo clean (keeps the committed plugin binaries)
+make clean-all  # also clean ../lesynth-fourier if it is checked out alongside
 ```
 
 The binary lands at `target/release/gemstone-daw`. The app is GUI-only and needs
