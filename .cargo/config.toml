@@ -1,0 +1,11 @@
+# The `vst3` crate's build script needs the Steinberg VST3 SDK to generate its
+# bindings. Point it there by exporting VST3_SDK_DIR in your environment, e.g.
+#
+#     export VST3_SDK_DIR=/path/to/vst3sdk
+#
+# (See the README.) It is intentionally not hardcoded here so the repo stays
+# machine-independent. The Makefile checks that it is set before building.
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"

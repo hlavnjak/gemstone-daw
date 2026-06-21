@@ -1,0 +1,16 @@
+/target
+/gemstone-daw.log
+*.log
+
+# The embedded LeSynth Fourier VST3 plugin is committed precompiled so the DAW
+# runs without needing the separate lesynth-fourier source tree. Ignore the rest
+# of internal_plugins/ (local rebuilds for other platforms, etc.) but keep the
+# shipped binaries.
+/internal_plugins/*
+!/internal_plugins/.gitkeep
+!/internal_plugins/liblesynth_fourier.so
+!/internal_plugins/lesynth_fourier.dll
+
+# Local scratch / recordings — not part of the repo.
+/my_voice.m4a
+/notes
