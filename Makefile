@@ -35,7 +35,7 @@ WIN_CPLUS_INCLUDE_PATH := $(shell echo | x86_64-w64-mingw32-g++ -E -x c++ -v - 2
 	awk '/#include <...> search starts/{f=1;next} /End of search/{f=0} f{gsub(/^ +/,"");print}' | \
 	paste -sd:)
 
-.PHONY: run build build-windows fourier fourier-windows copy-internal copy-internal-windows check-sdk clean
+.PHONY: run build build-windows fourier fourier-windows copy-internal copy-internal-windows check-sdk clean clean-all
 
 # Fail early with a helpful message if the VST3 SDK location isn't set.
 check-sdk:
@@ -111,3 +111,13 @@ build-windows: check-sdk copy-internal-windows
 clean:
 	cargo clean
 	@echo "Note: committed plugin binaries in $(INTERNAL_PLUGINS)/ are kept."
+
+# Like `clean`, but also cleans the lesynth-fourier source tree if it is checked
+# out next to this repo. No-op for the sibling on a plain public clone.
+clean-all: clean
+	@if [ -d $(FOURIER_DIR) ]; then \
+		echo "Cleaning $(FOURIER_DIR)"; \
+		cargo clean --manifest-path $(FOURIER_DIR)/Cargo.toml; \
+	else \
+		echo "$(FOURIER_DIR) not found; nothing else to clean."; \
+	fi
