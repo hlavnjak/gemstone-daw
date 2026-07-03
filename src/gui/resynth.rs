@@ -26,7 +26,7 @@
 //! Analysis mode, where individual harmonics can be toggled.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -68,29 +68,130 @@ struct SubtrackView {
     analyzed: bool,
 }
 
-pub struct ResynthPanel {
+/// A dedicated LeSynth Fourier editor instance opened for one subtrack, kept
+/// alive for as long as the window is open. The optional [`AudioEngine`] drives
+/// the instance's `process()` so the in-editor piano is audible — without it the
+/// dedicated instance is never pulled and stays silent.
+///
+/// Dropping this signals the editor window thread to close and stops its audio
+/// stream, so tearing down a file (or the whole panel) needs no extra bookkeeping.
+struct EditorInstance {
+    _plugin: Arc<PluginInstance>,
+    _handle: JoinHandle<()>,
+    close_flag: Arc<AtomicBool>,
+    _engine: Option<AudioEngine>,
+}
+
+impl Drop for EditorInstance {
+    fn drop(&mut self) {
+        self.close_flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// One opened audio file: its path, decode result, segmented subtracks, and any
+/// editor windows opened from those subtracks. Removing the file drops this whole
+/// struct, which closes its editors via [`EditorInstance`]'s `Drop`.
+struct AudioFile {
+    /// Stable id, used to key per-file egui widget state across frames.
+    id: u64,
     file_path: String,
     status: String,
     decoded: Option<DecodedAudio>,
     subtracks: Vec<SubtrackView>,
-    /// Shared library handle used for the stateless analysis FFI calls.
+    editors: Vec<EditorInstance>,
+}
+
+impl AudioFile {
+    fn new(id: u64, path: PathBuf) -> Self {
+        let mut file = Self {
+            id,
+            file_path: path.display().to_string(),
+            status: String::new(),
+            decoded: None,
+            subtracks: Vec::new(),
+            editors: Vec::new(),
+        };
+        file.decode_and_segment();
+        file
+    }
+
+    /// The trailing file name (for compact headers), falling back to the full path.
+    fn display_name(&self) -> &str {
+        let path = self.file_path.trim();
+        path.rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(path)
+    }
+
+    fn sample_rate(&self) -> f32 {
+        self.decoded.as_ref().map(|d| d.sample_rate).unwrap_or(44_100.0)
+    }
+
+    fn decode_and_segment(&mut self) {
+        let path = PathBuf::from(self.file_path.trim());
+        match decode_audio_file(&path) {
+            Ok(audio) => {
+                let subs = analysis::segment(&audio.samples, audio.sample_rate);
+                let reasonable = subs
+                    .iter()
+                    .filter(|s| s.is_reasonable(audio.sample_rate))
+                    .count();
+                self.status = format!(
+                    "Decoded {:.1}s @ {} Hz → {} subtrack(s), {} reasonable to analyse.",
+                    audio.duration_secs(),
+                    audio.sample_rate as u32,
+                    subs.len(),
+                    reasonable
+                );
+                self.subtracks = subs
+                    .into_iter()
+                    .map(|sub| SubtrackView {
+                        sub,
+                        preview_amp: None,
+                        analyzed: false,
+                    })
+                    .collect();
+                self.decoded = Some(audio);
+            }
+            Err(e) => {
+                self.status = format!("Decode failed: {}", e);
+                self.decoded = None;
+                self.subtracks.clear();
+            }
+        }
+    }
+
+    /// Decoded samples, sample rate, base frequency and pitch contour for
+    /// subtrack `idx` — the inputs the analysis FFI needs.
+    fn analysis_inputs(&self, idx: usize) -> Option<(Vec<f32>, f32, f32, Vec<f32>)> {
+        let audio = self.decoded.as_ref()?;
+        let s = &self.subtracks.get(idx)?.sub;
+        Some((
+            audio.samples[s.start..s.end.min(audio.samples.len())].to_vec(),
+            audio.sample_rate,
+            s.base_freq,
+            build_contour(s),
+        ))
+    }
+}
+
+pub struct ResynthPanel {
+    /// All currently-open audio files.
+    files: Vec<AudioFile>,
+    /// Monotonic source of stable per-file ids.
+    next_id: u64,
+    /// Panel-wide status line (add/analysis errors, hints).
+    status: String,
+    /// Shared library handle used for the stateless analysis FFI calls, reused
+    /// across every open file.
     ffi_plugin: Option<Arc<PluginInstance>>,
-    /// Editor instances opened for subtracks, kept alive. The optional
-    /// [`AudioEngine`] drives that instance's `process()` so the in-editor piano
-    /// is audible — without it the dedicated instance is never pulled and stays
-    /// silent.
-    editors: Vec<(Arc<PluginInstance>, JoinHandle<()>, Arc<AtomicBool>, Option<AudioEngine>)>,
 }
 
 impl Default for ResynthPanel {
     fn default() -> Self {
         Self {
-            file_path: String::new(),
-            status: "Pick a .wav, .mp3 or .m4a file to begin.".to_string(),
-            decoded: None,
-            subtracks: Vec::new(),
+            files: Vec::new(),
+            next_id: 0,
+            status: "Add a .wav, .mp3 or .m4a file to begin.".to_string(),
             ffi_plugin: None,
-            editors: Vec::new(),
         }
     }
 }
@@ -129,74 +230,42 @@ impl ResynthPanel {
         }
     }
 
-    /// Open a native file picker and put the chosen path into `file_path`.
-    fn browse_for_file(&mut self) {
+    /// Open a native file picker and add the chosen file as a new open file,
+    /// decoding and segmenting it immediately.
+    fn add_audio_file(&mut self) {
         let mut dialog = rfd::FileDialog::new()
             .add_filter("Audio (.wav, .mp3, .m4a)", &["wav", "mp3", "m4a"])
             .add_filter("All files", &["*"]);
-        // Start from the directory of the current entry, if any.
-        let current = PathBuf::from(self.file_path.trim());
-        if let Some(parent) = current.parent().filter(|p| p.is_dir()) {
-            dialog = dialog.set_directory(parent);
+        // Start from the directory of the most recently added file, if any.
+        if let Some(last) = self.files.last() {
+            let current = PathBuf::from(last.file_path.trim());
+            if let Some(parent) = current.parent().filter(|p| p.is_dir()) {
+                dialog = dialog.set_directory(parent);
+            }
         }
         if let Some(path) = dialog.pick_file() {
-            self.file_path = path.display().to_string();
-            self.status = format!("Selected {}", self.file_path);
+            let id = self.next_id;
+            self.next_id += 1;
+            let file = AudioFile::new(id, path);
+            self.status = file.status.clone();
+            self.files.push(file);
         }
     }
 
-    fn decode_and_segment(&mut self) {
-        let path = PathBuf::from(self.file_path.trim());
-        match decode_audio_file(&path) {
-            Ok(audio) => {
-                let subs = analysis::segment(&audio.samples, audio.sample_rate);
-                let reasonable = subs
-                    .iter()
-                    .filter(|s| s.is_reasonable(audio.sample_rate))
-                    .count();
-                self.status = format!(
-                    "Decoded {:.1}s @ {} Hz → {} subtrack(s), {} reasonable to analyse.",
-                    audio.duration_secs(),
-                    audio.sample_rate as u32,
-                    subs.len(),
-                    reasonable
-                );
-                self.subtracks = subs
-                    .into_iter()
-                    .map(|sub| SubtrackView {
-                        sub,
-                        preview_amp: None,
-                        analyzed: false,
-                    })
-                    .collect();
-                self.decoded = Some(audio);
-            }
-            Err(e) => {
-                self.status = format!("Decode failed: {}", e);
-                self.decoded = None;
-                self.subtracks.clear();
-            }
-        }
-    }
-
-    /// Compute the inline preview grid for subtrack `idx` via the plugin's
-    /// stateless analysis FFI.
-    fn preview_subtrack(&mut self, idx: usize) {
-        let (samples, sr, freq, contour) = {
-            let Some(audio) = &self.decoded else { return };
-            let Some(view) = self.subtracks.get(idx) else { return };
-            let s = &view.sub;
-            (
-                audio.samples[s.start..s.end.min(audio.samples.len())].to_vec(),
-                audio.sample_rate,
-                s.base_freq,
-                build_contour(s),
-            )
+    /// Compute the inline preview grid for subtrack `sub_idx` of file `file_idx`
+    /// via the plugin's stateless analysis FFI.
+    fn preview_subtrack(&mut self, file_idx: usize, sub_idx: usize) {
+        let Some((samples, sr, freq, contour)) =
+            self.files.get(file_idx).and_then(|f| f.analysis_inputs(sub_idx))
+        else {
+            return;
         };
         let Some(plugin) = self.ensure_ffi_plugin() else { return };
         match plugin.analyze(&samples, sr, freq, &contour, PREVIEW_BUCKETS, PREVIEW_HARMONICS) {
             Ok((amp, _phase)) => {
-                if let Some(view) = self.subtracks.get_mut(idx) {
+                if let Some(view) =
+                    self.files.get_mut(file_idx).and_then(|f| f.subtracks.get_mut(sub_idx))
+                {
                     view.preview_amp = Some(amp);
                 }
             }
@@ -204,19 +273,13 @@ impl ResynthPanel {
         }
     }
 
-    /// Open a dedicated LeSynth Fourier instance for subtrack `idx`, push the
-    /// audio for analysis, and show its editor (Analysis mode).
-    fn open_in_lesynth(&mut self, idx: usize) {
-        let (samples, sr, freq, contour) = {
-            let Some(audio) = &self.decoded else { return };
-            let Some(view) = self.subtracks.get(idx) else { return };
-            let s = &view.sub;
-            (
-                audio.samples[s.start..s.end.min(audio.samples.len())].to_vec(),
-                audio.sample_rate,
-                s.base_freq,
-                build_contour(s),
-            )
+    /// Open a dedicated LeSynth Fourier instance for subtrack `sub_idx` of file
+    /// `file_idx`, push the audio for analysis, and show its editor (Analysis mode).
+    fn open_in_lesynth(&mut self, file_idx: usize, sub_idx: usize) {
+        let Some((samples, sr, freq, contour)) =
+            self.files.get(file_idx).and_then(|f| f.analysis_inputs(sub_idx))
+        else {
+            return;
         };
 
         let Some(path) = Self::internal_plugin_path() else {
@@ -261,16 +324,23 @@ impl ResynthPanel {
                     }
                 };
                 let audible = engine.is_some();
-                self.editors.push((inst, handle, close_flag, engine));
-                if let Some(view) = self.subtracks.get_mut(idx) {
-                    view.analyzed = true;
+                if let Some(file) = self.files.get_mut(file_idx) {
+                    file.editors.push(EditorInstance {
+                        _plugin: inst,
+                        _handle: handle,
+                        close_flag,
+                        _engine: engine,
+                    });
+                    if let Some(view) = file.subtracks.get_mut(sub_idx) {
+                        view.analyzed = true;
+                    }
                 }
                 self.status = if audible {
-                    format!("Opened subtrack {} in LeSynth (Analysis mode).", idx + 1)
+                    format!("Opened subtrack {} in LeSynth (Analysis mode).", sub_idx + 1)
                 } else {
                     format!(
                         "Opened subtrack {} in LeSynth (Analysis mode) — audio output unavailable.",
-                        idx + 1
+                        sub_idx + 1
                     )
                 };
             }
@@ -309,112 +379,137 @@ impl ResynthPanel {
         }
     }
 
+    /// Draw one subtrack card. Returns the action the user clicked, if any, so
+    /// the caller can run it after the borrow of `self` ends.
+    fn draw_subtrack(ui: &mut egui::Ui, view: &SubtrackView, sr: f32, idx: usize) -> Option<SubtrackAction> {
+        let sub = &view.sub;
+        let reasonable = sub.is_reasonable(sr);
+        let mut action = None;
+        let fill = if reasonable {
+            egui::Color32::from_rgb(28, 42, 38)
+        } else {
+            egui::Color32::from_gray(34)
+        };
+        egui::Frame::new()
+            .fill(fill)
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Subtrack {}", idx + 1)).strong());
+                    ui.label(format!(
+                        "{:.0} Hz · {:.2}s · conf {:.2} · @{:.2}s",
+                        sub.base_freq,
+                        sub.duration_secs(sr),
+                        sub.confidence,
+                        sub.start as f32 / sr
+                    ));
+                    if !reasonable {
+                        ui.label(
+                            egui::RichText::new("(skipped — not pitched enough)")
+                                .italics()
+                                .color(egui::Color32::from_gray(160)),
+                        );
+                    } else if view.analyzed {
+                        ui.label(
+                            egui::RichText::new("● in LeSynth")
+                                .color(egui::Color32::from_rgb(130, 230, 150)),
+                        );
+                    }
+                });
+                if reasonable {
+                    ui.horizontal(|ui| {
+                        if ui.button("Preview FFT").clicked() {
+                            action = Some(SubtrackAction::Preview);
+                        }
+                        if ui.button("Open in LeSynth").clicked() {
+                            action = Some(SubtrackAction::Open);
+                        }
+                    });
+                    if let Some(grid) = &view.preview_amp {
+                        Self::draw_amp_preview(ui, grid);
+                    }
+                }
+            });
+        ui.add_space(4.0);
+        action
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Resynthesis (.wav / .mp3 / .m4a → LeSynth Fourier)");
         ui.horizontal(|ui| {
-            ui.label("File:");
-            if ui.button("Browse…").clicked() {
-                self.browse_for_file();
+            if ui.button("➕ Add audio file…").clicked() {
+                self.add_audio_file();
             }
-            ui.add(
-                egui::TextEdit::singleline(&mut self.file_path)
-                    .hint_text("/path/to/audio.wav")
-                    .desired_width(f32::INFINITY),
-            );
+            ui.label(&self.status);
         });
-        ui.horizontal(|ui| {
-            if ui.button("Decode & Segment").clicked() {
-                self.decode_and_segment();
-            }
-            if ui.button("Close all editors").clicked() {
-                for (_, _, flag, _) in &self.editors {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                // Dropping the editors also drops their AudioEngines, stopping
-                // each instance's audio stream.
-                self.editors.clear();
-            }
-        });
-        ui.label(&self.status);
         ui.add_space(8.0);
 
-        let sr = self.decoded.as_ref().map(|d| d.sample_rate).unwrap_or(44_100.0);
-        let count = self.subtracks.len();
-        let mut to_preview: Option<usize> = None;
-        let mut to_open: Option<usize> = None;
+        // Deferred actions, so we don't mutate `self` while iterating/borrowing it.
+        let mut to_remove: Option<usize> = None;
+        let mut to_close_editors: Option<usize> = None;
+        let mut pending: Option<(usize, usize, SubtrackAction)> = None;
 
-        egui::ScrollArea::vertical()
-            .max_height(360.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for idx in 0..count {
-                    let (start, dur, freq, conf, reasonable, analyzed) = {
-                        let v = &self.subtracks[idx];
-                        (
-                            v.sub.start,
-                            v.sub.duration_secs(sr),
-                            v.sub.base_freq,
-                            v.sub.confidence,
-                            v.sub.is_reasonable(sr),
-                            v.analyzed,
-                        )
-                    };
-                    let fill = if reasonable {
-                        egui::Color32::from_rgb(28, 42, 38)
-                    } else {
-                        egui::Color32::from_gray(34)
-                    };
-                    egui::Frame::new()
-                        .fill(fill)
-                        .inner_margin(egui::Margin::same(6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("Subtrack {}", idx + 1)).strong(),
-                                );
-                                ui.label(format!(
-                                    "{:.0} Hz · {:.2}s · conf {:.2} · @{:.2}s",
-                                    freq,
-                                    dur,
-                                    conf,
-                                    start as f32 / sr
-                                ));
-                                if !reasonable {
-                                    ui.label(
-                                        egui::RichText::new("(skipped — not pitched enough)")
-                                            .italics()
-                                            .color(egui::Color32::from_gray(160)),
-                                    );
-                                } else if analyzed {
-                                    ui.label(
-                                        egui::RichText::new("● in LeSynth")
-                                            .color(egui::Color32::from_rgb(130, 230, 150)),
-                                    );
-                                }
-                            });
-                            if reasonable {
-                                ui.horizontal(|ui| {
-                                    if ui.button("Preview FFT").clicked() {
-                                        to_preview = Some(idx);
-                                    }
-                                    if ui.button("Open in LeSynth").clicked() {
-                                        to_open = Some(idx);
-                                    }
-                                });
-                                if let Some(grid) = &self.subtracks[idx].preview_amp {
-                                    Self::draw_amp_preview(ui, grid);
-                                }
-                            }
-                        });
+        for (file_idx, file) in self.files.iter().enumerate() {
+            let sr = file.sample_rate();
+            let editor_count = file.editors.len();
+            let header_id = ui.make_persistent_id(("resynth_file", file.id));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), header_id, true)
+                .show_header(ui, |ui| {
+                    ui.label(egui::RichText::new(file.display_name()).strong());
+                    ui.label(
+                        egui::RichText::new(format!("({} subtracks)", file.subtracks.len()))
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    // Right-aligned controls: remove the whole file, and optionally
+                    // just close its open editors.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("🗑 Remove").on_hover_text("Remove this file and all its subtracks").clicked() {
+                            to_remove = Some(file_idx);
+                        }
+                        if editor_count > 0
+                            && ui.button(format!("Close editors ({})", editor_count)).clicked()
+                        {
+                            to_close_editors = Some(file_idx);
+                        }
+                    });
+                })
+                .body(|ui| {
+                    ui.label(egui::RichText::new(&file.status).color(egui::Color32::from_gray(180)));
                     ui.add_space(4.0);
-                }
-            });
-
-        if let Some(idx) = to_preview {
-            self.preview_subtrack(idx);
+                    for (sub_idx, view) in file.subtracks.iter().enumerate() {
+                        if let Some(action) = Self::draw_subtrack(ui, view, sr, sub_idx) {
+                            pending = Some((file_idx, sub_idx, action));
+                        }
+                    }
+                });
+            ui.add_space(6.0);
         }
-        if let Some(idx) = to_open {
-            self.open_in_lesynth(idx);
+
+        if let Some(idx) = to_close_editors {
+            // Dropping the editors closes their windows (via `EditorInstance`'s
+            // `Drop`) and stops each instance's audio stream.
+            if let Some(file) = self.files.get_mut(idx) {
+                file.editors.clear();
+            }
+        }
+        if let Some(idx) = to_remove {
+            if idx < self.files.len() {
+                let removed = self.files.remove(idx);
+                self.status = format!("Removed {}.", removed.display_name());
+            }
+        }
+        if let Some((file_idx, sub_idx, action)) = pending {
+            match action {
+                SubtrackAction::Preview => self.preview_subtrack(file_idx, sub_idx),
+                SubtrackAction::Open => self.open_in_lesynth(file_idx, sub_idx),
+            }
         }
     }
+}
+
+/// A user action requested on a subtrack card, resolved after the UI borrow ends.
+#[derive(Clone, Copy)]
+enum SubtrackAction {
+    Preview,
+    Open,
 }
