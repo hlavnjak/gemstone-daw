@@ -435,14 +435,23 @@ impl ResynthPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Resynthesis (.wav / .mp3 / .m4a → LeSynth Fourier)");
+        ui.label(
+            egui::RichText::new(".wav / .mp3 / .m4a → LeSynth Fourier")
+                .italics()
+                .color(egui::Color32::from_gray(150)),
+        );
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("➕ Add audio file…").clicked() {
                 self.add_audio_file();
             }
-            ui.label(&self.status);
+            ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_gray(170)));
         });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
+        if !self.files.is_empty() {
+            ui.separator();
+            ui.add_space(4.0);
+        }
 
         // Deferred actions, so we don't mutate `self` while iterating/borrowing it.
         let mut to_remove: Option<usize> = None;
@@ -453,36 +462,53 @@ impl ResynthPanel {
             let sr = file.sample_rate();
             let editor_count = file.editors.len();
             let header_id = ui.make_persistent_id(("resynth_file", file.id));
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), header_id, true)
-                .show_header(ui, |ui| {
-                    ui.label(egui::RichText::new(file.display_name()).strong());
-                    ui.label(
-                        egui::RichText::new(format!("({} subtracks)", file.subtracks.len()))
-                            .color(egui::Color32::from_gray(160)),
-                    );
-                    // Right-aligned controls: remove the whole file, and optionally
-                    // just close its open editors.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("🗑 Remove").on_hover_text("Remove this file and all its subtracks").clicked() {
-                            to_remove = Some(file_idx);
-                        }
-                        if editor_count > 0
-                            && ui.button(format!("Close editors ({})", editor_count)).clicked()
-                        {
-                            to_close_editors = Some(file_idx);
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        header_id,
+                        true,
+                    )
+                    .show_header(ui, |ui| {
+                        ui.label(egui::RichText::new(file.display_name()).strong());
+                        ui.label(
+                            egui::RichText::new(format!("· {} subtracks", file.subtracks.len()))
+                                .color(egui::Color32::from_gray(150)),
+                        );
+                        // Right-aligned controls: remove the whole file, and
+                        // optionally just close its open editors.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("🗑 Remove")
+                                .on_hover_text("Remove this file and all its subtracks")
+                                .clicked()
+                            {
+                                to_remove = Some(file_idx);
+                            }
+                            if editor_count > 0
+                                && ui.button(format!("Close editors ({})", editor_count)).clicked()
+                            {
+                                to_close_editors = Some(file_idx);
+                            }
+                        });
+                    })
+                    .body(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(&file.status)
+                                .color(egui::Color32::from_gray(180)),
+                        );
+                        ui.add_space(4.0);
+                        for (sub_idx, view) in file.subtracks.iter().enumerate() {
+                            if let Some(action) = Self::draw_subtrack(ui, view, sr, sub_idx) {
+                                pending = Some((file_idx, sub_idx, action));
+                            }
                         }
                     });
-                })
-                .body(|ui| {
-                    ui.label(egui::RichText::new(&file.status).color(egui::Color32::from_gray(180)));
-                    ui.add_space(4.0);
-                    for (sub_idx, view) in file.subtracks.iter().enumerate() {
-                        if let Some(action) = Self::draw_subtrack(ui, view, sr, sub_idx) {
-                            pending = Some((file_idx, sub_idx, action));
-                        }
-                    }
                 });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         }
 
         if let Some(idx) = to_close_editors {
