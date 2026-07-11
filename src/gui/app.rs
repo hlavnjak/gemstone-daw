@@ -279,44 +279,58 @@ impl DawApp {
 
     fn midi_section(&mut self, ui: &mut egui::Ui) {
         Self::section(ui, "MIDI", |ui| {
+            // Lay the two device pickers out in a grid so their labels and
+            // combo boxes share aligned columns instead of drifting out of line
+            // when placed side by side in a wrapping row.
+            egui::Grid::new("midi_devices")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    // USB keyboard picker
+                    ui.label("USB keyboard:");
+                    let usb_label = self
+                        .selected_usb_keyboard
+                        .clone()
+                        .unwrap_or_else(|| "Select USB keyboard…".to_string());
+                    egui::ComboBox::from_id_salt("usb_keyboard")
+                        .width(260.0)
+                        .selected_text(usb_label)
+                        .show_ui(ui, |ui| {
+                            if self.usb_keyboards.is_empty() {
+                                ui.label("No USB keyboards detected");
+                            }
+                            for kb in self.usb_keyboards.clone() {
+                                ui.selectable_value(
+                                    &mut self.selected_usb_keyboard,
+                                    Some(kb.clone()),
+                                    kb,
+                                );
+                            }
+                        });
+                    ui.end_row();
+
+                    // General MIDI port picker
+                    ui.label("MIDI port:");
+                    let port_label = self
+                        .selected_midi_port
+                        .clone()
+                        .unwrap_or_else(|| "Select MIDI port…".to_string());
+                    egui::ComboBox::from_id_salt("midi_port")
+                        .width(260.0)
+                        .selected_text(port_label)
+                        .show_ui(ui, |ui| {
+                            for port in self.midi_ports.clone() {
+                                ui.selectable_value(
+                                    &mut self.selected_midi_port,
+                                    Some(port.clone()),
+                                    port,
+                                );
+                            }
+                        });
+                    ui.end_row();
+                });
+            ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                // USB keyboard picker
-                let usb_label = self
-                    .selected_usb_keyboard
-                    .clone()
-                    .unwrap_or_else(|| "Select USB keyboard…".to_string());
-                egui::ComboBox::from_id_salt("usb_keyboard")
-                    .selected_text(usb_label)
-                    .show_ui(ui, |ui| {
-                        if self.usb_keyboards.is_empty() {
-                            ui.label("No USB keyboards detected");
-                        }
-                        for kb in self.usb_keyboards.clone() {
-                            ui.selectable_value(
-                                &mut self.selected_usb_keyboard,
-                                Some(kb.clone()),
-                                kb,
-                            );
-                        }
-                    });
-
-                // General MIDI port picker
-                let port_label = self
-                    .selected_midi_port
-                    .clone()
-                    .unwrap_or_else(|| "Select MIDI port…".to_string());
-                egui::ComboBox::from_id_salt("midi_port")
-                    .selected_text(port_label)
-                    .show_ui(ui, |ui| {
-                        for port in self.midi_ports.clone() {
-                            ui.selectable_value(
-                                &mut self.selected_midi_port,
-                                Some(port.clone()),
-                                port,
-                            );
-                        }
-                    });
-
                 if ui.button("Connect").clicked() {
                     self.connect_midi();
                 }
