@@ -346,8 +346,11 @@ impl DawApp {
 
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keep repainting so the panels stay live.
-        ctx.request_repaint();
+        // Reactive repaint: nothing in this window changes without user input, so
+        // let eframe/winit idle and wake on real events (egui still self-requests
+        // repaints for its own hover/tooltip/scroll animations). When live state is
+        // added (playback meters, async analysis), gate a `ctx.request_repaint()`
+        // on that activity here.
 
         // App title bar.
         egui::TopBottomPanel::top("title_bar")
