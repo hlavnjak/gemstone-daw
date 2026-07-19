@@ -11,24 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-
 use eframe::egui;
 
-use crate::audio::AudioEngine;
 use crate::midi::{self, MidiEventQueue};
-use crate::vst::{class_ids, PluginInstance};
 
 use super::resynth::ResynthPanel;
-
-const DEFAULT_PLUGIN_PATH: &str =
-    "/home/kuba/Programming/Fine_Ware_SW/lesynth-fourier/target/x86_64-unknown-linux-gnu/release/liblesynth_fourier.so";
+use super::track::TracksPanel;
 
 pub struct DawApp {
-    plugin_path: String,
-    plugin_status: String,
     midi_status: String,
     midi_ports: Vec<String>,
     selected_midi_port: Option<String>,
@@ -36,34 +26,27 @@ pub struct DawApp {
     selected_usb_keyboard: Option<String>,
 
     // Runtime state
-    plugin: Option<Arc<PluginInstance>>,
-    audio_engine: Option<AudioEngine>,
     midi_queue: MidiEventQueue,
     _midi_connection: Option<midir::MidiInputConnection<()>>,
-    /// The plugin's editor window, present only while it is open. Kept so repeat
-    /// "Show Editor" clicks focus intent on one window instead of spawning
-    /// duplicates, and so unloading can tear the window down before the plugin.
-    editor: Option<super::editor_window::EditorHandle>,
 
+    // Instrument tracks (LeSynth Fourier / custom VST), each with its own editor.
+    tracks: TracksPanel,
     // Resynthesis (.wav/.mp3/.m4a → LeSynth Fourier analysis)
     resynth: ResynthPanel,
 }
 
 impl Default for DawApp {
     fn default() -> Self {
+        let midi_queue = midi::new_midi_queue();
         Self {
-            plugin_path: DEFAULT_PLUGIN_PATH.to_string(),
-            plugin_status: "No plugin loaded".to_string(),
             midi_status: "Disconnected".to_string(),
             midi_ports: Vec::new(),
             selected_midi_port: None,
             usb_keyboards: Vec::new(),
             selected_usb_keyboard: None,
-            plugin: None,
-            audio_engine: None,
-            midi_queue: midi::new_midi_queue(),
+            tracks: TracksPanel::new(midi_queue.clone()),
+            midi_queue,
             _midi_connection: None,
-            editor: None,
             resynth: ResynthPanel::default(),
         }
     }
@@ -145,125 +128,6 @@ impl DawApp {
         self.usb_keyboards = midi::list_usb_midi_keyboards().unwrap_or_default();
     }
 
-    fn do_load_plugin(&mut self, path: &std::path::Path) {
-        log::info!("Loading plugin from: {:?}", path);
-        match PluginInstance::load(path, Some(&class_ids::FOURIER_SYNTH)) {
-            Ok(instance) => {
-                log::info!("Plugin loaded OK");
-                let plugin = Arc::new(instance);
-
-                match AudioEngine::query_device_config() {
-                    Ok(cfg) => {
-                        if let Err(e) =
-                            plugin.initialize_audio(cfg.sample_rate, cfg.max_buffer_size as i32)
-                        {
-                            self.plugin_status = format!("Audio init failed: {}", e);
-                            self.plugin = Some(plugin);
-                            return;
-                        }
-
-                        match AudioEngine::start(plugin.processor.clone(), self.midi_queue.clone()) {
-                            Ok(engine) => {
-                                self.plugin_status = format!(
-                                    "Plugin loaded & playing ({}Hz, {} ch)",
-                                    engine.config.sample_rate as u32,
-                                    engine.config.channels
-                                );
-                                self.audio_engine = Some(engine);
-                            }
-                            Err(e) => {
-                                self.plugin_status = format!("Audio start failed: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.plugin_status = format!("No audio device: {}", e);
-                    }
-                }
-
-                self.plugin = Some(plugin);
-            }
-            Err(e) => {
-                log::error!("Plugin load FAILED: {}", e);
-                self.plugin_status = format!("Load failed: {}", e);
-            }
-        }
-    }
-
-    fn load_internal_plugin(&mut self) {
-        #[cfg(target_os = "linux")]
-        let lib_name = "liblesynth_fourier.so";
-        #[cfg(target_os = "macos")]
-        let lib_name = "liblesynth_fourier.dylib";
-        #[cfg(target_os = "windows")]
-        let lib_name = "lesynth_fourier.dll";
-
-        match std::env::current_dir()
-            .ok()
-            .map(|cwd| cwd.join("internal_plugins").join(lib_name))
-        {
-            Some(path) => self.do_load_plugin(&path),
-            None => {
-                self.plugin_status = "Could not determine working directory".to_string();
-            }
-        }
-    }
-
-    fn unload_plugin(&mut self) {
-        // Tear the editor window down *before* the plugin: its thread holds a
-        // view into the plugin module, so dropping the library out from under it
-        // would be unsound. Joining guarantees `view.removed()` has run first.
-        self.close_editor();
-        self.audio_engine = None;
-        self.plugin = None;
-        self.plugin_status = "No plugin loaded".to_string();
-    }
-
-    /// Drop the editor handle if its window has already been closed by the user,
-    /// so button state and dedup logic reflect reality.
-    fn reap_editor(&mut self) {
-        if self
-            .editor
-            .as_ref()
-            .is_some_and(|e| e.closed.load(Ordering::Relaxed))
-        {
-            self.editor = None;
-        }
-    }
-
-    fn show_editor(&mut self) {
-        self.reap_editor();
-        if self.editor.is_some() {
-            self.plugin_status = "Editor already open".to_string();
-            return;
-        }
-        if let Some(ref plugin) = self.plugin {
-            log::info!("Opening plugin editor...");
-            match super::editor_window::open_editor_in_thread(plugin) {
-                Ok(handle) => {
-                    self.editor = Some(handle);
-                    self.plugin_status = "Editor opened".to_string();
-                }
-                Err(e) => {
-                    log::error!("Editor error: {}", e);
-                    self.plugin_status = format!("Editor failed: {}", e);
-                }
-            }
-        } else {
-            self.plugin_status = "Load a plugin first".to_string();
-        }
-    }
-
-    /// Ask the editor window to close and wait for its thread to finish, so the
-    /// plugin view is detached before we touch the plugin again.
-    fn close_editor(&mut self) {
-        if let Some(handle) = self.editor.take() {
-            handle.close_flag.store(true, Ordering::Relaxed);
-            let _ = handle.handle.join();
-            self.plugin_status = "Editor closed".to_string();
-        }
-    }
-
     fn connect_midi(&mut self) {
         // Prefer USB keyboard selection, fall back to general MIDI port
         let port_filter = self
@@ -282,41 +146,6 @@ impl DawApp {
                 self.midi_status = format!("MIDI error: {}", e);
             }
         }
-    }
-
-    fn plugin_section(&mut self, ui: &mut egui::Ui) {
-        Self::section(ui, "Plugin", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Path:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.plugin_path)
-                        .hint_text("Plugin path…")
-                        .desired_width(f32::INFINITY),
-                );
-            });
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Load").clicked() {
-                    let path = PathBuf::from(self.plugin_path.clone());
-                    self.do_load_plugin(&path);
-                }
-                if ui.button("Load Internal — LeSynth Fourier").clicked() {
-                    self.load_internal_plugin();
-                }
-                if self.editor.is_some() {
-                    if ui.button("✖ Close Editor").clicked() {
-                        self.close_editor();
-                    }
-                } else if ui.button("Show Editor").clicked() {
-                    self.show_editor();
-                }
-                if ui.button("Unload").clicked() {
-                    self.unload_plugin();
-                }
-            });
-            ui.add_space(2.0);
-            Self::status_label(ui, &self.plugin_status);
-        });
     }
 
     fn midi_section(&mut self, ui: &mut egui::Ui) {
@@ -390,16 +219,9 @@ impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reactive repaint: nothing in this window changes without user input, so
         // let eframe/winit idle and wake on real events (egui still self-requests
-        // repaints for its own hover/tooltip/scroll animations). When live state is
-        // added (playback meters, async analysis), gate a `ctx.request_repaint()`
-        // on that activity here.
-
-        // Reap the editor if its window was closed directly, and while it is open
-        // poll a few times a second so the button state tracks the real window.
-        self.reap_editor();
-        if self.editor.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
+        // repaints for its own hover/tooltip/scroll animations). The Tracks and
+        // Resynthesis panels each request a low-frequency repaint while they hold
+        // an open editor, so windows the user closes directly are reaped promptly.
 
         // App title bar.
         egui::TopBottomPanel::top("title_bar")
@@ -430,7 +252,9 @@ impl eframe::App for DawApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add_space(6.0);
-                    self.plugin_section(ui);
+                    Self::section(ui, "Tracks", |ui| {
+                        self.tracks.ui(ui);
+                    });
                     ui.add_space(14.0);
                     self.midi_section(ui);
                     ui.add_space(14.0);

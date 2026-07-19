@@ -19,6 +19,12 @@ use midir::{MidiInput, MidiInputConnection};
 
 pub type MidiEventQueue = Arc<Mutex<VecDeque<[u8; 3]>>>;
 
+/// Cap on buffered MIDI messages. The queue is drained by an audio engine only
+/// while a track/subtrack editor is open; without this bound, playing a
+/// connected keyboard with no editor open would grow it without limit (and flood
+/// on the next open). Dropping the oldest keeps at most a brief burst.
+const MAX_QUEUED_EVENTS: usize = 1024;
+
 /// Create a new empty MIDI event queue.
 pub fn new_midi_queue() -> MidiEventQueue {
     Arc::new(Mutex::new(VecDeque::new()))
@@ -107,6 +113,9 @@ pub fn spawn_midi_thread(
             move |_stamp, message, _| {
                 if message.len() >= 3 {
                     let mut queue = midi_events.lock().unwrap();
+                    if queue.len() >= MAX_QUEUED_EVENTS {
+                        queue.pop_front();
+                    }
                     queue.push_back([message[0], message[1], message[2]]);
                 }
             },

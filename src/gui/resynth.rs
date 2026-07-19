@@ -26,12 +26,11 @@
 //! Analysis mode, where individual harmonics can be toggled.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use eframe::egui;
 
+use super::track::EditorInstance;
 use crate::analysis::{self, Subtrack};
 use crate::audio::{decode_audio_file, AudioEngine, DecodedAudio};
 use crate::midi::new_midi_queue;
@@ -69,49 +68,6 @@ struct SubtrackView {
     /// window is open. While this is `Some`, "Open in LeSynth" is replaced by a
     /// "Close" control, so repeat clicks never spawn duplicate instances.
     editor: Option<EditorInstance>,
-}
-
-/// A dedicated LeSynth Fourier editor instance opened for one subtrack, kept
-/// alive for as long as the window is open. The optional [`AudioEngine`] drives
-/// the instance's `process()` so the in-editor piano is audible — without it the
-/// dedicated instance is never pulled and stays silent.
-///
-/// Dropping this signals the editor window thread to close and stops its audio
-/// stream, so tearing down a subtrack (or the whole panel) needs no extra
-/// bookkeeping. Conversely, when the user closes the window directly, the editor
-/// thread sets `closed`; the panel polls it each frame and drops this to reclaim
-/// the audio stream and plugin.
-struct EditorInstance {
-    // Field order matters for `Drop`: after `drop()` joins the window thread,
-    // fields drop top-to-bottom, so `_plugin` (which unloads the shared library
-    // the thread's view lives in) must come *after* `handle`.
-    handle: Option<JoinHandle<()>>,
-    _plugin: Arc<PluginInstance>,
-    close_flag: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    _engine: Option<AudioEngine>,
-}
-
-impl EditorInstance {
-    /// True once the editor window has gone away — whether the user closed it or
-    /// we asked it to via `close_flag`.
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for EditorInstance {
-    fn drop(&mut self) {
-        // Ask the window thread to exit, then wait for it: it detaches the plugin
-        // view (`view.removed()`) as it unwinds, which must happen before the
-        // `_plugin` Arc below unloads the library the view points into. If the
-        // user already closed the window, the thread has finished and this joins
-        // instantly.
-        self.close_flag.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 /// One opened audio file: its path, decode result, and segmented subtracks. Each
@@ -368,34 +324,16 @@ impl ResynthPanel {
             return;
         }
 
-        match super::editor_window::open_editor_in_thread(&inst) {
-            Ok(super::editor_window::EditorHandle {
-                handle,
-                close_flag,
-                closed,
-            }) => {
-                // Drive this dedicated instance's `process()` with its own audio
-                // stream so the in-editor piano is audible. The piano writes
-                // voices directly into the instance's shared state, so an empty
-                // MIDI queue is fine here.
-                let engine = match AudioEngine::start(inst.processor.clone(), new_midi_queue()) {
-                    Ok(e) => Some(e),
-                    Err(e) => {
-                        log::warn!("Resynth instance audio start failed: {}", e);
-                        None
-                    }
-                };
-                let audible = engine.is_some();
+        // Drive the dedicated instance's `process()` with its own audio stream so
+        // the in-editor piano is audible. The piano writes voices directly into
+        // the instance's shared state, so an empty MIDI queue is fine here.
+        match EditorInstance::open(inst, new_midi_queue()) {
+            Ok(editor) => {
+                let audible = editor.is_audible();
                 if let Some(view) =
                     self.files.get_mut(file_idx).and_then(|f| f.subtracks.get_mut(sub_idx))
                 {
-                    view.editor = Some(EditorInstance {
-                        handle: Some(handle),
-                        _plugin: inst,
-                        close_flag,
-                        closed,
-                        _engine: engine,
-                    });
+                    view.editor = Some(editor);
                 }
                 self.status = if audible {
                     format!("Opened subtrack {} in LeSynth (Analysis mode).", sub_idx + 1)

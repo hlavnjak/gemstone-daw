@@ -14,5 +14,6 @@
 pub mod app;
 pub mod editor_window;
 pub mod resynth;
+pub mod track;
 
 pub use app::DawApp;
