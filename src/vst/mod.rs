@@ -15,5 +15,5 @@ pub mod event_list;
 pub mod handler;
 pub mod host;
 
-pub use host::{PluginInstance, class_ids};
+pub use host::{class_ids, next_instance_token, PluginInstance};
 pub use event_list::EventList;

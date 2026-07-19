@@ -73,7 +73,7 @@ fn d5_wav_produces_amp_and_phase_curves() {
 
     // 3) Load a real LeSynth Fourier instance (this opens the plugin's shared
     //    object — the same one whose editor would display these curves).
-    let plugin = PluginInstance::load(&plugin_path, Some(&class_ids::FOURIER_SYNTH))
+    let plugin = PluginInstance::load(&plugin_path, Some(&class_ids::FOURIER_SYNTH), None)
         .expect("load internal LeSynth Fourier");
 
     // 4) Analyse each subtrack and validate the produced curves.

@@ -34,7 +34,8 @@ use eframe::egui;
 use super::editor_window::{open_editor_in_thread, EditorHandle};
 use crate::audio::AudioEngine;
 use crate::midi::MidiEventQueue;
-use crate::vst::{class_ids, PluginInstance};
+use crate::track_format::TrackState;
+use crate::vst::{class_ids, next_instance_token, PluginInstance};
 
 /// A live plugin editor: the loaded instance, its editor-window thread and an
 /// audio stream driving `process()` so the plugin's in-GUI piano is audible.
@@ -94,6 +95,12 @@ impl EditorInstance {
     pub fn is_audible(&self) -> bool {
         self.engine.is_some()
     }
+
+    /// Snapshot the live LeSynth grid into a [`TrackState`] for saving. Errors if
+    /// the instance wasn't tagged (non-LeSynth) or has no grid.
+    pub fn export_state(&self) -> Result<TrackState> {
+        self._plugin.export_state()
+    }
 }
 
 impl Drop for EditorInstance {
@@ -110,36 +117,68 @@ impl Drop for EditorInstance {
     }
 }
 
+/// Track flavour. Only LeSynth tracks carry the harmonic grid that can be
+/// exported/imported; custom VST tracks are create-only.
+#[derive(Clone, Copy, PartialEq)]
+enum TrackKind {
+    LeSynth,
+    CustomVst,
+}
+
 /// One instrument track: persistent metadata plus its editor while open.
 struct PluginTrack {
     /// Stable id, used to key per-track egui widget state across frames.
     id: u64,
     /// Display name (the plugin kind, or the chosen `.so` file name).
     name: String,
+    kind: TrackKind,
     /// Library to (re)load whenever the editor is opened.
     plugin_path: PathBuf,
     /// Class ID to select from the factory; `None` takes the first class.
     class_id: Option<[i8; 16]>,
+    /// A saved grid to push into the instance when its editor is opened (set for
+    /// tracks created via "Load LeSynth Fourier Track").
+    import_state: Option<TrackState>,
     editor: Option<EditorInstance>,
 }
 
 impl PluginTrack {
     /// Load the plugin, initialise it at the output device's format and open its
     /// editor. Idempotent: does nothing if the editor is already open. LeSynth
-    /// stays in its plain synth mode here — no `push_analysis` is issued.
+    /// tracks are tagged with a token (so their grid can be exported), and if the
+    /// track carries an `import_state` it is pushed in before the window opens —
+    /// otherwise LeSynth stays in its plain synth mode (no `push_analysis`).
     fn open_editor(&mut self, midi_queue: &MidiEventQueue) -> Result<()> {
         if self.editor.is_some() {
             return Ok(());
         }
-        let inst = Arc::new(PluginInstance::load(&self.plugin_path, self.class_id.as_ref())?);
+        // Only LeSynth instances support the state export/import C ABI.
+        let token = (self.kind == TrackKind::LeSynth).then(next_instance_token);
+        let inst = Arc::new(PluginInstance::load(
+            &self.plugin_path,
+            self.class_id.as_ref(),
+            token,
+        )?);
 
         let (sr, block) = AudioEngine::query_device_config()
             .map(|c| (c.sample_rate, c.max_buffer_size as i32))
             .unwrap_or((44_100.0, 512));
         let _ = inst.initialize_audio(sr, block);
 
+        // Push a loaded grid (Analysis mode) before the window renders it.
+        if let Some(state) = &self.import_state {
+            if let Err(e) = inst.import_state(state) {
+                log::warn!("Track import failed: {}", e);
+            }
+        }
+
         self.editor = Some(EditorInstance::open(inst, midi_queue.clone())?);
         Ok(())
+    }
+
+    /// Whether this track's live grid can be exported (LeSynth, editor open).
+    fn can_export(&self) -> bool {
+        self.kind == TrackKind::LeSynth && self.editor.is_some()
     }
 
     /// Drop the editor if its window was closed directly, freeing the instance.
@@ -195,12 +234,14 @@ impl TracksPanel {
         let track = PluginTrack {
             id: self.take_id(),
             name: "LeSynth Fourier".to_string(),
+            kind: TrackKind::LeSynth,
             plugin_path: path,
             class_id: Some(class_ids::FOURIER_SYNTH),
+            import_state: None,
             editor: None,
         };
         self.tracks.push(track);
-        self.status = "Added LeSynth Fourier track.".to_string();
+        self.status = "Created LeSynth Fourier track.".to_string();
     }
 
     /// Add a custom VST track from a `.so` chosen in a file dialog.
@@ -218,13 +259,88 @@ impl TracksPanel {
         let track = PluginTrack {
             id: self.take_id(),
             name,
+            kind: TrackKind::CustomVst,
             plugin_path: path,
             // Take the first class in the factory — we don't know the plugin's ID.
             class_id: None,
+            import_state: None,
             editor: None,
         };
         self.tracks.push(track);
-        self.status = "Added custom VST track.".to_string();
+        self.status = "Created custom VST track.".to_string();
+    }
+
+    /// Load a saved `.lsft` LeSynth track: pick the file, parse it, and add a
+    /// LeSynth track whose grid is pushed into the instance when its editor opens.
+    fn load_lesynth_track(&mut self) {
+        let Some(file) = rfd::FileDialog::new()
+            .add_filter("LeSynth Fourier track (.lsft)", &["lsft"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        let state = match TrackState::read(&file) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Load failed: {}", e);
+                return;
+            }
+        };
+        let Some(plugin_path) = Self::internal_plugin_path() else {
+            self.status = "Could not locate the internal plugin.".to_string();
+            return;
+        };
+        if !plugin_path.exists() {
+            self.status = format!("Internal plugin not found at {}", plugin_path.display());
+            return;
+        }
+        let name = file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "LeSynth track".to_string());
+        let id = self.take_id();
+        self.tracks.push(PluginTrack {
+            id,
+            name,
+            kind: TrackKind::LeSynth,
+            plugin_path,
+            class_id: Some(class_ids::FOURIER_SYNTH),
+            import_state: Some(state),
+            editor: None,
+        });
+        self.status = "Loaded LeSynth track — open its editor to view.".to_string();
+    }
+
+    /// Save a track's live grid to a chosen `.lsft` file.
+    fn export_track(&mut self, idx: usize) {
+        // Snapshot first (ends the borrow of `self.tracks` before the dialog).
+        let snapshot = self
+            .tracks
+            .get(idx)
+            .filter(|t| t.can_export())
+            .map(|t| (t.name.clone(), t.editor.as_ref().unwrap().export_state()));
+        let Some((name, result)) = snapshot else {
+            return;
+        };
+        let state = match result {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Export failed: {}", e);
+                return;
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("LeSynth Fourier track (.lsft)", &["lsft"])
+            .set_file_name(format!("{name}.lsft"))
+            .save_file()
+        else {
+            return;
+        };
+        self.status = match state.write(&path) {
+            Ok(()) => format!("Exported {name}."),
+            Err(e) => format!("Export failed: {e}"),
+        };
     }
 
     fn take_id(&mut self) -> u64 {
@@ -235,11 +351,18 @@ impl TracksPanel {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("➕ Add LeSynth Fourier Track").clicked() {
+            if ui.button("➕ Create LeSynth Fourier Track").clicked() {
                 self.add_lesynth_track();
             }
-            if ui.button("➕ Add Custom VST Track").clicked() {
+            if ui.button("➕ Create Custom VST Track").clicked() {
                 self.add_custom_vst_track();
+            }
+            if ui
+                .button("➕ Load LeSynth Fourier Track")
+                .on_hover_text("Open a saved .lsft track")
+                .clicked()
+            {
+                self.load_lesynth_track();
             }
         });
         ui.add_space(4.0);
@@ -262,6 +385,7 @@ impl TracksPanel {
         enum Action {
             Open(usize),
             Close(usize),
+            Export(usize),
             Remove(usize),
         }
         let mut action: Option<Action> = None;
@@ -300,6 +424,15 @@ impl TracksPanel {
                                     } else if ui.button("Open editor").clicked() {
                                         action = Some(Action::Open(idx));
                                     }
+                                    // Export the live grid (LeSynth only, editor open).
+                                    if track.can_export()
+                                        && ui
+                                            .button("💾 Export…")
+                                            .on_hover_text("Save this track's grid to a .lsft file")
+                                            .clicked()
+                                    {
+                                        action = Some(Action::Export(idx));
+                                    }
                                 },
                             );
                         });
@@ -327,6 +460,7 @@ impl TracksPanel {
                     track.editor = None;
                 }
             }
+            Some(Action::Export(idx)) => self.export_track(idx),
             Some(Action::Remove(idx)) => {
                 if idx < self.tracks.len() {
                     let removed = self.tracks.remove(idx);

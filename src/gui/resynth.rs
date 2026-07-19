@@ -220,7 +220,8 @@ impl ResynthPanel {
             return Some(p.clone());
         }
         let path = Self::internal_plugin_path()?;
-        match PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH)) {
+        // Stateless analysis FFI only — no editor, so no token needed.
+        match PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) {
             Ok(inst) => {
                 let arc = Arc::new(inst);
                 self.ffi_plugin = Some(arc.clone());
@@ -300,7 +301,12 @@ impl ResynthPanel {
             self.status = "Could not locate internal plugin.".to_string();
             return;
         };
-        let inst = match PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH)) {
+        // Tag the instance so its edited grid can be exported to a .lsft later.
+        let inst = match PluginInstance::load(
+            &path,
+            Some(&class_ids::FOURIER_SYNTH),
+            Some(crate::vst::next_instance_token()),
+        ) {
             Ok(i) => Arc::new(i),
             Err(e) => {
                 self.status = format!("Plugin load failed: {}", e);
@@ -346,6 +352,39 @@ impl ResynthPanel {
             }
             Err(e) => self.status = format!("Editor failed: {}", e),
         }
+    }
+
+    /// Save subtrack `sub_idx`'s live (edited) LeSynth grid to a `.lsft` file.
+    /// Resynthesis is export-only; loading happens in the Tracks panel.
+    fn export_subtrack(&mut self, file_idx: usize, sub_idx: usize) {
+        // Snapshot the grid first, ending the borrow before the file dialog.
+        let snapshot = self
+            .files
+            .get(file_idx)
+            .and_then(|f| f.subtracks.get(sub_idx))
+            .and_then(|v| v.editor.as_ref())
+            .map(|e| e.export_state());
+        let Some(result) = snapshot else {
+            return;
+        };
+        let state = match result {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Export failed: {}", e);
+                return;
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("LeSynth Fourier track (.lsft)", &["lsft"])
+            .set_file_name(format!("subtrack_{}.lsft", sub_idx + 1))
+            .save_file()
+        else {
+            return;
+        };
+        self.status = match state.write(&path) {
+            Ok(()) => format!("Exported subtrack {} to {}.", sub_idx + 1, path.display()),
+            Err(e) => format!("Export failed: {}", e),
+        };
     }
 
     fn draw_amp_preview(ui: &mut egui::Ui, grid: &[Vec<f32>]) {
@@ -430,6 +469,14 @@ impl ResynthPanel {
                                 .clicked()
                             {
                                 action = Some(SubtrackAction::Close);
+                            }
+                            // Save the current (edited) grid to a .lsft file.
+                            if ui
+                                .button("💾 Export…")
+                                .on_hover_text("Save this subtrack's grid to a .lsft file")
+                                .clicked()
+                            {
+                                action = Some(SubtrackAction::Export);
                             }
                         } else if ui.button("Open in LeSynth").clicked() {
                             action = Some(SubtrackAction::Open);
@@ -551,6 +598,7 @@ impl ResynthPanel {
                         view.editor = None;
                     }
                 }
+                SubtrackAction::Export => self.export_subtrack(file_idx, sub_idx),
             }
         }
 
@@ -571,4 +619,5 @@ enum SubtrackAction {
     Preview,
     Open,
     Close,
+    Export,
 }
