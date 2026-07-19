@@ -11,16 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-
 use anyhow::{bail, Result};
 
+use super::EditorHandle;
 use crate::vst::PluginInstance;
 
 /// Editor embedding is not implemented for this platform.
-pub fn open_editor_in_thread(
-    _plugin: &PluginInstance,
-) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
+pub fn open_editor_in_thread(_plugin: &PluginInstance) -> Result<EditorHandle> {
     bail!("Plugin editor embedding is not supported on this platform");
 }

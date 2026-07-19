@@ -65,7 +65,10 @@ struct SubtrackView {
     sub: Subtrack,
     /// `[harmonic][bucket]` amplitude grid for the inline preview.
     preview_amp: Option<Vec<Vec<f32>>>,
-    analyzed: bool,
+    /// The dedicated LeSynth editor for this subtrack, present only while its
+    /// window is open. While this is `Some`, "Open in LeSynth" is replaced by a
+    /// "Close" control, so repeat clicks never spawn duplicate instances.
+    editor: Option<EditorInstance>,
 }
 
 /// A dedicated LeSynth Fourier editor instance opened for one subtrack, kept
@@ -74,23 +77,46 @@ struct SubtrackView {
 /// dedicated instance is never pulled and stays silent.
 ///
 /// Dropping this signals the editor window thread to close and stops its audio
-/// stream, so tearing down a file (or the whole panel) needs no extra bookkeeping.
+/// stream, so tearing down a subtrack (or the whole panel) needs no extra
+/// bookkeeping. Conversely, when the user closes the window directly, the editor
+/// thread sets `closed`; the panel polls it each frame and drops this to reclaim
+/// the audio stream and plugin.
 struct EditorInstance {
+    // Field order matters for `Drop`: after `drop()` joins the window thread,
+    // fields drop top-to-bottom, so `_plugin` (which unloads the shared library
+    // the thread's view lives in) must come *after* `handle`.
+    handle: Option<JoinHandle<()>>,
     _plugin: Arc<PluginInstance>,
-    _handle: JoinHandle<()>,
     close_flag: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
     _engine: Option<AudioEngine>,
+}
+
+impl EditorInstance {
+    /// True once the editor window has gone away — whether the user closed it or
+    /// we asked it to via `close_flag`.
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for EditorInstance {
     fn drop(&mut self) {
+        // Ask the window thread to exit, then wait for it: it detaches the plugin
+        // view (`view.removed()`) as it unwinds, which must happen before the
+        // `_plugin` Arc below unloads the library the view points into. If the
+        // user already closed the window, the thread has finished and this joins
+        // instantly.
         self.close_flag.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
-/// One opened audio file: its path, decode result, segmented subtracks, and any
-/// editor windows opened from those subtracks. Removing the file drops this whole
-/// struct, which closes its editors via [`EditorInstance`]'s `Drop`.
+/// One opened audio file: its path, decode result, and segmented subtracks. Each
+/// subtrack may own an editor window; removing the file drops this whole struct,
+/// which closes those editors via [`EditorInstance`]'s `Drop`.
 struct AudioFile {
     /// Stable id, used to key per-file egui widget state across frames.
     id: u64,
@@ -98,7 +124,6 @@ struct AudioFile {
     status: String,
     decoded: Option<DecodedAudio>,
     subtracks: Vec<SubtrackView>,
-    editors: Vec<EditorInstance>,
 }
 
 impl AudioFile {
@@ -109,10 +134,32 @@ impl AudioFile {
             status: String::new(),
             decoded: None,
             subtracks: Vec::new(),
-            editors: Vec::new(),
         };
         file.decode_and_segment();
         file
+    }
+
+    /// Number of subtracks whose editor window is currently open.
+    fn open_editor_count(&self) -> usize {
+        self.subtracks.iter().filter(|s| s.editor.is_some()).count()
+    }
+
+    /// Drop any editor whose window the user has closed, reclaiming its audio
+    /// stream and plugin. Called every frame so the UI count and the running
+    /// resources stay in sync with the actual windows on screen.
+    fn reap_closed_editors(&mut self) {
+        for s in &mut self.subtracks {
+            if s.editor.as_ref().is_some_and(EditorInstance::is_closed) {
+                s.editor = None;
+            }
+        }
+    }
+
+    /// Close every open editor for this file.
+    fn close_all_editors(&mut self) {
+        for s in &mut self.subtracks {
+            s.editor = None;
+        }
     }
 
     /// The trailing file name (for compact headers), falling back to the full path.
@@ -146,7 +193,7 @@ impl AudioFile {
                     .map(|sub| SubtrackView {
                         sub,
                         preview_amp: None,
-                        analyzed: false,
+                        editor: None,
                     })
                     .collect();
                 self.decoded = Some(audio);
@@ -276,6 +323,17 @@ impl ResynthPanel {
     /// Open a dedicated LeSynth Fourier instance for subtrack `sub_idx` of file
     /// `file_idx`, push the audio for analysis, and show its editor (Analysis mode).
     fn open_in_lesynth(&mut self, file_idx: usize, sub_idx: usize) {
+        // Idempotent: if this subtrack already has an open editor, do nothing
+        // rather than spawn a duplicate instance.
+        if self
+            .files
+            .get(file_idx)
+            .and_then(|f| f.subtracks.get(sub_idx))
+            .is_some_and(|v| v.editor.is_some())
+        {
+            return;
+        }
+
         let Some((samples, sr, freq, contour)) =
             self.files.get(file_idx).and_then(|f| f.analysis_inputs(sub_idx))
         else {
@@ -311,7 +369,11 @@ impl ResynthPanel {
         }
 
         match super::editor_window::open_editor_in_thread(&inst) {
-            Ok((handle, close_flag)) => {
+            Ok(super::editor_window::EditorHandle {
+                handle,
+                close_flag,
+                closed,
+            }) => {
                 // Drive this dedicated instance's `process()` with its own audio
                 // stream so the in-editor piano is audible. The piano writes
                 // voices directly into the instance's shared state, so an empty
@@ -324,16 +386,16 @@ impl ResynthPanel {
                     }
                 };
                 let audible = engine.is_some();
-                if let Some(file) = self.files.get_mut(file_idx) {
-                    file.editors.push(EditorInstance {
+                if let Some(view) =
+                    self.files.get_mut(file_idx).and_then(|f| f.subtracks.get_mut(sub_idx))
+                {
+                    view.editor = Some(EditorInstance {
+                        handle: Some(handle),
                         _plugin: inst,
-                        _handle: handle,
                         close_flag,
+                        closed,
                         _engine: engine,
                     });
-                    if let Some(view) = file.subtracks.get_mut(sub_idx) {
-                        view.analyzed = true;
-                    }
                 }
                 self.status = if audible {
                     format!("Opened subtrack {} in LeSynth (Analysis mode).", sub_idx + 1)
@@ -409,7 +471,7 @@ impl ResynthPanel {
                                 .italics()
                                 .color(egui::Color32::from_gray(160)),
                         );
-                    } else if view.analyzed {
+                    } else if view.editor.is_some() {
                         ui.label(
                             egui::RichText::new("● in LeSynth")
                                 .color(egui::Color32::from_rgb(130, 230, 150)),
@@ -421,7 +483,17 @@ impl ResynthPanel {
                         if ui.button("Preview FFT").clicked() {
                             action = Some(SubtrackAction::Preview);
                         }
-                        if ui.button("Open in LeSynth").clicked() {
+                        if view.editor.is_some() {
+                            // Editor already open: offer to close it rather than
+                            // spawn a duplicate instance.
+                            if ui
+                                .button("✖ Close editor")
+                                .on_hover_text("Close this subtrack's LeSynth editor")
+                                .clicked()
+                            {
+                                action = Some(SubtrackAction::Close);
+                            }
+                        } else if ui.button("Open in LeSynth").clicked() {
                             action = Some(SubtrackAction::Open);
                         }
                     });
@@ -453,6 +525,12 @@ impl ResynthPanel {
             ui.add_space(4.0);
         }
 
+        // Reap editors whose windows the user closed directly, so their audio
+        // streams and plugins are released and the on-screen state stays honest.
+        for file in &mut self.files {
+            file.reap_closed_editors();
+        }
+
         // Deferred actions, so we don't mutate `self` while iterating/borrowing it.
         let mut to_remove: Option<usize> = None;
         let mut to_close_editors: Option<usize> = None;
@@ -460,7 +538,7 @@ impl ResynthPanel {
 
         for (file_idx, file) in self.files.iter().enumerate() {
             let sr = file.sample_rate();
-            let editor_count = file.editors.len();
+            let editor_count = file.open_editor_count();
             let header_id = ui.make_persistent_id(("resynth_file", file.id));
             egui::Frame::group(ui.style())
                 .inner_margin(egui::Margin::same(8))
@@ -515,7 +593,7 @@ impl ResynthPanel {
             // Dropping the editors closes their windows (via `EditorInstance`'s
             // `Drop`) and stops each instance's audio stream.
             if let Some(file) = self.files.get_mut(idx) {
-                file.editors.clear();
+                file.close_all_editors();
             }
         }
         if let Some(idx) = to_remove {
@@ -528,7 +606,23 @@ impl ResynthPanel {
             match action {
                 SubtrackAction::Preview => self.preview_subtrack(file_idx, sub_idx),
                 SubtrackAction::Open => self.open_in_lesynth(file_idx, sub_idx),
+                SubtrackAction::Close => {
+                    if let Some(view) =
+                        self.files.get_mut(file_idx).and_then(|f| f.subtracks.get_mut(sub_idx))
+                    {
+                        view.editor = None;
+                    }
+                }
             }
+        }
+
+        // While any editor window is open, poll a few times a second so a window
+        // the user closes directly is reaped promptly (the editor thread only
+        // sets a flag; nothing else wakes this reactive panel). When none are
+        // open, this stops and the panel returns to fully idle.
+        if self.files.iter().any(|f| f.open_editor_count() > 0) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 }
@@ -538,4 +632,5 @@ impl ResynthPanel {
 enum SubtrackAction {
     Preview,
     Open,
+    Close,
 }

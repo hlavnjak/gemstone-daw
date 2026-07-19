@@ -19,21 +19,31 @@ use anyhow::{Context, Result};
 use vst3::Steinberg::{IPlugViewTrait, ViewRect};
 use x11_dl::xlib;
 
+use super::EditorHandle;
 use crate::vst::PluginInstance;
 
 /// Open the plugin editor in a new thread using raw X11.
-/// Returns a handle to stop the editor (set the bool to true to close).
-pub fn open_editor_in_thread(
-    plugin: &PluginInstance,
-) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
+pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
     let view = plugin
         .create_view()
         .context("Plugin has no editor view")?;
 
     let close_flag = Arc::new(AtomicBool::new(false));
     let close_flag_clone = close_flag.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_clone = closed.clone();
 
     let handle = std::thread::spawn(move || {
+        // Signal the host once this thread returns, no matter which path it took,
+        // so a window closed by the user is reaped just like one closed by us.
+        struct SignalClosed(Arc<AtomicBool>);
+        impl Drop for SignalClosed {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _signal = SignalClosed(closed_clone);
+
         unsafe {
             let xlib = xlib::Xlib::open().expect("Failed to open Xlib");
 
@@ -155,5 +165,9 @@ pub fn open_editor_in_thread(
         }
     });
 
-    Ok((handle, close_flag))
+    Ok(EditorHandle {
+        handle,
+        close_flag,
+        closed,
+    })
 }

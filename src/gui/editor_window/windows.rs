@@ -28,6 +28,7 @@ use winapi::um::winuser::{
     WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
+use super::EditorHandle;
 use crate::vst::PluginInstance;
 
 /// Convert a Rust string to a NUL-terminated UTF-16 buffer for the Win32 W APIs.
@@ -51,18 +52,27 @@ unsafe extern "system" fn wnd_proc(
 }
 
 /// Open the plugin editor in a new thread using a raw Win32 window.
-/// Returns a handle to the thread and a flag — set it to `true` to close.
-pub fn open_editor_in_thread(
-    plugin: &PluginInstance,
-) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> {
+pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
     let view = plugin
         .create_view()
         .context("Plugin has no editor view")?;
 
     let close_flag = Arc::new(AtomicBool::new(false));
     let close_flag_clone = close_flag.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_clone = closed.clone();
 
     let handle = std::thread::spawn(move || unsafe {
+        // Signal the host once this thread returns, no matter which path it took,
+        // so a window closed by the user is reaped just like one closed by us.
+        struct SignalClosed(Arc<AtomicBool>);
+        impl Drop for SignalClosed {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _signal = SignalClosed(closed_clone);
+
         let class_name = to_wide("GemstoneDawEditorWindow");
         let window_title = to_wide("LeSynth Fourier - Editor");
         let hinstance = GetModuleHandleW(std::ptr::null());
@@ -155,5 +165,9 @@ pub fn open_editor_in_thread(
         eprintln!("Plugin editor window closed");
     });
 
-    Ok((handle, close_flag))
+    Ok(EditorHandle {
+        handle,
+        close_flag,
+        closed,
+    })
 }

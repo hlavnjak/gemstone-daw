@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -39,6 +40,10 @@ pub struct DawApp {
     audio_engine: Option<AudioEngine>,
     midi_queue: MidiEventQueue,
     _midi_connection: Option<midir::MidiInputConnection<()>>,
+    /// The plugin's editor window, present only while it is open. Kept so repeat
+    /// "Show Editor" clicks focus intent on one window instead of spawning
+    /// duplicates, and so unloading can tear the window down before the plugin.
+    editor: Option<super::editor_window::EditorHandle>,
 
     // Resynthesis (.wav/.mp3/.m4a → LeSynth Fourier analysis)
     resynth: ResynthPanel,
@@ -58,6 +63,7 @@ impl Default for DawApp {
             audio_engine: None,
             midi_queue: midi::new_midi_queue(),
             _midi_connection: None,
+            editor: None,
             resynth: ResynthPanel::default(),
         }
     }
@@ -204,16 +210,38 @@ impl DawApp {
     }
 
     fn unload_plugin(&mut self) {
+        // Tear the editor window down *before* the plugin: its thread holds a
+        // view into the plugin module, so dropping the library out from under it
+        // would be unsound. Joining guarantees `view.removed()` has run first.
+        self.close_editor();
         self.audio_engine = None;
         self.plugin = None;
         self.plugin_status = "No plugin loaded".to_string();
     }
 
+    /// Drop the editor handle if its window has already been closed by the user,
+    /// so button state and dedup logic reflect reality.
+    fn reap_editor(&mut self) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.closed.load(Ordering::Relaxed))
+        {
+            self.editor = None;
+        }
+    }
+
     fn show_editor(&mut self) {
+        self.reap_editor();
+        if self.editor.is_some() {
+            self.plugin_status = "Editor already open".to_string();
+            return;
+        }
         if let Some(ref plugin) = self.plugin {
             log::info!("Opening plugin editor...");
             match super::editor_window::open_editor_in_thread(plugin) {
-                Ok((_handle, _close_flag)) => {
+                Ok(handle) => {
+                    self.editor = Some(handle);
                     self.plugin_status = "Editor opened".to_string();
                 }
                 Err(e) => {
@@ -223,6 +251,16 @@ impl DawApp {
             }
         } else {
             self.plugin_status = "Load a plugin first".to_string();
+        }
+    }
+
+    /// Ask the editor window to close and wait for its thread to finish, so the
+    /// plugin view is detached before we touch the plugin again.
+    fn close_editor(&mut self) {
+        if let Some(handle) = self.editor.take() {
+            handle.close_flag.store(true, Ordering::Relaxed);
+            let _ = handle.handle.join();
+            self.plugin_status = "Editor closed".to_string();
         }
     }
 
@@ -265,7 +303,11 @@ impl DawApp {
                 if ui.button("Load Internal — LeSynth Fourier").clicked() {
                     self.load_internal_plugin();
                 }
-                if ui.button("Show Editor").clicked() {
+                if self.editor.is_some() {
+                    if ui.button("✖ Close Editor").clicked() {
+                        self.close_editor();
+                    }
+                } else if ui.button("Show Editor").clicked() {
                     self.show_editor();
                 }
                 if ui.button("Unload").clicked() {
@@ -351,6 +393,13 @@ impl eframe::App for DawApp {
         // repaints for its own hover/tooltip/scroll animations). When live state is
         // added (playback meters, async analysis), gate a `ctx.request_repaint()`
         // on that activity here.
+
+        // Reap the editor if its window was closed directly, and while it is open
+        // poll a few times a second so the button state tracks the real window.
+        self.reap_editor();
+        if self.editor.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         // App title bar.
         egui::TopBottomPanel::top("title_bar")
