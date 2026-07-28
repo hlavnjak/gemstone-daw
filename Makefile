@@ -1,11 +1,6 @@
 FOURIER_DIR := ../lesynth-fourier
 INTERNAL_PLUGINS := internal_plugins
 
-# The `vst3` crate's build script reads the Steinberg VST3 SDK location from the
-# VST3_SDK_DIR environment variable. Re-export it so it reaches cargo whether it
-# comes from the shell environment or from `make VST3_SDK_DIR=... run`.
-export VST3_SDK_DIR
-
 # ── Linux (native) ──────────────────────────────────────────────────────────
 LINUX_TARGET := x86_64-unknown-linux-gnu
 FOURIER_SO := $(FOURIER_DIR)/target/$(LINUX_TARGET)/release/liblesynth_fourier.so
@@ -27,34 +22,16 @@ FOURIER_SRCS := $(shell find $(FOURIER_DIR)/src -name '*.rs' 2>/dev/null) \
 # precompiled binary committed under internal_plugins/ is used as-is.
 HAVE_FOURIER_SRC := $(wildcard $(FOURIER_DIR)/Cargo.toml)
 
-# Mingw ships libstdc++ headers (cstdint, ...) that clang/com-scrape need when
-# generating the VST3 bindings for the Windows target. Pull the exact include
-# search paths out of the cross g++ itself (version-independent), colon-joined
-# for CPLUS_INCLUDE_PATH.
-WIN_CPLUS_INCLUDE_PATH := $(shell echo | x86_64-w64-mingw32-g++ -E -x c++ -v - 2>&1 | \
-	awk '/#include <...> search starts/{f=1;next} /End of search/{f=0} f{gsub(/^ +/,"");print}' | \
-	paste -sd:)
-
-.PHONY: run build build-windows fourier fourier-windows copy-internal copy-internal-windows check-sdk clean clean-all
-
-# Fail early with a helpful message if the VST3 SDK location isn't set.
-check-sdk:
-	@if [ -z "$$VST3_SDK_DIR" ]; then \
-		echo "error: VST3_SDK_DIR is not set."; \
-		echo "       Point it at your Steinberg VST3 SDK checkout, e.g."; \
-		echo "         export VST3_SDK_DIR=/path/to/vst3sdk"; \
-		echo "       See the README for details."; \
-		exit 1; \
-	fi
+.PHONY: run build build-windows fourier fourier-windows copy-internal copy-internal-windows clean clean-all
 
 # ── Linux build ─────────────────────────────────────────────────────────────
 
 # Build (and embed the VST3 plugin), then run.
-run: check-sdk copy-internal
+run: copy-internal
 	cargo run --release
 
 # Build, embedding the VST3 plugin.
-build: check-sdk copy-internal
+build: copy-internal
 	cargo build --release
 
 ifeq ($(HAVE_FOURIER_SRC),)
@@ -105,8 +82,8 @@ endif
 # ── Windows cross build ─────────────────────────────────────────────────────
 
 # Build for Windows, embedding the VST3 plugin.
-build-windows: check-sdk copy-internal-windows
-	CPLUS_INCLUDE_PATH="$(WIN_CPLUS_INCLUDE_PATH)" cargo build --release --target $(WIN_TARGET)
+build-windows: copy-internal-windows
+	cargo build --release --target $(WIN_TARGET)
 
 clean:
 	cargo clean

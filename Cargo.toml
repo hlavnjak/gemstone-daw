@@ -11,7 +11,7 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 # VST3 hosting
-vst3 = "0.1.0"
+vst3 = "0.3.0"
 libloading = "0.7"
 
 # Audio I/O

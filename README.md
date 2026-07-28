@@ -40,7 +40,7 @@ arbitrary recording and rebuilds it as additive synthesis you can play and edit:
 ```
 Cargo.toml          # egui/eframe app crate
 Makefile            # builds the app; (re)builds + embeds the VST3 when its source is present
-.cargo/config.toml  # Windows cross linker; VST3_SDK_DIR comes from the environment
+.cargo/config.toml  # Windows cross linker
 internal_plugins/   # the embedded LeSynth Fourier VST3 (committed precompiled)
 src/
   main.rs                                 # eframe entry point
@@ -58,16 +58,10 @@ src/
 ## Requirements
 
 - A recent **Rust** toolchain.
-- The **Steinberg VST3 SDK** — the `vst3` crate generates its bindings from the
-  SDK headers at build time. Download it from Steinberg and point `VST3_SDK_DIR`
-  at the checkout:
-
-  ```sh
-  export VST3_SDK_DIR=/path/to/vst3sdk
-  ```
-
-  (You can also pass it per-invocation: `make run VST3_SDK_DIR=/path/to/vst3sdk`.)
 - Linux: an X11 or Wayland display, plus GTK3 (used by the file-open dialog).
+
+No copy of the Steinberg VST3 SDK is needed: the `vst3` crate ships pre-generated
+bindings, so nothing is scraped from the SDK headers at build time.
 
 ## Build & run (Linux)
 
