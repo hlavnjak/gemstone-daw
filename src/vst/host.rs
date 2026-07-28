@@ -37,8 +37,12 @@ type GetPluginFactoryProc = unsafe extern "C" fn() -> *mut IPluginFactory;
 // LeSynth Fourier's host-facing analysis C ABI (see lesynth-fourier/src/lib.rs).
 // The `contour` (ptr,len) carries the per-position fundamental in absolute Hz,
 // uniformly resampled across the subtrack; null/0 means flat (legacy).
-type PushAnalysisProc =
-    unsafe extern "C" fn(*const f32, usize, f32, f32, *const f32, usize) -> u64;
+// Addressed to the instance carrying `token` (first argument), so the job can't
+// be claimed by a different open editor. Returns 0 on success. (The plugin also
+// exports an untargeted `lesynth_fourier_push_analysis`, kept for other hosts;
+// it is unusable here because we open several editors at once.)
+type PushAnalysisToProc =
+    unsafe extern "C" fn(u64, *const f32, usize, f32, f32, *const f32, usize) -> i64;
 type AnalyzeProc = unsafe extern "C" fn(
     *const f32,    // samples
     usize,         // len
@@ -324,33 +328,44 @@ impl PluginInstance {
     }
 
     /// Push a recorded subtrack to this plugin (same shared object) for
-    /// Fourier analysis. The running editor will pick the job up, switch to
+    /// Fourier analysis. This instance's editor will pick the job up, switch to
     /// Analysis mode and display the extracted amplitude/phase grid.
     ///
-    /// Returns the queue depth reported by the plugin. `contour` is the
-    /// per-position fundamental (absolute Hz) uniformly resampled across the
-    /// subtrack; pass an empty slice for flat (legacy) analysis.
+    /// The job is addressed to *this* instance by token, so it survives until
+    /// this instance's editor opens; the untargeted entry point would let an
+    /// editor already open for another track claim it first, leaving this one
+    /// with empty charts (and overwriting the other's).
+    ///
+    /// `contour` is the per-position fundamental (absolute Hz) uniformly
+    /// resampled across the subtrack; pass an empty slice for flat (legacy)
+    /// analysis.
     pub fn push_analysis(
         &self,
         samples: &[f32],
         sample_rate: f32,
         base_freq: f32,
         contour: &[f32],
-    ) -> Result<u64> {
+    ) -> Result<()> {
+        let token = self
+            .token
+            .context("this instance was not tagged; cannot target an analysis push")?;
         unsafe {
-            let func: libloading::Symbol<PushAnalysisProc> = self
+            let func: libloading::Symbol<PushAnalysisToProc> = self
                 ._library
-                .get(b"lesynth_fourier_push_analysis\0")
-                .context("plugin does not export lesynth_fourier_push_analysis")?;
-            Ok(func(
+                .get(b"lesynth_fourier_push_analysis_to\0")
+                .context("plugin does not export lesynth_fourier_push_analysis_to")?;
+            let rc = func(
+                token,
                 samples.as_ptr(),
                 samples.len(),
                 sample_rate,
                 base_freq,
                 contour.as_ptr(),
                 contour.len(),
-            ))
+            );
+            anyhow::ensure!(rc == 0, "push_analysis_to failed ({rc})");
         }
+        Ok(())
     }
 
     /// Stateless harmonic analysis via the plugin's exported DSP, for the
