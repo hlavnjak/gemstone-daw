@@ -89,6 +89,29 @@ impl Subtrack {
     }
 }
 
+/// Resolution of the pitch contour handed to LeSynth Fourier per subtrack.
+/// Vibrato is slow, so a few hundred points capture it with room to spare.
+pub const CONTOUR_POINTS: usize = 256;
+
+/// Uniformly-resampled fundamental (absolute Hz) across a subtrack's span, for
+/// the analysis bridge. Lets the plugin follow vibrato/drift instead of a single
+/// global pitch. Empty when the subtrack carries no pitch track (→ flat).
+///
+/// Lives here rather than in the GUI so the resynthesis tests feed the plugin
+/// the exact contour the app does.
+pub fn build_contour(sub: &Subtrack) -> Vec<f32> {
+    if sub.pitch_track.is_empty() {
+        return Vec::new();
+    }
+    let len = sub.len().max(1);
+    (0..CONTOUR_POINTS)
+        .map(|i| {
+            let off = (i as f32 + 0.5) / CONTOUR_POINTS as f32 * len as f32;
+            sub.freq_at(sub.start + off as usize)
+        })
+        .collect()
+}
+
 const FRAME: usize = 2048;
 const HOP: usize = 1024;
 const MIN_FREQ: f32 = 50.0;
@@ -166,8 +189,25 @@ fn estimate_frame_pitch(frame: &[f32], sample_rate: f32) -> FramePitch {
         }
     }
 
+    // Sub-sample refinement: the whole-lag grid is coarse at high pitch (a D5 at
+    // 22 kHz sits at lag 37, and lag 38 is *46 cents* away), so without it a
+    // smooth vibrato is reported as a staircase mostly stuck on one step, which
+    // desynchronises the plugin's per-bucket DFT. A parabola through the NAC
+    // peak recovers the fraction; `delta` is clamped to ±½ lag.
+    let refined = if chosen > min_lag && chosen < max_lag {
+        let (y0, y1, y2) = (nac[chosen - 1], nac[chosen], nac[chosen + 1]);
+        let denom = y0 - 2.0 * y1 + y2;
+        if denom.abs() > 1e-9 {
+            chosen as f32 + (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5)
+        } else {
+            chosen as f32
+        }
+    } else {
+        chosen as f32
+    };
+
     FramePitch {
-        freq: sample_rate / chosen as f32,
+        freq: sample_rate / refined.max(1.0),
         confidence: chosen_val.clamp(0.0, 1.0),
     }
 }
@@ -326,6 +366,40 @@ mod tests {
             pitch_track: Vec::new(),
         };
         assert_eq!(sub.freq_at(5), 123.0);
+    }
+
+    /// The whole-lag grid is coarse at high pitch: at 22.05 kHz a ~590 Hz tone
+    /// sits between lags 37 (595.9 Hz) and 38 (580.3 Hz), 46 cents apart. Without
+    /// sub-sample refinement of the autocorrelation peak the tracker can only
+    /// report one of those two, so a pitch that falls between them is off by tens
+    /// of cents and a smooth vibrato comes out as a staircase.
+    #[test]
+    fn pitch_is_refined_between_whole_sample_lags() {
+        let sr = 22_050.0;
+        for &freq in &[588.0f32, 590.5, 593.0] {
+            let n = FRAME * 4;
+            let sig: Vec<f32> = (0..n)
+                .map(|i| (2.0 * PI * freq * i as f32 / sr).sin())
+                .collect();
+            let subs = segment(&sig, sr);
+            let s = subs.first().expect("a steady tone must be detected");
+            let cents = 1200.0 * (s.base_freq / freq).log2();
+            assert!(
+                cents.abs() < 8.0,
+                "{} Hz detected as {:.2} Hz ({:+.1} cents) — whole-lag quantisation",
+                freq,
+                s.base_freq,
+                cents
+            );
+            // And the nearest whole lags really are far away, so this is not
+            // passing by accident.
+            let lag = sr / freq;
+            assert!(
+                (1200.0 * (lag / lag.round()).log2()).abs() > 8.0,
+                "test frequency {} lands on a whole lag; pick another",
+                freq
+            );
+        }
     }
 
     #[test]

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 use super::track::EditorInstance;
-use crate::analysis::{self, Subtrack};
+use crate::analysis::{self, build_contour, Subtrack};
 use crate::audio::{decode_audio_file, AudioEngine, DecodedAudio};
 use crate::midi::new_midi_queue;
 use crate::vst::{class_ids, PluginInstance};
@@ -40,25 +40,6 @@ use crate::vst::{class_ids, PluginInstance};
 const PREVIEW_HARMONICS: usize = 16;
 /// Bucket count requested for the inline host-side preview.
 const PREVIEW_BUCKETS: usize = 128;
-/// Resolution of the pitch contour handed to LeSynth Fourier per subtrack.
-/// Vibrato is slow, so a few hundred points capture it with room to spare.
-const CONTOUR_POINTS: usize = 256;
-
-/// Uniformly-resampled fundamental (absolute Hz) across a subtrack's span, for
-/// the analysis bridge. Lets the plugin follow vibrato/drift instead of a single
-/// global pitch. Empty when the subtrack carries no pitch track (→ flat).
-fn build_contour(sub: &Subtrack) -> Vec<f32> {
-    if sub.pitch_track.is_empty() {
-        return Vec::new();
-    }
-    let len = sub.len().max(1);
-    (0..CONTOUR_POINTS)
-        .map(|i| {
-            let off = (i as f32 + 0.5) / CONTOUR_POINTS as f32 * len as f32;
-            sub.freq_at(sub.start + off as usize)
-        })
-        .collect()
-}
 
 struct SubtrackView {
     sub: Subtrack,

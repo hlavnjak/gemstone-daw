@@ -13,4 +13,4 @@
 // limitations under the License.
 pub mod segmentation;
 
-pub use segmentation::{segment, Subtrack};
+pub use segmentation::{build_contour, segment, Subtrack, CONTOUR_POINTS};

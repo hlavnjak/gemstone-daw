@@ -55,15 +55,75 @@ type AnalyzeProc = unsafe extern "C" fn(
     *mut f32,      // out_amp
     *mut f32,      // out_phase
 ) -> i64;
+// Full analysis + offline resynthesis, the pair that lets the host reproduce the
+// plugin's own grid and playback (see lesynth-fourier/src/lib.rs).
+type AnalyzeFullProc = unsafe extern "C" fn(
+    *const f32, // samples
+    usize,      // len
+    f32,        // sample_rate
+    f32,        // base_freq
+    *const f32, // contour
+    usize,      // contour_len
+    usize,      // num_buckets (0 = period-synchronous)
+    usize,      // num_harmonics
+    usize,      // max_buckets
+    usize,      // cap_buckets
+    *mut f32,   // out_amp
+    *mut f32,   // out_phase
+    *mut f32,   // out_pitch_ratio
+    *mut f32,   // out_bucket_periods
+    *mut f32,   // out_display_gain
+    *mut f32,   // out_dc
+    *mut f32,   // out_nyquist
+) -> i64;
+/// The exact inverse of the analysis — see `lesynth_fourier_resynthesize_exact`.
+type ResynthesizeExactProc = unsafe extern "C" fn(
+    usize,      // num_harmonics
+    usize,      // num_buckets
+    *const f32, // amp
+    *const f32, // phase
+    *const u32, // bucket_lengths
+    *const f32, // dc (may be null)
+    *const f32, // nyquist (may be null)
+    f32,        // display_gain (0 = render at the grid's own level)
+    f32,        // rate_ratio (output_rate / analysis_rate; 1.0 = exact)
+    *mut f32,   // out
+    usize,      // out_cap
+) -> i64;
+type ResynthesizeProc = unsafe extern "C" fn(
+    usize,      // num_harmonics
+    usize,      // num_buckets
+    *const f32, // amp
+    *const f32, // phase
+    *const f32, // pitch_ratio
+    f32,        // base_period (fractional — must not be rounded)
+    usize,      // max_harmonic
+    usize,      // target_samples
+    f32,        // display_gain (0 = render at the grid's own level)
+    *mut f32,   // out
+    usize,      // out_cap
+) -> i64;
 
 // LeSynth Fourier's state save/load C ABI (see lesynth-fourier/src/lib.rs). The
 // host tags an instance with a token before creating it, then exports/imports
 // that exact instance's grid by token.
 type PrepareInstanceProc = unsafe extern "C" fn(u64);
 type ExportDimsProc =
-    unsafe extern "C" fn(u64, *mut u32, *mut u32, *mut f32, *mut f32, *mut f32) -> i64;
-type ExportGridProc =
-    unsafe extern "C" fn(u64, u32, u32, *mut f32, *mut f32, *mut f32) -> i64;
+    unsafe extern "C" fn(u64, *mut u32, *mut u32, *mut f32, *mut f32, *mut f32, *mut f32) -> i64;
+/// `_export_grid` / `_import_grid` gained the exact inverse's per-bucket state
+/// (lengths, DC, Nyquist) alongside the grid — see `.lsft` version 3. The three
+/// pointers are nullable; passing them null exports/imports the grid alone.
+type ExportGridProc = unsafe extern "C" fn(
+    u64,      // token
+    u32,      // num_harmonics
+    u32,      // num_buckets
+    *mut f32, // out_amp
+    *mut f32, // out_phase
+    *mut f32, // out_pitch_ratio
+    *mut u32, // out_bucket_lengths
+    *mut f32, // out_dc
+    *mut f32, // out_nyquist
+) -> i64;
 type ImportGridProc = unsafe extern "C" fn(
     u64,        // token
     u32,        // num_harmonics
@@ -71,9 +131,13 @@ type ImportGridProc = unsafe extern "C" fn(
     f32,        // base_freq
     f32,        // duration_secs
     f32,        // sample_rate
+    f32,        // display_gain (0 = unknown; no source-level audition)
     *const f32, // amp
     *const f32, // phase
     *const f32, // pitch_ratio
+    *const u32, // bucket_lengths (null = no exact inverse)
+    *const f32, // dc
+    *const f32, // nyquist
 ) -> i64;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -82,6 +146,58 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// Pass it to [`PluginInstance::load`] right before creating the instance.
 pub fn next_instance_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The complete harmonic grid the plugin extracts from one subtrack — what
+/// [`PluginInstance::analyze_full`] returns and [`PluginInstance::resynthesize`]
+/// consumes. `amplitude`/`phase` are row-major `[h * num_buckets + b]`.
+#[derive(Debug, Clone)]
+pub struct AnalysisGrid {
+    pub num_harmonics: usize,
+    pub num_buckets: usize,
+    pub amplitude: Vec<f32>,
+    pub phase: Vec<f32>,
+    /// Per-bucket fundamental relative to `base_freq` (the vibrato contour).
+    pub pitch_ratio: Vec<f32>,
+    /// Per-bucket length in **whole source samples** — the length of the inverse
+    /// FFT that reproduces that bucket. These sum to the analysed subtrack, which
+    /// is what makes [`PluginInstance::resynthesize_exact`] exact.
+    pub bucket_periods: Vec<f32>,
+    /// Per-bucket DC (bin 0) and Nyquist (bin `N/2`) terms. Neither is a harmonic
+    /// so neither has a row in the grid or a curve on the charts, but the inverse
+    /// transform needs both: dropping DC alone costs ~120 dB of reconstruction
+    /// accuracy, because one pitch period of real audio does not have zero mean.
+    pub dc: Vec<f32>,
+    pub nyquist: Vec<f32>,
+    /// Gain the plugin's display normalisation applied to this grid
+    /// (`grid_amplitude = source_amplitude × display_gain`). Pass it to
+    /// [`PluginInstance::resynthesize`] to get audio back at the analysed
+    /// source's own level; the grid itself is scaled for chart legibility, which
+    /// on a quiet recording is a boost of ~19 dB.
+    pub display_gain: f32,
+    pub base_freq: f32,
+    pub sample_rate: f32,
+    pub duration_secs: f32,
+}
+
+impl AnalysisGrid {
+    pub fn amp(&self, harmonic: usize, bucket: usize) -> f32 {
+        self.amplitude[harmonic * self.num_buckets + bucket]
+    }
+
+    pub fn phase(&self, harmonic: usize, bucket: usize) -> f32 {
+        self.phase[harmonic * self.num_buckets + bucket]
+    }
+
+    /// Rendered period (samples, **fractional**) for `bucket` at `base_period`,
+    /// matching the plugin's `bucket_period`: the base period scaled by the pitch
+    /// ratio. Fractional because the renderer carries a fractional phase
+    /// accumulator — rounding here would reintroduce the tuning error that
+    /// accumulator exists to remove.
+    pub fn rendered_period(&self, base_period: f32, bucket: usize) -> f32 {
+        let r = self.pitch_ratio.get(bucket).copied().unwrap_or(1.0);
+        (base_period / r.max(1e-3)).max(2.0)
+    }
 }
 
 /// Represents a loaded and initialized VST3 plugin instance.
@@ -215,7 +331,8 @@ impl PluginInstance {
                 .get(b"lesynth_fourier_export_dims\0")
                 .context("plugin does not export lesynth_fourier_export_dims")?;
             let (mut nh, mut nb, mut base, mut dur, mut sr) = (0u32, 0u32, 0f32, 0f32, 0f32);
-            let rc = dims(token, &mut nh, &mut nb, &mut base, &mut dur, &mut sr);
+            let mut gain = 0f32;
+            let rc = dims(token, &mut nh, &mut nb, &mut base, &mut dur, &mut sr, &mut gain);
             anyhow::ensure!(rc == 0, "export_dims failed ({rc}); instance not found");
             let (nhz, nbz) = (nh as usize, nb as usize);
             anyhow::ensure!(nhz > 0 && nbz > 0, "instance has an empty grid to export");
@@ -224,6 +341,9 @@ impl PluginInstance {
             let mut amplitude = vec![0f32; grid];
             let mut phase = vec![0f32; grid];
             let mut pitch_ratio = vec![0f32; nbz];
+            let mut bucket_lengths = vec![0u32; nbz];
+            let mut dc = vec![0f32; nbz];
+            let mut nyquist = vec![0f32; nbz];
 
             let grid_fn: libloading::Symbol<ExportGridProc> = self
                 ._library
@@ -236,8 +356,20 @@ impl PluginInstance {
                 amplitude.as_mut_ptr(),
                 phase.as_mut_ptr(),
                 pitch_ratio.as_mut_ptr(),
+                bucket_lengths.as_mut_ptr(),
+                dc.as_mut_ptr(),
+                nyquist.as_mut_ptr(),
             );
             anyhow::ensure!(rc2 >= 0, "export_grid failed ({rc2})");
+
+            // Zeroed lengths mean this grid was never analysed period-
+            // synchronously (a hand-drawn Synth grid), so there is no exact
+            // inverse to save and all three are dropped together.
+            if bucket_lengths.iter().any(|&n| n < 2) {
+                bucket_lengths.clear();
+                dc.clear();
+                nyquist.clear();
+            }
 
             let state = TrackState {
                 num_harmonics: nhz,
@@ -245,9 +377,13 @@ impl PluginInstance {
                 base_freq: base,
                 duration_secs: dur,
                 sample_rate: sr,
+                display_gain: gain,
                 amplitude,
                 phase,
                 pitch_ratio,
+                bucket_lengths,
+                dc,
+                nyquist,
             };
             state.validate()?;
             Ok(state)
@@ -273,9 +409,28 @@ impl PluginInstance {
                 state.base_freq,
                 state.duration_secs,
                 state.sample_rate,
+                state.display_gain,
                 state.amplitude.as_ptr(),
                 state.phase.as_ptr(),
                 state.pitch_ratio.as_ptr(),
+                // A pre-v3 file or a hand-drawn grid has no exact inverse to
+                // restore; null tells the plugin to leave that path switched off
+                // rather than invert a grid with lengths it never recorded.
+                if state.supports_exact_inverse() {
+                    state.bucket_lengths.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
+                if state.supports_exact_inverse() {
+                    state.dc.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
+                if state.supports_exact_inverse() {
+                    state.nyquist.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
             );
             anyhow::ensure!(rc == 0, "import_grid failed ({rc})");
         }
@@ -327,18 +482,15 @@ impl PluginInstance {
         Ok(())
     }
 
-    /// Push a recorded subtrack to this plugin (same shared object) for
-    /// Fourier analysis. This instance's editor will pick the job up, switch to
-    /// Analysis mode and display the extracted amplitude/phase grid.
+    /// Push a recorded subtrack to this instance for analysis; its editor picks
+    /// the job up, switches to Analysis mode and shows the grid.
     ///
-    /// The job is addressed to *this* instance by token, so it survives until
-    /// this instance's editor opens; the untargeted entry point would let an
-    /// editor already open for another track claim it first, leaving this one
-    /// with empty charts (and overwriting the other's).
+    /// Addressed by token, so it waits for *this* instance's editor. The
+    /// untargeted entry point lets an editor already open for another track
+    /// claim it first, leaving this one with empty charts.
     ///
-    /// `contour` is the per-position fundamental (absolute Hz) uniformly
-    /// resampled across the subtrack; pass an empty slice for flat (legacy)
-    /// analysis.
+    /// `contour` is the per-position fundamental in Hz, uniformly resampled
+    /// across the subtrack; empty = flat.
     pub fn push_analysis(
         &self,
         samples: &[f32],
@@ -409,6 +561,214 @@ impl PluginInstance {
             .map(|h| phase_flat[h * num_buckets..(h + 1) * num_buckets].to_vec())
             .collect();
         Ok((amp, phase))
+    }
+
+    /// Full stateless analysis through the plugin's DSP: the same grid
+    /// `analyze_and_load` builds when the plugin ingests a subtrack, including
+    /// the per-bucket pitch ratio and bucket period that [`Self::analyze`]
+    /// leaves out. `num_buckets == 0` selects the plugin's own
+    /// period-synchronous bucketing, in which case the count is derived from the
+    /// source (hence the two-call probe below).
+    pub fn analyze_full(
+        &self,
+        samples: &[f32],
+        sample_rate: f32,
+        base_freq: f32,
+        contour: &[f32],
+        num_buckets: usize,
+        num_harmonics: usize,
+    ) -> Result<AnalysisGrid> {
+        unsafe {
+            let func: libloading::Symbol<AnalyzeFullProc> = self
+                ._library
+                .get(b"lesynth_fourier_analyze_full\0")
+                .context("plugin does not export lesynth_fourier_analyze_full")?;
+
+            // Probe for the bucket count the analysis will derive, then allocate
+            // exactly that and repeat (the analysis is deterministic).
+            let nb = func(
+                samples.as_ptr(),
+                samples.len(),
+                sample_rate,
+                base_freq,
+                contour.as_ptr(),
+                contour.len(),
+                num_buckets,
+                num_harmonics,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            anyhow::ensure!(nb > 0, "analyze_full probe returned {nb}");
+            let nb = nb as usize;
+
+            let mut amp = vec![0.0f32; num_harmonics * nb];
+            let mut phase = vec![0.0f32; num_harmonics * nb];
+            let mut pitch_ratio = vec![0.0f32; nb];
+            let mut bucket_periods = vec![0.0f32; nb];
+            let mut dc = vec![0.0f32; nb];
+            let mut nyquist = vec![0.0f32; nb];
+            let mut display_gain = 0.0f32;
+            let rc = func(
+                samples.as_ptr(),
+                samples.len(),
+                sample_rate,
+                base_freq,
+                contour.as_ptr(),
+                contour.len(),
+                num_buckets,
+                num_harmonics,
+                0,
+                nb,
+                amp.as_mut_ptr(),
+                phase.as_mut_ptr(),
+                pitch_ratio.as_mut_ptr(),
+                bucket_periods.as_mut_ptr(),
+                &mut display_gain,
+                dc.as_mut_ptr(),
+                nyquist.as_mut_ptr(),
+            );
+            anyhow::ensure!(rc == nb as i64, "analyze_full returned {rc}, expected {nb}");
+
+            Ok(AnalysisGrid {
+                num_harmonics,
+                num_buckets: nb,
+                amplitude: amp,
+                phase,
+                pitch_ratio,
+                bucket_periods,
+                dc,
+                nyquist,
+                display_gain,
+                base_freq,
+                sample_rate,
+                duration_secs: if sample_rate > 0.0 {
+                    samples.len() as f32 / sample_rate
+                } else {
+                    0.0
+                },
+            })
+        }
+    }
+
+    /// Reproduce the analysed source from its grid — the exact inverse of
+    /// [`Self::analyze_full`]. One inverse FFT per bucket returns that period's
+    /// samples, and the concatenation returns the subtrack, exact to float
+    /// rounding. Use [`Self::resynthesize`] for anything transposed onto a key,
+    /// which must resample.
+    ///
+    /// `restore_source_level` divides out [`AnalysisGrid::display_gain`], giving
+    /// the source file's own absolute level.
+    ///
+    /// `output_sample_rate` is the rate this will be played at: the grid's own
+    /// rate is the bit-exact case, any other band-limit-resamples the finished
+    /// reconstruction.
+    pub fn resynthesize_exact(
+        &self,
+        grid: &AnalysisGrid,
+        restore_source_level: bool,
+        output_sample_rate: f32,
+    ) -> Result<Vec<f32>> {
+        unsafe {
+            let func: libloading::Symbol<ResynthesizeExactProc> = self
+                ._library
+                .get(b"lesynth_fourier_resynthesize_exact\0")
+                .context("plugin does not export lesynth_fourier_resynthesize_exact")?;
+
+            let lengths: Vec<u32> = grid.bucket_periods.iter().map(|&p| p as u32).collect();
+            let gain = if restore_source_level { grid.display_gain } else { 0.0 };
+            // Bucket lengths are in the sample rate the audio was analysed at.
+            // Rendering them into a stream at any other rate has to scale, or the
+            // note plays at `out/analysis` times its pitch.
+            let ratio = if grid.sample_rate > 0.0 && output_sample_rate > 0.0 {
+                output_sample_rate / grid.sample_rate
+            } else {
+                1.0
+            };
+            let n = func(
+                grid.num_harmonics,
+                grid.num_buckets,
+                grid.amplitude.as_ptr(),
+                grid.phase.as_ptr(),
+                lengths.as_ptr(),
+                grid.dc.as_ptr(),
+                grid.nyquist.as_ptr(),
+                gain,
+                ratio,
+                std::ptr::null_mut(),
+                0,
+            );
+            anyhow::ensure!(n > 0, "resynthesize_exact returned {n}");
+            let mut out = vec![0.0f32; n as usize];
+            let rc = func(
+                grid.num_harmonics,
+                grid.num_buckets,
+                grid.amplitude.as_ptr(),
+                grid.phase.as_ptr(),
+                lengths.as_ptr(),
+                grid.dc.as_ptr(),
+                grid.nyquist.as_ptr(),
+                gain,
+                ratio,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            anyhow::ensure!(rc == n, "resynthesize_exact returned {rc}, expected {n}");
+            Ok(out)
+        }
+    }
+
+    /// Render a grid back to audio through the plugin's own playback path, with
+    /// no plugin state involved. `base_period` is the **fractional** rendered
+    /// fundamental period in samples (`sample_rate / freq`, unrounded),
+    /// `max_harmonic` an anti-alias cap (`0` = none beyond Nyquist), and
+    /// `target_samples` the Analysis-mode "preserve seconds" length (`0` = one
+    /// cycle per bucket).
+    ///
+    /// `restore_source_level` divides out [`AnalysisGrid::display_gain`], giving
+    /// the source's own absolute level — the only form comparable against the
+    /// file. `false` renders at the grid's level, which is what a key plays.
+    pub fn resynthesize(
+        &self,
+        grid: &AnalysisGrid,
+        base_period: f32,
+        max_harmonic: usize,
+        target_samples: usize,
+        restore_source_level: bool,
+    ) -> Result<Vec<f32>> {
+        unsafe {
+            let func: libloading::Symbol<ResynthesizeProc> = self
+                ._library
+                .get(b"lesynth_fourier_resynthesize\0")
+                .context("plugin does not export lesynth_fourier_resynthesize")?;
+            let call = |out: *mut f32, cap: usize| {
+                func(
+                    grid.num_harmonics,
+                    grid.num_buckets,
+                    grid.amplitude.as_ptr(),
+                    grid.phase.as_ptr(),
+                    grid.pitch_ratio.as_ptr(),
+                    base_period,
+                    max_harmonic,
+                    target_samples,
+                    if restore_source_level { grid.display_gain } else { 0.0 },
+                    out,
+                    cap,
+                )
+            };
+            let n = call(std::ptr::null_mut(), 0);
+            anyhow::ensure!(n >= 0, "resynthesize returned error {n}");
+            let mut out = vec![0.0f32; n as usize];
+            let written = call(out.as_mut_ptr(), out.len());
+            anyhow::ensure!(written == n, "resynthesize length changed ({written} vs {n})");
+            Ok(out)
+        }
     }
 
     /// Create plugin editor view (returns raw pointer for window embedding).
