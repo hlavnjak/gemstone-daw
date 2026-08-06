@@ -25,6 +25,30 @@ arbitrary recording and rebuilds it as additive synthesis you can play and edit:
    running in Analysis mode, where individual harmonics can be toggled and the
    result played back on the keyboard.
 
+## Track Composer
+
+Arrange the tracks on a timeline and play them together. Horizontal is time;
+each row plays exactly one Track — a LeSynth Fourier track, a custom VST3 track,
+or a subtrack published from the Resynthesis panel with "Add as Track" — and any
+number of rows may share the same one.
+
+- **Rows** are added by hand ("➕ Add Track Row"); a fresh instance starts empty.
+  The select box at the head of a row picks its Track, and follows the track
+  list: delete the track a row is playing and the row moves to another one, or
+  to a placeholder while no tracks exist.
+- **Notes** are appended after the last one ("➕ Add Note") as constant-size
+  cards carrying their pitch (`C0`–`B8`) and length (whole … 1/128). Drag a card
+  by its grip to move it along the row; it will not land on an occupied slot, so
+  notes in a row never overlap and dragging only ever inserts silence.
+- **Time is sequential**: a note starts where the previous slot ended, lasting
+  what its length box says; an empty slot is one beat of rest. The tempo control
+  (BPM) sets what a beat is worth.
+- **Play / Stop** at the foot of the section renders the whole arrangement in
+  real time: one output stream, one plugin instance per row, mixed with each
+  row's own gain. The Composer loads its own instances, so a composition plays
+  whether or not the tracks' editors are open — and when one is open, its live
+  grid is what plays.
+
 ## Other features
 
 - **Load Internal plugin** — loads the embedded LeSynth Fourier VST3
@@ -51,6 +75,9 @@ src/
   analysis/{segmentation,mod}.rs          # host-side subtrack segmentation
   gui/
     app.rs            # top-level egui app
+    registry.rs       # the shared list of Tracks every panel agrees on
+    track.rs          # the Tracks panel
+    composer/         # the Track Composer panel + its playback engine
     resynth.rs        # the Resynthesis panel
     editor_window/    # embedded plugin editor window (x11 / windows / fallback)
 ```

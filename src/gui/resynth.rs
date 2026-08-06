@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 
+use super::registry::TrackRegistry;
 use super::track::EditorInstance;
 use crate::analysis::{self, build_contour, Subtrack};
 use crate::audio::{decode_audio_file, AudioEngine, DecodedAudio};
@@ -40,11 +41,18 @@ use crate::vst::{class_ids, PluginInstance};
 const PREVIEW_HARMONICS: usize = 16;
 /// Bucket count requested for the inline host-side preview.
 const PREVIEW_BUCKETS: usize = 128;
+/// Harmonics kept when a subtrack is turned into a Track — the plugin's own grid
+/// height, so the registered grid is the full analysis rather than a preview of
+/// it.
+const TRACK_HARMONICS: usize = 256;
 
 struct SubtrackView {
     sub: Subtrack,
     /// `[harmonic][bucket]` amplitude grid for the inline preview.
     preview_amp: Option<Vec<Vec<f32>>>,
+    /// Set once this subtrack has been registered as a Track the Composer can
+    /// play; the id it was registered under.
+    registry_id: Option<u64>,
     /// The dedicated LeSynth editor for this subtrack, present only while its
     /// window is open. While this is `Some`, "Open in LeSynth" is replaced by a
     /// "Close" control, so repeat clicks never spawn duplicate instances.
@@ -130,6 +138,7 @@ impl AudioFile {
                     .map(|sub| SubtrackView {
                         sub,
                         preview_amp: None,
+                        registry_id: None,
                         editor: None,
                     })
                     .collect();
@@ -167,15 +176,20 @@ pub struct ResynthPanel {
     /// Shared library handle used for the stateless analysis FFI calls, reused
     /// across every open file.
     ffi_plugin: Option<Arc<PluginInstance>>,
+    /// The app-wide track list. A subtrack analysed here can be published to it
+    /// ("Add as Track"), which is what makes resynthesised material available to
+    /// the Composer.
+    registry: TrackRegistry,
 }
 
-impl Default for ResynthPanel {
-    fn default() -> Self {
+impl ResynthPanel {
+    pub fn new(registry: TrackRegistry) -> Self {
         Self {
             files: Vec::new(),
             next_id: 0,
             status: "Add a .wav, .mp3 or .m4a file to begin.".to_string(),
             ffi_plugin: None,
+            registry,
         }
     }
 }
@@ -335,6 +349,74 @@ impl ResynthPanel {
         }
     }
 
+    /// Publish subtrack `sub_idx` to the shared track list, so the Composer can
+    /// put it on a row.
+    ///
+    /// The grid is analysed here and registered *with* the track, rather than
+    /// registering a reference to an open editor: a resynthesised track is then
+    /// playable in a composition without its editor ever being opened, and the
+    /// analysis is the plugin's own (`analyze_full`, full harmonic height), not
+    /// the reduced inline preview.
+    fn add_as_track(&mut self, file_idx: usize, sub_idx: usize) {
+        let already = self
+            .files
+            .get(file_idx)
+            .and_then(|f| f.subtracks.get(sub_idx))
+            .and_then(|v| v.registry_id)
+            .is_some_and(|id| self.registry.contains(id));
+        if already {
+            self.status = "That subtrack is already in the track list.".to_string();
+            return;
+        }
+        let Some((samples, sr, freq, contour)) =
+            self.files.get(file_idx).and_then(|f| f.analysis_inputs(sub_idx))
+        else {
+            return;
+        };
+        let Some(path) = Self::internal_plugin_path() else {
+            self.status = "Could not locate the internal plugin.".to_string();
+            return;
+        };
+        let Some(plugin) = self.ensure_ffi_plugin() else { return };
+        // `0` buckets = the plugin's own period-synchronous bucketing, the only
+        // one whose grid inverts back to the source exactly.
+        let grid = match plugin.analyze_full(&samples, sr, freq, &contour, 0, TRACK_HARMONICS) {
+            Ok(g) => g,
+            Err(e) => {
+                self.status = format!("Analysis failed: {e}");
+                return;
+            }
+        };
+        let name = match self.files.get(file_idx) {
+            Some(f) => format!("{} · subtrack {}", f.display_name(), sub_idx + 1),
+            None => return,
+        };
+        let id = self.registry.add(
+            &name,
+            path,
+            Some(class_ids::FOURIER_SYNTH),
+            true,
+            Some(grid.to_track_state()),
+        );
+        if let Some(view) = self.files.get_mut(file_idx).and_then(|f| f.subtracks.get_mut(sub_idx)) {
+            view.registry_id = Some(id);
+        }
+        self.status = format!("Added “{name}” to the track list — pick it in the Composer.");
+    }
+
+    /// Take a published subtrack back out of the track list. Composer rows using
+    /// it fall back to another track on their next frame.
+    fn remove_from_tracks(&mut self, file_idx: usize, sub_idx: usize) {
+        let Some(view) = self.files.get_mut(file_idx).and_then(|f| f.subtracks.get_mut(sub_idx))
+        else {
+            return;
+        };
+        if let Some(id) = view.registry_id.take() {
+            self.registry.remove(id);
+            self.status = format!("Removed subtrack {} from the track list.", sub_idx + 1);
+        }
+    }
+
     /// Save subtrack `sub_idx`'s live (edited) LeSynth grid to a `.lsft` file.
     /// Resynthesis is export-only; loading happens in the Tracks panel.
     fn export_subtrack(&mut self, file_idx: usize, sub_idx: usize) {
@@ -441,6 +523,26 @@ impl ResynthPanel {
                         if ui.button("Preview FFT").clicked() {
                             action = Some(SubtrackAction::Preview);
                         }
+                        // Publish to the shared track list, so a Composer row can
+                        // play this subtrack.
+                        if view.registry_id.is_some() {
+                            if ui
+                                .button("🗑 Remove from tracks")
+                                .on_hover_text("Take this subtrack back out of the track list")
+                                .clicked()
+                            {
+                                action = Some(SubtrackAction::RemoveTrack);
+                            }
+                        } else if ui
+                            .button("🎼 Add as Track")
+                            .on_hover_text(
+                                "Analyse this subtrack and add it to the track list, \
+                                 so the Composer can play it",
+                            )
+                            .clicked()
+                        {
+                            action = Some(SubtrackAction::AddTrack);
+                        }
                         if view.editor.is_some() {
                             // Editor already open: offer to close it rather than
                             // spawn a duplicate instance.
@@ -493,8 +595,18 @@ impl ResynthPanel {
 
         // Reap editors whose windows the user closed directly, so their audio
         // streams and plugins are released and the on-screen state stays honest.
+        // Published subtracks also keep the registry's live-instance pointer in
+        // step, so the Composer plays the grid as it is being edited here.
         for file in &mut self.files {
             file.reap_closed_editors();
+            for view in &file.subtracks {
+                if let Some(id) = view.registry_id {
+                    self.registry.set_live(
+                        id,
+                        view.editor.as_ref().map(|e| Arc::downgrade(e.plugin())),
+                    );
+                }
+            }
         }
 
         // Deferred actions, so we don't mutate `self` while iterating/borrowing it.
@@ -565,6 +677,13 @@ impl ResynthPanel {
         if let Some(idx) = to_remove {
             if idx < self.files.len() {
                 let removed = self.files.remove(idx);
+                // The file's subtracks go with it, so any track published from
+                // them leaves the registry too.
+                for view in &removed.subtracks {
+                    if let Some(id) = view.registry_id {
+                        self.registry.remove(id);
+                    }
+                }
                 self.status = format!("Removed {}.", removed.display_name());
             }
         }
@@ -580,6 +699,8 @@ impl ResynthPanel {
                     }
                 }
                 SubtrackAction::Export => self.export_subtrack(file_idx, sub_idx),
+                SubtrackAction::AddTrack => self.add_as_track(file_idx, sub_idx),
+                SubtrackAction::RemoveTrack => self.remove_from_tracks(file_idx, sub_idx),
             }
         }
 
@@ -601,4 +722,6 @@ enum SubtrackAction {
     Open,
     Close,
     Export,
+    AddTrack,
+    RemoveTrack,
 }

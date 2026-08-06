@@ -32,6 +32,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use super::editor_window::{open_editor_in_thread, EditorHandle};
+use super::registry::TrackRegistry;
 use crate::audio::AudioEngine;
 use crate::midi::MidiEventQueue;
 use crate::track_format::TrackState;
@@ -101,6 +102,13 @@ impl EditorInstance {
     pub fn export_state(&self) -> Result<TrackState> {
         self._plugin.export_state()
     }
+
+    /// The instance behind this editor, for the track registry to hold weakly —
+    /// that is how the Composer plays the grid as it is being edited rather than
+    /// the one the track was registered with.
+    pub fn plugin(&self) -> &Arc<PluginInstance> {
+        &self._plugin
+    }
 }
 
 impl Drop for EditorInstance {
@@ -129,6 +137,9 @@ enum TrackKind {
 struct PluginTrack {
     /// Stable id, used to key per-track egui widget state across frames.
     id: u64,
+    /// This track's id in the shared [`TrackRegistry`], where the Composer finds
+    /// it. Distinct from `id`, which is local to this panel.
+    registry_id: u64,
     /// Display name (the plugin kind, or the chosen `.so` file name).
     name: String,
     kind: TrackKind,
@@ -196,15 +207,19 @@ pub struct TracksPanel {
     status: String,
     /// Shared MIDI queue, so a connected keyboard plays the open track editors.
     midi_queue: MidiEventQueue,
+    /// The app-wide track list the Composer draws its rows from. Every track
+    /// created here is registered, and removed from it when it goes.
+    registry: TrackRegistry,
 }
 
 impl TracksPanel {
-    pub fn new(midi_queue: MidiEventQueue) -> Self {
+    pub fn new(midi_queue: MidiEventQueue, registry: TrackRegistry) -> Self {
         Self {
             tracks: Vec::new(),
             next_id: 0,
             status: "Add a LeSynth Fourier or custom VST track.".to_string(),
             midi_queue,
+            registry,
         }
     }
 
@@ -231,16 +246,21 @@ impl TracksPanel {
             self.status = format!("Internal plugin not found at {}", path.display());
             return;
         }
-        let track = PluginTrack {
-            id: self.take_id(),
-            name: "LeSynth Fourier".to_string(),
+        let id = self.take_id();
+        let name = format!("LeSynth Fourier {}", id + 1);
+        let registry_id =
+            self.registry
+                .add(&name, path.clone(), Some(class_ids::FOURIER_SYNTH), true, None);
+        self.tracks.push(PluginTrack {
+            id,
+            registry_id,
+            name,
             kind: TrackKind::LeSynth,
             plugin_path: path,
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: None,
             editor: None,
-        };
-        self.tracks.push(track);
+        });
         self.status = "Created LeSynth Fourier track.".to_string();
     }
 
@@ -256,17 +276,19 @@ impl TracksPanel {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        let track = PluginTrack {
-            id: self.take_id(),
+        // Take the first class in the factory — we don't know the plugin's ID.
+        let registry_id = self.registry.add(&name, path.clone(), None, false, None);
+        let id = self.take_id();
+        self.tracks.push(PluginTrack {
+            id,
+            registry_id,
             name,
             kind: TrackKind::CustomVst,
             plugin_path: path,
-            // Take the first class in the factory — we don't know the plugin's ID.
             class_id: None,
             import_state: None,
             editor: None,
-        };
-        self.tracks.push(track);
+        });
         self.status = "Created custom VST track.".to_string();
     }
 
@@ -300,8 +322,18 @@ impl TracksPanel {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "LeSynth track".to_string());
         let id = self.take_id();
+        // The saved grid is registered with the track, so the Composer can play
+        // it without the editor ever being opened.
+        let registry_id = self.registry.add(
+            &name,
+            plugin_path.clone(),
+            Some(class_ids::FOURIER_SYNTH),
+            true,
+            Some(state.clone()),
+        );
         self.tracks.push(PluginTrack {
             id,
+            registry_id,
             name,
             kind: TrackKind::LeSynth,
             plugin_path,
@@ -376,9 +408,15 @@ impl TracksPanel {
         ui.add_space(4.0);
 
         // Reap editors the user closed directly, so button state and resources
-        // stay honest.
+        // stay honest, and keep the registry's view of which instances are live
+        // in step with them — that is what lets the Composer play a grid the
+        // user is editing right now.
         for track in &mut self.tracks {
             track.reap_editor();
+            self.registry.set_live(
+                track.registry_id,
+                track.editor.as_ref().map(|e| Arc::downgrade(e.plugin())),
+            );
         }
 
         // Deferred actions, so we don't mutate a track while iterating.
@@ -464,6 +502,9 @@ impl TracksPanel {
             Some(Action::Remove(idx)) => {
                 if idx < self.tracks.len() {
                     let removed = self.tracks.remove(idx);
+                    // Composer rows pointing here fall back to another track on
+                    // their next frame.
+                    self.registry.remove(removed.registry_id);
                     self.status = format!("Removed {}.", removed.name);
                 }
             }

@@ -198,6 +198,29 @@ impl AnalysisGrid {
         let r = self.pitch_ratio.get(bucket).copied().unwrap_or(1.0);
         (base_period / r.max(1e-3)).max(2.0)
     }
+
+    /// The same grid as a [`TrackState`] — the form an instance is loaded from
+    /// ([`PluginInstance::import_state`]) and a `.lsft` is written in. Lets an
+    /// analysis be turned into a playable track without an editor ever opening.
+    ///
+    /// `bucket_periods` are whole sample counts here; they are `f32` in the grid
+    /// only because that is the ABI's array type.
+    pub fn to_track_state(&self) -> TrackState {
+        TrackState {
+            num_harmonics: self.num_harmonics,
+            num_buckets: self.num_buckets,
+            base_freq: self.base_freq,
+            duration_secs: self.duration_secs,
+            sample_rate: self.sample_rate,
+            display_gain: self.display_gain,
+            amplitude: self.amplitude.clone(),
+            phase: self.phase.clone(),
+            pitch_ratio: self.pitch_ratio.clone(),
+            bucket_lengths: self.bucket_periods.iter().map(|&p| p as u32).collect(),
+            dc: self.dc.clone(),
+            nyquist: self.nyquist.clone(),
+        }
+    }
 }
 
 /// Represents a loaded and initialized VST3 plugin instance.

@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 pub mod app;
+pub mod composer;
 pub mod editor_window;
+pub mod registry;
 pub mod resynth;
 pub mod track;
 

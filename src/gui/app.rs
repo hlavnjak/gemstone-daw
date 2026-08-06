@@ -15,6 +15,8 @@ use eframe::egui;
 
 use crate::midi::{self, MidiEventQueue};
 
+use super::composer::ComposerPanel;
+use super::registry::TrackRegistry;
 use super::resynth::ResynthPanel;
 use super::track::TracksPanel;
 
@@ -31,6 +33,8 @@ pub struct DawApp {
 
     // Instrument tracks (LeSynth Fourier / custom VST), each with its own editor.
     tracks: TracksPanel,
+    // Arrange the registered tracks on a timeline and play them.
+    composer: ComposerPanel,
     // Resynthesis (.wav/.mp3/.m4a → LeSynth Fourier analysis)
     resynth: ResynthPanel,
 }
@@ -38,16 +42,20 @@ pub struct DawApp {
 impl Default for DawApp {
     fn default() -> Self {
         let midi_queue = midi::new_midi_queue();
+        // The one track list the panels share: Tracks and Resynthesis publish
+        // into it, the Composer builds its rows from it.
+        let registry = TrackRegistry::default();
         Self {
             midi_status: "Disconnected".to_string(),
             midi_ports: Vec::new(),
             selected_midi_port: None,
             usb_keyboards: Vec::new(),
             selected_usb_keyboard: None,
-            tracks: TracksPanel::new(midi_queue.clone()),
+            tracks: TracksPanel::new(midi_queue.clone(), registry.clone()),
+            composer: ComposerPanel::new(registry.clone()),
             midi_queue,
             _midi_connection: None,
-            resynth: ResynthPanel::default(),
+            resynth: ResynthPanel::new(registry),
         }
     }
 }
@@ -254,6 +262,10 @@ impl eframe::App for DawApp {
                     ui.add_space(6.0);
                     Self::section(ui, "Tracks", |ui| {
                         self.tracks.ui(ui);
+                    });
+                    ui.add_space(14.0);
+                    Self::section(ui, "Track Composer", |ui| {
+                        self.composer.ui(ui);
                     });
                     ui.add_space(14.0);
                     self.midi_section(ui);
