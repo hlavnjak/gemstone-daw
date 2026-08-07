@@ -21,11 +21,14 @@
 //! together exactly to the extent that the lengths before a frame add up the
 //! same — that is what makes a chord.
 //!
-//! **Two kinds of frame.** A *note* frame carries a pitch and a length. A *space*
-//! frame (drawn in its own colour) carries only a length: it is silence. Pressing
-//! "➕ Add Note" appends both — the note, then a space right behind it — because
-//! a note followed by nothing but the next note is rarely what is wanted, and the
-//! space is where the silence between them is edited.
+//! **Two kinds of frame, tied in pairs.** A *note* frame carries a pitch and a
+//! length. A *space* frame (drawn in its own colour) carries only a length: it is
+//! the silence after that note. "➕ Add Note" appends both, and they stay
+//! together — the space has no delete button of its own and leaves only when its
+//! note is deleted. In the model they are one [`Item`], so no code path can
+//! orphan a space or leave a note without one. A space of length zero is normal:
+//! a placeholder that holds its frame, ready to be given a length, while the next
+//! note follows on immediately.
 //!
 //! **Length is two select boxes**, not one: a whole-note count and a fraction
 //! down to a 1/256, added together. Time is counted in [`UNITS_PER_WHOLE`]ths of
@@ -164,21 +167,29 @@ fn pitch_name(pitch: u8) -> String {
     format!("{}{}", NAMES[(pitch % 12) as usize], pitch as i32 / 12 - 1)
 }
 
-/// One frame in a row: either a note or the silence after one.
+/// A note and the space tied behind it — two frames on screen, one thing in the
+/// model. They are stored together rather than as two entries in the row
+/// because the space is not independently removable: it exists only as the
+/// silence after *this* note, and goes when the note goes. Making that
+/// structural means no code path can leave a space orphaned.
 #[derive(Clone, Copy)]
 struct Item {
     /// Stable within its row, so the egui widget ids survive frames being
     /// deleted around it.
     id: u64,
-    /// The pitch a note frame sounds; `None` marks a space frame, which has a
-    /// length but nothing to play.
-    pitch: Option<u8>,
+    pitch: u8,
+    /// How long the note sounds.
     dur: Duration,
+    /// The silence after it. Zero is legal and useful: the frame stays on
+    /// screen as a placeholder, ready to be given a length, while the next note
+    /// follows on immediately.
+    space: Duration,
 }
 
 impl Item {
-    fn is_space(&self) -> bool {
-        self.pitch.is_none()
+    /// The note and its space together — what the next note waits for.
+    fn total_units(&self) -> i64 {
+        self.dur.units() + self.space.units()
     }
 }
 
@@ -190,7 +201,7 @@ struct Row {
     /// is empty.
     track_id: Option<u64>,
     gain: f32,
-    /// In play order: frame `n` starts where frame `n - 1` ended.
+    /// In play order: item `n` starts where item `n - 1`'s space ended.
     items: Vec<Item>,
     next_item_id: u64,
 }
@@ -206,39 +217,41 @@ impl Row {
         }
     }
 
-    /// Total length of the row in units — the frames simply add up.
+    /// Total length of the row in units — the items simply add up.
     fn end_units(&self) -> i64 {
-        self.items.iter().map(|i| i.dur.units()).sum()
+        self.items.iter().map(Item::total_units).sum()
     }
 
-    fn push(&mut self, pitch: Option<u8>, dur: Duration) {
-        let id = self.next_item_id;
-        self.next_item_id += 1;
-        self.items.push(Item { id, pitch, dur });
-    }
-
-    /// Append a note and, right behind it, the space that separates it from
+    /// Append a note and, tied behind it, the space that separates it from
     /// whatever comes next.
     fn add_note(&mut self) {
-        self.push(Some(DEFAULT_PITCH), Duration::new(0, Fraction::Quarter));
-        self.push(None, Duration::new(0, Fraction::Eighth));
+        let id = self.next_item_id;
+        self.next_item_id += 1;
+        self.items.push(Item {
+            id,
+            pitch: DEFAULT_PITCH,
+            dur: Duration::new(0, Fraction::Quarter),
+            space: Duration::new(0, Fraction::Eighth),
+        });
     }
 
+    /// Delete a note *and* the space tied to it — the only way either of them
+    /// leaves the row.
     fn delete_item(&mut self, idx: usize) {
         if idx < self.items.len() {
             self.items.remove(idx);
         }
     }
 
-    /// Where each frame starts, in units — the running sum of the lengths before
-    /// it. One entry per frame.
+    /// Where each note starts, in units — the running sum of everything before
+    /// it. One entry per item; its space starts where the note ends.
     fn starts(&self) -> Vec<i64> {
         let mut at = 0;
         self.items
             .iter()
             .map(|i| {
                 let start = at;
-                at += i.dur.units();
+                at += i.total_units();
                 start
             })
             .collect()
@@ -251,16 +264,14 @@ impl Row {
         let mut out = Vec::new();
         for item in &self.items {
             let units = item.dur.units();
-            if let Some(pitch) = item.pitch {
-                if units > 0 {
-                    out.push(PlannedNote {
-                        at_secs: at as f64 * spu,
-                        dur_secs: units as f64 * spu,
-                        pitch,
-                    });
-                }
+            if units > 0 {
+                out.push(PlannedNote {
+                    at_secs: at as f64 * spu,
+                    dur_secs: units as f64 * spu,
+                    pitch: item.pitch,
+                });
             }
-            at += units;
+            at += item.total_units();
         }
         out
     }
@@ -510,8 +521,9 @@ impl ComposerPanel {
         }
     }
 
-    /// A row's frames, left to right in play order. Editing a frame's length or
-    /// pitch is immediate; everything after it simply shifts, because a frame's
+    /// A row's frames, left to right in play order — each item drawn as its note
+    /// frame followed by its tied space frame. Editing a frame's length or pitch
+    /// is immediate; everything after it simply shifts, because a frame's
     /// position is nothing but the sum of the lengths before it.
     fn chain_ui(ui: &mut egui::Ui, row: &mut Row, playhead: Option<f64>) {
         // Deferred: removing a frame rewrites the list this loop walks.
@@ -530,14 +542,21 @@ impl ComposerPanel {
                 );
             }
             for (idx, (item, start)) in row.items.iter_mut().zip(starts).enumerate() {
-                let sounding = playhead.is_some_and(|p| {
-                    !item.is_space()
-                        && p >= start as f64
-                        && p < (start + item.dur.units()) as f64
-                });
-                if Self::frame_ui(ui, row_id, item, sounding) {
+                let sounding = playhead
+                    .is_some_and(|p| p >= start as f64 && p < (start + item.dur.units()) as f64);
+                if Self::frame_ui(
+                    ui,
+                    row_id,
+                    item.id,
+                    Some(&mut item.pitch),
+                    &mut item.dur,
+                    sounding,
+                ) {
                     pending_delete = Some(idx);
                 }
+                // The space tied to it, drawn right behind it and carrying no
+                // delete button of its own: it leaves only with its note.
+                Self::frame_ui(ui, row_id, item.id, None, &mut item.space, false);
             }
         });
 
@@ -548,11 +567,20 @@ impl ComposerPanel {
 
     /// One frame. Returns `true` when its delete button was pressed.
     ///
-    /// A note frame is blue and carries three select boxes — pitch, whole part
-    /// of the length, fractional part. A space frame is amber and carries only
-    /// the two length boxes: it has no pitch to choose.
-    fn frame_ui(ui: &mut egui::Ui, row_id: u64, item: &mut Item, sounding: bool) -> bool {
-        let space = item.is_space();
+    /// `pitch` is what decides which frame this is: `Some` draws the blue note
+    /// frame — three select boxes (pitch, whole part of the length, fractional
+    /// part) and a delete button. `None` draws the amber space frame, which has
+    /// no pitch to choose and *no delete button*: a space is tied to its note
+    /// and can only leave with it.
+    fn frame_ui(
+        ui: &mut egui::Ui,
+        row_id: u64,
+        id: u64,
+        pitch: Option<&mut u8>,
+        dur: &mut Duration,
+        sounding: bool,
+    ) -> bool {
+        let space = pitch.is_none();
         let (fill, stroke, header) = match (space, sounding) {
             (true, _) => (
                 egui::Color32::from_rgb(78, 62, 38),
@@ -572,7 +600,6 @@ impl ComposerPanel {
         };
 
         let mut deleted = false;
-        let id = item.id;
         ui.allocate_ui_with_layout(
             egui::vec2(CARD_W, CARD_H),
             egui::Layout::top_down(egui::Align::Min),
@@ -589,30 +616,28 @@ impl ComposerPanel {
                         ui.spacing_mut().item_spacing.y = 3.0;
                         ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
 
-                        // Header: what the frame is and how long, plus its
-                        // delete button. Laid out from the right so the button
-                        // keeps its corner and a long title truncates instead of
-                        // pushing the card wider than its neighbours.
+                        // Header: what the frame is and how long. The note frame
+                        // also carries the delete button, laid out from the
+                        // right so it keeps its corner and a long title
+                        // truncates instead of pushing the card wider than its
+                        // neighbours.
                         ui.horizontal(|ui| {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui
-                                        .add(egui::Button::new("✖").small().frame(false))
-                                        .on_hover_text(if space {
-                                            "Delete this space"
-                                        } else {
-                                            "Delete this note"
-                                        })
-                                        .clicked()
+                                    if !space
+                                        && ui
+                                            .add(egui::Button::new("✖").small().frame(false))
+                                            .on_hover_text(
+                                                "Delete this note and the space tied to it",
+                                            )
+                                            .clicked()
                                     {
                                         deleted = true;
                                     }
-                                    let title = match item.pitch {
-                                        Some(p) => {
-                                            format!("{} · {}", pitch_name(p), item.dur.label())
-                                        }
-                                        None => format!("space · {}", item.dur.label()),
+                                    let title = match &pitch {
+                                        Some(p) => format!("{} · {}", pitch_name(**p), dur.label()),
+                                        None => format!("space · {}", dur.label()),
                                     };
                                     ui.add(
                                         egui::Label::new(
@@ -624,7 +649,7 @@ impl ComposerPanel {
                             );
                         });
 
-                        if let Some(pitch) = item.pitch.as_mut() {
+                        if let Some(pitch) = pitch {
                             egui::ComboBox::from_id_salt(("pitch", row_id, id))
                                 .width(inner_w)
                                 .height(260.0)
@@ -638,28 +663,27 @@ impl ComposerPanel {
                                 .on_hover_text("Pitch");
                         }
 
-                        egui::ComboBox::from_id_salt(("wholes", row_id, id))
+                        // Both boxes reach zero, and for a space that is the
+                        // point: a 0-length space is a placeholder that keeps
+                        // its frame without putting any silence in the row.
+                        egui::ComboBox::from_id_salt(("wholes", row_id, id, space))
                             .width(inner_w)
                             .height(260.0)
-                            .selected_text(format!("{} whole", item.dur.wholes))
+                            .selected_text(format!("{} whole", dur.wholes))
                             .show_ui(ui, |ui| {
                                 for w in 0..=MAX_WHOLES {
-                                    ui.selectable_value(
-                                        &mut item.dur.wholes,
-                                        w,
-                                        format!("{w} whole"),
-                                    );
+                                    ui.selectable_value(&mut dur.wholes, w, format!("{w} whole"));
                                 }
                             })
                             .response
                             .on_hover_text("Whole notes — the whole part of the length");
 
-                        egui::ComboBox::from_id_salt(("frac", row_id, id))
+                        egui::ComboBox::from_id_salt(("frac", row_id, id, space))
                             .width(inner_w)
-                            .selected_text(item.dur.frac.label())
+                            .selected_text(dur.frac.label())
                             .show_ui(ui, |ui| {
                                 for f in Fraction::ALL {
-                                    ui.selectable_value(&mut item.dur.frac, f, f.label());
+                                    ui.selectable_value(&mut dur.frac, f, f.label());
                                 }
                             })
                             .response
@@ -739,35 +763,82 @@ mod tests {
     const QUARTER: i64 = UNITS_PER_WHOLE / 4;
     const EIGHTH: i64 = UNITS_PER_WHOLE / 8;
 
-    fn row_with(items: &[(Option<u8>, u8, Fraction)]) -> Row {
+    /// `(pitch, note length, space length)` per item.
+    fn row_with(items: &[(u8, Duration, Duration)]) -> Row {
         let mut row = Row::new(0, None);
-        for (pitch, wholes, frac) in items {
-            row.push(*pitch, Duration::new(*wholes, *frac));
+        for (pitch, dur, space) in items {
+            let id = row.next_item_id;
+            row.next_item_id += 1;
+            row.items.push(Item {
+                id,
+                pitch: *pitch,
+                dur: *dur,
+                space: *space,
+            });
         }
         row
     }
 
+    /// Shorthand for a length with no whole-note part.
+    const fn frac(f: Fraction) -> Duration {
+        Duration::new(0, f)
+    }
+
     /// The requirement: one press of "Add Note" leaves a note *and* the space
-    /// behind it, in that order, and the space has no pitch to edit.
+    /// behind it.
     #[test]
     fn adding_a_note_appends_the_note_and_a_space_behind_it() {
         let mut row = row_with(&[]);
         row.add_note();
-        assert_eq!(row.items.len(), 2);
-        assert_eq!(row.items[0].pitch, Some(DEFAULT_PITCH));
-        assert!(!row.items[0].is_space());
-        assert!(row.items[1].is_space());
-        assert_eq!(row.items[1].pitch, None);
+        assert_eq!(row.items.len(), 1);
+        assert_eq!(row.items[0].pitch, DEFAULT_PITCH);
+        assert!(row.items[0].dur.units() > 0);
+        assert!(row.items[0].space.units() > 0);
 
-        // And again: the chain grows note, space, note, space.
         row.add_note();
-        let kinds: Vec<bool> = row.items.iter().map(Item::is_space).collect();
-        assert_eq!(kinds, vec![false, true, false, true]);
-        // Ids stay unique, so two frames never share a widget id.
-        let mut ids: Vec<u64> = row.items.iter().map(|i| i.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), row.items.len());
+        assert_eq!(row.items.len(), 2);
+        // Ids stay unique, so two items never share a widget id.
+        assert_ne!(row.items[0].id, row.items[1].id);
+    }
+
+    /// The space is tied to its note: there is no way to remove one and keep the
+    /// other, and deleting the note takes its space with it.
+    #[test]
+    fn a_space_can_only_leave_with_the_note_it_is_tied_to() {
+        let mut row = row_with(&[
+            (60, frac(Fraction::Quarter), frac(Fraction::Half)),
+            (64, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+        ]);
+        assert_eq!(
+            row.end_units(),
+            QUARTER + UNITS_PER_WHOLE / 2 + QUARTER + EIGHTH
+        );
+
+        // Delete the first note: its half-note space goes too, so the row loses
+        // both lengths and the second note starts at zero.
+        row.delete_item(0);
+        assert_eq!(row.items.len(), 1);
+        assert_eq!(row.items[0].pitch, 64);
+        assert_eq!(row.end_units(), QUARTER + EIGHTH);
+        assert_eq!(row.starts(), vec![0]);
+    }
+
+    /// A space of length zero is legal — the placeholder case: the frame stays,
+    /// the row does not grow, and the next note follows on immediately.
+    #[test]
+    fn a_space_may_be_zero_length() {
+        let spu = 1.0;
+        let row = row_with(&[
+            (60, frac(Fraction::Quarter), Duration::new(0, Fraction::None)),
+            (64, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+        ]);
+        // The zero space is still an item's space — nothing is dropped …
+        assert_eq!(row.items[0].space.units(), 0);
+        assert_eq!(row.items[0].space.label(), "0");
+        // … and it adds no time: the second note starts as the first one ends.
+        let notes = row.planned_notes(spu);
+        assert_eq!(notes[1].at_secs, QUARTER as f64);
+        assert_eq!(row.end_units(), QUARTER + QUARTER + EIGHTH);
     }
 
     /// A length is the whole part plus the fractional part, and 1/256 is the
@@ -795,18 +866,17 @@ mod tests {
         assert_eq!(Duration::new(3, Fraction::None).label(), "3");
     }
 
-    /// Frames are played one after another: a frame starts where the previous
-    /// one ended, and a space is silence of exactly its own length.
+    /// Frames are played one after another: a note starts where the previous
+    /// note's space ended, and a space is silence of exactly its own length.
     #[test]
     fn frames_play_in_sequence_and_spaces_are_the_silences() {
         let spu = 1.0; // one second per unit keeps the arithmetic readable
         let row = row_with(&[
-            (Some(60), 0, Fraction::Quarter),
-            (None, 0, Fraction::Eighth),
-            (Some(64), 0, Fraction::Quarter),
+            (60, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+            (64, frac(Fraction::Quarter), frac(Fraction::None)),
         ]);
         let notes = row.planned_notes(spu);
-        assert_eq!(notes.len(), 2); // the space is not played
+        assert_eq!(notes.len(), 2); // the spaces are not played
         assert_eq!(notes[0].at_secs, 0.0);
         assert_eq!(notes[0].dur_secs, QUARTER as f64);
         // The second note waits out the quarter *and* the eighth of silence.
@@ -814,12 +884,16 @@ mod tests {
         assert_eq!(notes[1].pitch, 64);
         assert_eq!(row.end_units(), QUARTER + EIGHTH + QUARTER);
 
-        // A note left at length zero is silence, not a click.
-        let row = row_with(&[(Some(60), 0, Fraction::None), (Some(62), 0, Fraction::Half)]);
+        // A note left at length zero is silence, not a click — but its space
+        // still counts, so what follows keeps its place.
+        let row = row_with(&[
+            (60, frac(Fraction::None), frac(Fraction::Eighth)),
+            (62, frac(Fraction::Half), frac(Fraction::None)),
+        ]);
         let notes = row.planned_notes(spu);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].pitch, 62);
-        assert_eq!(notes[0].at_secs, 0.0);
+        assert_eq!(notes[0].at_secs, EIGHTH as f64);
     }
 
     /// Every row starts at zero, so rows sound together exactly when the lengths
@@ -829,40 +903,42 @@ mod tests {
     fn equal_lengths_before_a_note_make_it_sound_with_another_row() {
         let spu = 0.5 / UNITS_PER_BEAT as f64; // 120 BPM
 
-        // Two eighths played, then the note.
+        // Two eighths played back to back, then the note.
         let dense = row_with(&[
-            (Some(60), 0, Fraction::Eighth),
-            (Some(62), 0, Fraction::Eighth),
-            (Some(64), 1, Fraction::None),
+            (60, frac(Fraction::Eighth), frac(Fraction::None)),
+            (62, frac(Fraction::Eighth), frac(Fraction::None)),
+            (64, Duration::new(1, Fraction::None), frac(Fraction::None)),
         ]);
-        // A quarter of silence, then the note — the same moment, reached by a
-        // different route.
-        let sparse = row_with(&[(None, 0, Fraction::Quarter), (Some(67), 1, Fraction::None)]);
+        // A note cut short and a long space instead — the same moment, reached
+        // by a different route.
+        let sparse = row_with(&[
+            (59, frac(Fraction::Eighth), frac(Fraction::Eighth)),
+            (67, Duration::new(1, Fraction::None), frac(Fraction::None)),
+        ]);
 
         let third = dense.planned_notes(spu)[2].at_secs;
-        // The space is not a played note, so the row's only note is at index 0.
-        let second = sparse.planned_notes(spu)[0].at_secs;
+        let second = sparse.planned_notes(spu)[1].at_secs;
         assert_eq!(third, second);
-        assert_eq!(third, QUARTER as f64 * spu);
+        assert_eq!(third, (EIGHTH + EIGHTH) as f64 * spu);
         // …and a row whose lengths do not add up the same does not join them.
         let off = row_with(&[
-            (None, 0, Fraction::Eighth),
-            (Some(67), 1, Fraction::None),
+            (59, frac(Fraction::Sixteenth), frac(Fraction::None)),
+            (67, Duration::new(1, Fraction::None), frac(Fraction::None)),
         ]);
-        assert_ne!(off.planned_notes(spu)[0].at_secs, third);
+        assert_ne!(off.planned_notes(spu)[1].at_secs, third);
     }
 
-    /// Deleting a frame closes the gap: everything behind it moves earlier by
-    /// exactly that frame's length.
+    /// Deleting from the middle closes the gap: everything behind moves earlier
+    /// by exactly the note *and* space that went with it.
     #[test]
     fn deleting_a_frame_pulls_the_rest_forward() {
         let mut row = row_with(&[
-            (Some(60), 0, Fraction::Quarter),
-            (None, 0, Fraction::Half),
-            (Some(64), 0, Fraction::Quarter),
+            (60, frac(Fraction::Quarter), frac(Fraction::None)),
+            (62, frac(Fraction::Quarter), frac(Fraction::Quarter)),
+            (64, frac(Fraction::Quarter), frac(Fraction::None)),
         ]);
-        assert_eq!(row.starts(), vec![0, QUARTER, QUARTER + UNITS_PER_WHOLE / 2]);
-        row.delete_item(1); // drop the silence
+        assert_eq!(row.starts(), vec![0, QUARTER, 3 * QUARTER]);
+        row.delete_item(1); // takes its own quarter of silence with it
         assert_eq!(row.items.len(), 2);
         assert_eq!(row.starts(), vec![0, QUARTER]);
         assert_eq!(row.end_units(), 2 * QUARTER);
@@ -951,13 +1027,17 @@ mod tests {
         panel.rows[0].add_note();
         frame(&mut panel);
 
-        // Two rows on the same track, which the spec allows.
+        // Two rows on the same track, which the spec allows. The longest length
+        // the boxes can name, and a zero-length placeholder space, are the two
+        // extremes a frame has to lay out at.
         panel.add_row();
         panel.rows[1].add_note();
         panel.rows[1].items[0].dur = Duration::new(MAX_WHOLES, Fraction::TwoHundredFiftySixth);
+        panel.rows[1].items[0].space = Duration::new(0, Fraction::None);
         frame(&mut panel);
 
-        // A deleted frame must not leave a stale widget id behind.
+        // A deleted item must not leave a stale widget id behind — neither for
+        // its note frame nor for the space that went with it.
         panel.rows[0].delete_item(0);
         frame(&mut panel);
 

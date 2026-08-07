@@ -45,6 +45,10 @@ rows may share the same one.
   whole-note part of its length, and the fractional part (1/2 … 1/256). A space
   frame carries only the two length boxes; it has no pitch. A length is the two
   parts added together, so `1` + `1/8` is a whole note tied to an eighth.
+- **A space belongs to its note.** It has no delete button of its own: the ✖ on
+  a note frame removes the note *and* its space, and there is no way to remove
+  one without the other. Setting a space to `0 whole` + `—` is the way to run
+  two notes together — the frame stays as a placeholder, but adds no time.
 - **Time**: every row starts at zero, so two rows sound together exactly when the
   lengths in front of their frames add up the same — that is what makes a chord.
   The tempo control (BPM) sets what a beat is worth — a beat is a quarter note.
