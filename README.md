@@ -27,27 +27,32 @@ arbitrary recording and rebuilds it as additive synthesis you can play and edit:
 
 ## Track Composer
 
-Arrange the tracks on a timeline and play them together. Horizontal is time;
-each row plays exactly one Track — a LeSynth Fourier track, a custom VST3 track,
-or a subtrack published from the Resynthesis panel with "Add as Track" — and any
-number of rows may share the same one.
+Arrange the tracks in rows of frames and play them together. Each row plays
+exactly one Track — a LeSynth Fourier track, a custom VST3 track, or a subtrack
+published from the Resynthesis panel with "Add as Track" — and any number of
+rows may share the same one.
 
 - **Rows** are added by hand ("➕ Add Track Row"); a fresh instance starts empty.
   The select box at the head of a row picks its Track, and follows the track
   list: delete the track a row is playing and the row moves to another one, or
   to a placeholder while no tracks exist.
-- **Notes** are appended after the last one ("➕ Add Note") as constant-size
-  cards carrying their pitch (`C0`–`B8`) and length (whole … 1/128). Drag a card
-  by its grip to move it along the row; it will not land on an occupied slot, so
-  notes in a row never overlap and dragging only ever inserts silence.
-- **Time is sequential**: a note starts where the previous slot ended, lasting
-  what its length box says; an empty slot is one beat of rest. The tempo control
-  (BPM) sets what a beat is worth.
+- **A row is a sequence of frames**, laid left to right and simply played one
+  after another: nothing is positioned by hand, nothing is dragged, and nothing
+  can overlap. Deleting a frame pulls everything behind it forward.
+- **Notes and spaces.** "➕ Add Note" appends two frames: a **note** frame
+  (blue), and behind it a **space** frame (amber) which is the silence that
+  follows. A note frame carries three select boxes — pitch (`C0`–`B8`), the
+  whole-note part of its length, and the fractional part (1/2 … 1/256). A space
+  frame carries only the two length boxes; it has no pitch. A length is the two
+  parts added together, so `1` + `1/8` is a whole note tied to an eighth.
+- **Time**: every row starts at zero, so two rows sound together exactly when the
+  lengths in front of their frames add up the same — that is what makes a chord.
+  The tempo control (BPM) sets what a beat is worth — a beat is a quarter note.
 - **Play / Stop** at the foot of the section renders the whole arrangement in
-  real time: one output stream, one plugin instance per row, mixed with each
-  row's own gain. The Composer loads its own instances, so a composition plays
-  whether or not the tracks' editors are open — and when one is open, its live
-  grid is what plays.
+  real time, lighting up the frame each row is sounding as it goes: one output
+  stream, one plugin instance per row, mixed with each row's own gain. The
+  Composer loads its own instances, so a composition plays whether or not the
+  tracks' editors are open — and when one is open, its live grid is what plays.
 
 ## Other features
 

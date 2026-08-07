@@ -11,21 +11,29 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! Track Composer — arrange the registered Tracks on a timeline and play them.
+//! Track Composer — arrange the registered Tracks in rows of frames and play them.
 //!
-//! Horizontal is time. Each row plays exactly one Track (picked in the select
-//! box at its head), and several rows may share the same Track. Rows are added
-//! by hand: a fresh instance starts with none.
+//! **A row is a sequence, not a canvas.** Each row plays exactly one Track
+//! (picked in the select box at its head), and several rows may share the same
+//! Track. A row holds a chain of frames laid left to right, and each frame is
+//! simply played after the one before it: nothing is positioned, nothing is
+//! dragged, and nothing can overlap. Every row starts at time zero, so rows sound
+//! together exactly to the extent that the lengths before a frame add up the
+//! same — that is what makes a chord.
 //!
-//! **Slots, not pixels.** A row is a list of fixed-width slots, each either a
-//! note or a rest. "+ Add Note" appends after the last note; dragging a note
-//! moves it between slots and refuses to land on an occupied one, so notes in a
-//! row can never overlap and the only thing dragging can produce is silence.
+//! **Two kinds of frame.** A *note* frame carries a pitch and a length. A *space*
+//! frame (drawn in its own colour) carries only a length: it is silence. Pressing
+//! "➕ Add Note" appends both — the note, then a space right behind it — because
+//! a note followed by nothing but the next note is rarely what is wanted, and the
+//! space is where the silence between them is edited.
 //!
-//! **Time is sequential.** A note's onset is where the previous slot ended: a
-//! note lasts what its length box says, an empty slot lasts [`REST_BEATS`]. So
-//! the length box shapes the rhythm and the gaps stretch it, at the tempo set on
-//! the transport. Playback itself lives in [`player`].
+//! **Length is two select boxes**, not one: a whole-note count and a fraction
+//! down to a 1/256, added together. Time is counted in [`UNITS_PER_WHOLE`]ths of
+//! a whole note, so every length either box can name is a whole number of units
+//! and the arithmetic stays exact.
+//!
+//! Playback (and the transport that highlights the sounding frame) lives in
+//! [`player`].
 
 pub mod player;
 
@@ -34,29 +42,37 @@ use eframe::egui;
 use self::player::{CompositionPlayer, PlannedNote, RowPlan};
 use super::registry::TrackRegistry;
 
-/// Beats one empty slot is silent for.
-const REST_BEATS: f64 = 1.0;
+/// Time resolution: a whole note is this many units. 256 makes every fraction in
+/// [`Fraction`] — down to a 1/256 — a whole number of them, so lengths and the
+/// positions they add up to are exact integer arithmetic.
+const UNITS_PER_WHOLE: i64 = 256;
+/// A beat is a quarter note.
+const UNITS_PER_BEAT: i64 = UNITS_PER_WHOLE / 4;
 
-/// Note card size. Constant by design — a note's width says nothing about its
-/// length here; the length box does.
-const SLOT_W: f32 = 104.0;
-const SLOT_H: f32 = 104.0;
+/// On-screen width of one frame. Fixed: a frame carries up to three select boxes
+/// and stops being usable below about this width, and a width proportional to
+/// the length would make a 1/256 invisible.
+const CARD_W: f32 = 108.0;
+/// Height of one frame — a header line plus up to three select boxes.
+const CARD_H: f32 = 112.0;
+/// Height of one row's lane. The frames plus a little air around them.
+const ROW_H: f32 = CARD_H + 10.0;
 /// Width of the fixed row head (track select, add-note, gain).
-const HEAD_W: f32 = 292.0;
-/// Empty slots drawn past the end of a row, so there is always somewhere to drag
-/// a note to.
-const TRAILING_SLOTS: usize = 4;
+const HEAD_W: f32 = 284.0;
 
 /// Lowest and highest note offered, C0..B8.
 const PITCH_MIN: u8 = 12;
 const PITCH_MAX: u8 = 119;
 /// A new note starts at middle C.
 const DEFAULT_PITCH: u8 = 60;
+/// Largest whole-note count a length may carry.
+const MAX_WHOLES: u8 = 16;
 
-/// Note duration, as the fraction of a whole note it is named for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NoteLength {
-    Whole,
+/// The fractional part of a length, as the fraction of a whole note it is named
+/// for. `None` is a length that is a whole number of whole notes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fraction {
+    None,
     Half,
     Quarter,
     Eighth,
@@ -64,44 +80,78 @@ pub enum NoteLength {
     ThirtySecond,
     SixtyFourth,
     HundredTwentyEighth,
+    TwoHundredFiftySixth,
 }
 
-impl NoteLength {
-    const ALL: [NoteLength; 8] = [
-        NoteLength::Whole,
-        NoteLength::Half,
-        NoteLength::Quarter,
-        NoteLength::Eighth,
-        NoteLength::Sixteenth,
-        NoteLength::ThirtySecond,
-        NoteLength::SixtyFourth,
-        NoteLength::HundredTwentyEighth,
+impl Fraction {
+    const ALL: [Fraction; 9] = [
+        Fraction::None,
+        Fraction::Half,
+        Fraction::Quarter,
+        Fraction::Eighth,
+        Fraction::Sixteenth,
+        Fraction::ThirtySecond,
+        Fraction::SixtyFourth,
+        Fraction::HundredTwentyEighth,
+        Fraction::TwoHundredFiftySixth,
     ];
 
-    /// Length in beats, a beat being a quarter note.
-    fn beats(self) -> f64 {
+    /// Length in grid units.
+    fn units(self) -> i64 {
         match self {
-            NoteLength::Whole => 4.0,
-            NoteLength::Half => 2.0,
-            NoteLength::Quarter => 1.0,
-            NoteLength::Eighth => 0.5,
-            NoteLength::Sixteenth => 0.25,
-            NoteLength::ThirtySecond => 0.125,
-            NoteLength::SixtyFourth => 0.0625,
-            NoteLength::HundredTwentyEighth => 0.03125,
+            Fraction::None => 0,
+            Fraction::Half => UNITS_PER_WHOLE / 2,
+            Fraction::Quarter => UNITS_PER_WHOLE / 4,
+            Fraction::Eighth => UNITS_PER_WHOLE / 8,
+            Fraction::Sixteenth => UNITS_PER_WHOLE / 16,
+            Fraction::ThirtySecond => UNITS_PER_WHOLE / 32,
+            Fraction::SixtyFourth => UNITS_PER_WHOLE / 64,
+            Fraction::HundredTwentyEighth => UNITS_PER_WHOLE / 128,
+            Fraction::TwoHundredFiftySixth => 1,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            NoteLength::Whole => "whole",
-            NoteLength::Half => "1/2",
-            NoteLength::Quarter => "1/4",
-            NoteLength::Eighth => "1/8",
-            NoteLength::Sixteenth => "1/16",
-            NoteLength::ThirtySecond => "1/32",
-            NoteLength::SixtyFourth => "1/64",
-            NoteLength::HundredTwentyEighth => "1/128",
+            Fraction::None => "—",
+            Fraction::Half => "1/2",
+            Fraction::Quarter => "1/4",
+            Fraction::Eighth => "1/8",
+            Fraction::Sixteenth => "1/16",
+            Fraction::ThirtySecond => "1/32",
+            Fraction::SixtyFourth => "1/64",
+            Fraction::HundredTwentyEighth => "1/128",
+            Fraction::TwoHundredFiftySixth => "1/256",
+        }
+    }
+}
+
+/// A length: a whole-note count plus a fraction, added together. Both parts are
+/// picked in their own select box, which is why they are stored apart rather
+/// than as a single unit count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Duration {
+    /// Whole notes, `0..=`[`MAX_WHOLES`].
+    wholes: u8,
+    frac: Fraction,
+}
+
+impl Duration {
+    const fn new(wholes: u8, frac: Fraction) -> Self {
+        Self { wholes, frac }
+    }
+
+    fn units(self) -> i64 {
+        self.wholes as i64 * UNITS_PER_WHOLE + self.frac.units()
+    }
+
+    /// How the length reads in the frame's header, e.g. `1 + 1/8`.
+    fn label(self) -> String {
+        match (self.wholes, self.frac) {
+            (0, Fraction::None) => "0".to_string(),
+            (0, f) => f.label().to_string(),
+            (w, Fraction::None) => w.to_string(),
+            (w, f) => format!("{w} + {}", f.label()),
         }
     }
 }
@@ -111,39 +161,38 @@ fn pitch_name(pitch: u8) -> String {
     const NAMES: [&str; 12] = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
-    format!(
-        "{}{}",
-        NAMES[(pitch % 12) as usize],
-        pitch as i32 / 12 - 1
-    )
+    format!("{}{}", NAMES[(pitch % 12) as usize], pitch as i32 / 12 - 1)
 }
 
+/// One frame in a row: either a note or the silence after one.
 #[derive(Clone, Copy)]
-struct Note {
-    pitch: u8,
-    length: NoteLength,
+struct Item {
+    /// Stable within its row, so the egui widget ids survive frames being
+    /// deleted around it.
+    id: u64,
+    /// The pitch a note frame sounds; `None` marks a space frame, which has a
+    /// length but nothing to play.
+    pitch: Option<u8>,
+    dur: Duration,
 }
 
-impl Default for Note {
-    fn default() -> Self {
-        Self {
-            pitch: DEFAULT_PITCH,
-            length: NoteLength::Quarter,
-        }
+impl Item {
+    fn is_space(&self) -> bool {
+        self.pitch.is_none()
     }
 }
 
-/// One lane: a Track and the notes played on it.
+/// One lane: a Track and the chain of frames played on it.
 struct Row {
-    /// Stable id, so egui widget state and the drag in progress survive rows
-    /// being removed above them.
+    /// Stable id, so egui widget state survives rows being removed above them.
     id: u64,
     /// The Track this row plays, by registry id. `None` only while the registry
     /// is empty.
     track_id: Option<u64>,
     gain: f32,
-    /// Fixed-width slots along the timeline; `None` is a rest.
-    slots: Vec<Option<Note>>,
+    /// In play order: frame `n` starts where frame `n - 1` ended.
+    items: Vec<Item>,
+    next_item_id: u64,
 }
 
 impl Row {
@@ -152,87 +201,69 @@ impl Row {
             id,
             track_id,
             gain: 1.0,
-            slots: Vec::new(),
+            items: Vec::new(),
+            next_item_id: 0,
         }
     }
 
-    /// Append a note right after the last one.
+    /// Total length of the row in units — the frames simply add up.
+    fn end_units(&self) -> i64 {
+        self.items.iter().map(|i| i.dur.units()).sum()
+    }
+
+    fn push(&mut self, pitch: Option<u8>, dur: Duration) {
+        let id = self.next_item_id;
+        self.next_item_id += 1;
+        self.items.push(Item { id, pitch, dur });
+    }
+
+    /// Append a note and, right behind it, the space that separates it from
+    /// whatever comes next.
     fn add_note(&mut self) {
-        self.slots.push(Some(Note::default()));
+        self.push(Some(DEFAULT_PITCH), Duration::new(0, Fraction::Quarter));
+        self.push(None, Duration::new(0, Fraction::Eighth));
     }
 
-    /// Move the note in `from` to slot `to`, growing the row if it lands past
-    /// the end. Refuses to leave the row (`to < 0`) or to land on a slot that
-    /// already holds a note — the rule that keeps notes in a row from
-    /// overlapping.
-    fn move_note(&mut self, from: usize, to: i64) -> bool {
-        if to < 0 || self.slots.get(from).is_none_or(Option::is_none) {
-            return false;
-        }
-        let to = to as usize;
-        if to >= self.slots.len() {
-            self.slots.resize(to + 1, None);
-        } else if self.slots[to].is_some() {
-            return false;
-        }
-        self.slots[to] = self.slots[from].take();
-        self.trim();
-        true
-    }
-
-    fn delete_note(&mut self, slot: usize) {
-        if let Some(s) = self.slots.get_mut(slot) {
-            *s = None;
-        }
-        self.trim();
-    }
-
-    /// Drop trailing rests: they are silence after the last note, which is not
-    /// part of the composition, and keeping them would let a row grow forever.
-    fn trim(&mut self) {
-        while matches!(self.slots.last(), Some(None)) {
-            self.slots.pop();
+    fn delete_item(&mut self, idx: usize) {
+        if idx < self.items.len() {
+            self.items.remove(idx);
         }
     }
 
-    /// The row's notes in seconds at `spb` seconds per beat, laid out
-    /// sequentially: each slot starts where the previous one ended.
-    fn planned_notes(&self, spb: f64) -> Vec<PlannedNote> {
-        let mut at = 0.0f64;
-        let mut notes = Vec::new();
-        for slot in &self.slots {
-            match slot {
-                Some(note) => {
-                    let dur = note.length.beats() * spb;
-                    notes.push(PlannedNote {
-                        at_secs: at,
-                        dur_secs: dur,
-                        pitch: note.pitch,
-                    });
-                    at += dur;
-                }
-                None => at += REST_BEATS * spb,
-            }
-        }
-        notes
-    }
-
-    /// Where the row ends, in seconds.
-    fn length_secs(&self, spb: f64) -> f64 {
-        self.slots
+    /// Where each frame starts, in units — the running sum of the lengths before
+    /// it. One entry per frame.
+    fn starts(&self) -> Vec<i64> {
+        let mut at = 0;
+        self.items
             .iter()
-            .map(|s| s.map_or(REST_BEATS, |n| n.length.beats()) * spb)
-            .sum()
+            .map(|i| {
+                let start = at;
+                at += i.dur.units();
+                start
+            })
+            .collect()
     }
-}
 
-/// A drag in progress, tracked across frames because a note moves in whole slots
-/// while the pointer moves in pixels.
-struct Drag {
-    row_id: u64,
-    slot: usize,
-    /// Pointer travel not yet spent on a slot move.
-    accum_x: f32,
+    /// The row's notes in seconds, at `spu` seconds per grid unit. Spaces only
+    /// advance the clock, and a note given no length at all is not played.
+    fn planned_notes(&self, spu: f64) -> Vec<PlannedNote> {
+        let mut at = 0i64;
+        let mut out = Vec::new();
+        for item in &self.items {
+            let units = item.dur.units();
+            if let Some(pitch) = item.pitch {
+                if units > 0 {
+                    out.push(PlannedNote {
+                        at_secs: at as f64 * spu,
+                        dur_secs: units as f64 * spu,
+                        pitch,
+                    });
+                }
+            }
+            at += units;
+        }
+        out
+    }
 }
 
 /// The Composer panel.
@@ -243,10 +274,6 @@ pub struct ComposerPanel {
     tempo_bpm: f32,
     status: String,
     player: Option<CompositionPlayer>,
-    drag: Option<Drag>,
-    /// Shared horizontal scroll of every lane, so the rows keep a common time
-    /// axis instead of drifting apart.
-    scroll_x: f32,
 }
 
 impl ComposerPanel {
@@ -258,13 +285,12 @@ impl ComposerPanel {
             tempo_bpm: 120.0,
             status: "Add a track row to start composing.".to_string(),
             player: None,
-            drag: None,
-            scroll_x: 0.0,
         }
     }
 
-    fn secs_per_beat(&self) -> f64 {
-        60.0 / (self.tempo_bpm.max(1.0) as f64)
+    /// Seconds one grid unit lasts.
+    fn secs_per_unit(&self) -> f64 {
+        60.0 / (self.tempo_bpm.max(1.0) as f64) / UNITS_PER_BEAT as f64
     }
 
     fn add_row(&mut self) {
@@ -291,14 +317,19 @@ impl ComposerPanel {
         }
     }
 
+    /// End of the composition in units — the longest row.
+    fn end_units(&self) -> i64 {
+        self.rows.iter().map(Row::end_units).max().unwrap_or(0)
+    }
+
     fn start_playback(&mut self) {
-        let spb = self.secs_per_beat();
+        let spu = self.secs_per_unit();
         let mut plans = Vec::new();
         for row in &self.rows {
             let Some(source) = row.track_id.and_then(|id| self.registry.playback_source(id)) else {
                 continue;
             };
-            let notes = row.planned_notes(spb);
+            let notes = row.planned_notes(spu);
             if notes.is_empty() {
                 continue;
             }
@@ -334,13 +365,11 @@ impl ComposerPanel {
         }
     }
 
-    /// Total length of the composition, in seconds.
-    fn length_secs(&self) -> f64 {
-        let spb = self.secs_per_beat();
-        self.rows
-            .iter()
-            .map(|r| r.length_secs(spb))
-            .fold(0.0, f64::max)
+    /// Where the transport is, in grid units, while it is running. The frame
+    /// containing it is the one lit up in each lane.
+    fn playhead_units(&self) -> Option<f64> {
+        let player = self.player.as_ref()?;
+        Some(player.position_secs() / self.secs_per_unit())
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -376,7 +405,7 @@ impl ComposerPanel {
 
         if !self.rows.is_empty() {
             ui.add_space(6.0);
-            self.rows_ui(ui, &tracks);
+            self.lanes_ui(ui, &tracks);
         }
 
         ui.add_space(8.0);
@@ -384,16 +413,11 @@ impl ComposerPanel {
         self.transport_ui(ui);
     }
 
-    /// The lanes: a fixed head per row, then a scrolling timeline. All lanes
-    /// share one scroll offset, so a note in one row lines up with the note
-    /// under it in the next.
-    fn rows_ui(&mut self, ui: &mut egui::Ui, tracks: &[(u64, String)]) {
-        enum Act {
-            Remove(usize),
-        }
-        let mut act: Option<Act> = None;
-        let mut offset = self.scroll_x;
-        let dragging_id = self.drag.as_ref().map(|d| (d.row_id, d.slot));
+    /// One strip per row: the head on the left, the chain of frames scrolling on
+    /// the right.
+    fn lanes_ui(&mut self, ui: &mut egui::Ui, tracks: &[(u64, String)]) {
+        let mut remove_row: Option<usize> = None;
+        let playhead = self.playhead_units();
 
         for (idx, row) in self.rows.iter_mut().enumerate() {
             let row_id = row.id;
@@ -405,7 +429,7 @@ impl ComposerPanel {
                         ui.horizontal_top(|ui| {
                             // ── Row head ──────────────────────────────────
                             ui.allocate_ui_with_layout(
-                                egui::vec2(HEAD_W, SLOT_H),
+                                egui::vec2(HEAD_W, ROW_H),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
                                     ui.horizontal(|ui| {
@@ -438,18 +462,22 @@ impl ComposerPanel {
                                             .on_hover_text("Remove this row")
                                             .clicked()
                                         {
-                                            act = Some(Act::Remove(idx));
+                                            remove_row = Some(idx);
                                         }
                                     });
-                                    if ui
-                                        .button("➕ Add Note")
-                                        .on_hover_text("Append a note after the last one in this row")
-                                        .clicked()
-                                    {
-                                        row.add_note();
-                                    }
                                     ui.horizontal(|ui| {
+                                        if ui
+                                            .button("➕ Add Note")
+                                            .on_hover_text(
+                                                "Append a note frame and, behind it, a \
+                                                 space frame for the silence that follows",
+                                            )
+                                            .clicked()
+                                        {
+                                            row.add_note();
+                                        }
                                         ui.label("Gain");
+                                        ui.spacing_mut().slider_width = 96.0;
                                         ui.add(
                                             egui::Slider::new(&mut row.gain, 0.0..=2.0)
                                                 .fixed_decimals(2)
@@ -459,193 +487,190 @@ impl ComposerPanel {
                                 },
                             );
 
-                            // ── Timeline lane ─────────────────────────────
-                            let out = egui::ScrollArea::horizontal()
+                            // ── The chain of frames ───────────────────────
+                            egui::ScrollArea::horizontal()
                                 .id_salt("lane")
-                                .horizontal_scroll_offset(self.scroll_x)
-                                .max_height(SLOT_H + 8.0)
+                                // Room for the frames *and* the scrollbar under
+                                // them, which would otherwise clip the cards.
+                                .max_height(ROW_H + 12.0)
                                 .show(ui, |ui| {
-                                    Self::lane_ui(ui, row, &mut self.drag, dragging_id);
+                                    Self::chain_ui(ui, row, playhead);
                                 });
-                            // Whichever lane the user actually scrolled wins,
-                            // and the rest follow it next frame.
-                            if (out.state.offset.x - self.scroll_x).abs() > 0.5 {
-                                offset = out.state.offset.x;
-                            }
                         });
                     });
             });
             ui.add_space(4.0);
         }
 
-        self.scroll_x = offset;
-
-        if let Some(Act::Remove(idx)) = act {
+        if let Some(idx) = remove_row {
             if idx < self.rows.len() {
-                let removed = self.rows.remove(idx);
-                if self.drag.as_ref().is_some_and(|d| d.row_id == removed.id) {
-                    self.drag = None;
-                }
+                self.rows.remove(idx);
                 self.status = "Removed a row.".to_string();
             }
         }
     }
 
-    /// One row's slots. Notes are cards of a constant size; empty slots are drawn
-    /// as faint drop targets so the silence in a row is visible.
-    fn lane_ui(
-        ui: &mut egui::Ui,
-        row: &mut Row,
-        drag: &mut Option<Drag>,
-        dragging: Option<(u64, usize)>,
-    ) {
-        let count = row.slots.len() + TRAILING_SLOTS;
-        let (lane, _) =
-            ui.allocate_exact_size(egui::vec2(count as f32 * SLOT_W, SLOT_H), egui::Sense::hover());
-        let painter = ui.painter();
-
-        for i in 0..count {
-            let cell = egui::Rect::from_min_size(
-                egui::pos2(lane.left() + i as f32 * SLOT_W, lane.top()),
-                egui::vec2(SLOT_W - 4.0, SLOT_H),
-            );
-            let has_note = row.slots.get(i).is_some_and(Option::is_some);
-            if !has_note {
-                painter.rect_stroke(
-                    cell,
-                    4.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(52)),
-                    egui::StrokeKind::Inside,
-                );
-                continue;
-            }
-            let held = dragging == Some((row.id, i));
-            painter.rect_filled(
-                cell,
-                4.0,
-                if held {
-                    egui::Color32::from_rgb(72, 96, 132)
-                } else {
-                    egui::Color32::from_rgb(52, 66, 92)
-                },
-            );
-            painter.rect_stroke(
-                cell,
-                4.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(110, 150, 200)),
-                egui::StrokeKind::Inside,
-            );
-        }
-
-        // Widgets on top of the painted cards. Deferred, because moving a note
-        // rewrites the very slots this loop walks.
-        let mut pending_move: Option<(usize, i64)> = None;
+    /// A row's frames, left to right in play order. Editing a frame's length or
+    /// pitch is immediate; everything after it simply shifts, because a frame's
+    /// position is nothing but the sum of the lengths before it.
+    fn chain_ui(ui: &mut egui::Ui, row: &mut Row, playhead: Option<f64>) {
+        // Deferred: removing a frame rewrites the list this loop walks.
         let mut pending_delete: Option<usize> = None;
+        // Taken before the frames are drawn, so an edit made in one frame moves
+        // the ones behind it only on the next pass — never mid-loop.
+        let starts = row.starts();
+        let row_id = row.id;
 
-        for i in 0..row.slots.len() {
-            if row.slots[i].is_none() {
-                continue;
+        ui.horizontal_top(|ui| {
+            ui.set_min_height(ROW_H);
+            if row.items.is_empty() {
+                ui.label(
+                    egui::RichText::new("Empty row — press “➕ Add Note”.")
+                        .color(egui::Color32::from_gray(120)),
+                );
             }
-            let cell = egui::Rect::from_min_size(
-                egui::pos2(lane.left() + i as f32 * SLOT_W, lane.top()),
-                egui::vec2(SLOT_W - 4.0, SLOT_H),
-            );
-
-            // Drag handle: the card's top strip. The combo boxes below own their
-            // own clicks, so the grip has to be somewhere they are not.
-            let grip = egui::Rect::from_min_size(cell.min, egui::vec2(cell.width() - 22.0, 20.0));
-            let grip_resp = ui.interact(
-                grip,
-                ui.id().with(("grip", row.id, i)),
-                egui::Sense::click_and_drag(),
-            );
-            ui.painter().text(
-                grip.center(),
-                egui::Align2::CENTER_CENTER,
-                "⣿ drag",
-                egui::TextStyle::Small.resolve(ui.style()),
-                egui::Color32::from_gray(190),
-            );
-            if grip_resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            }
-            if grip_resp.drag_started() {
-                *drag = Some(Drag {
-                    row_id: row.id,
-                    slot: i,
-                    accum_x: 0.0,
+            for (idx, (item, start)) in row.items.iter_mut().zip(starts).enumerate() {
+                let sounding = playhead.is_some_and(|p| {
+                    !item.is_space()
+                        && p >= start as f64
+                        && p < (start + item.dur.units()) as f64
                 });
-            }
-            if grip_resp.dragged() {
-                if let Some(d) = drag.as_mut().filter(|d| d.row_id == row.id && d.slot == i) {
-                    d.accum_x += grip_resp.drag_delta().x;
-                    // One slot per SLOT_W of travel; a refused move (occupied
-                    // slot, or the start of the row) spends the travel anyway so
-                    // the note does not leap once the way clears.
-                    if d.accum_x.abs() >= SLOT_W {
-                        let step = d.accum_x.signum() as i64;
-                        pending_move = Some((i, i as i64 + step));
-                        d.accum_x -= step as f32 * SLOT_W;
-                    }
+                if Self::frame_ui(ui, row_id, item, sounding) {
+                    pending_delete = Some(idx);
                 }
             }
-            if grip_resp.drag_stopped() {
-                *drag = None;
-            }
+        });
 
-            let close = egui::Rect::from_min_size(
-                egui::pos2(cell.right() - 20.0, cell.top() + 1.0),
-                egui::vec2(18.0, 18.0),
-            );
-            if ui
-                .put(close, egui::Button::new("✖").small().frame(false))
-                .on_hover_text("Delete this note")
-                .clicked()
-            {
-                pending_delete = Some(i);
-            }
+        if let Some(idx) = pending_delete {
+            row.delete_item(idx);
+        }
+    }
 
-            let note = row.slots[i].as_mut().expect("checked above");
-            let body = egui::Rect::from_min_size(
-                egui::pos2(cell.left() + 6.0, cell.top() + 24.0),
-                egui::vec2(cell.width() - 12.0, cell.height() - 30.0),
-            );
-            let mut body_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(body)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            body_ui.spacing_mut().item_spacing.y = 4.0;
-            egui::ComboBox::from_id_salt(("pitch", row.id, i))
-                .width(body.width())
-                .height(260.0)
-                .selected_text(pitch_name(note.pitch))
-                .show_ui(&mut body_ui, |ui| {
-                    for p in PITCH_MIN..=PITCH_MAX {
-                        ui.selectable_value(&mut note.pitch, p, pitch_name(p));
-                    }
-                });
-            egui::ComboBox::from_id_salt(("len", row.id, i))
-                .width(body.width())
-                .selected_text(note.length.label())
-                .show_ui(&mut body_ui, |ui| {
-                    for l in NoteLength::ALL {
-                        ui.selectable_value(&mut note.length, l, l.label());
-                    }
-                });
-        }
+    /// One frame. Returns `true` when its delete button was pressed.
+    ///
+    /// A note frame is blue and carries three select boxes — pitch, whole part
+    /// of the length, fractional part. A space frame is amber and carries only
+    /// the two length boxes: it has no pitch to choose.
+    fn frame_ui(ui: &mut egui::Ui, row_id: u64, item: &mut Item, sounding: bool) -> bool {
+        let space = item.is_space();
+        let (fill, stroke, header) = match (space, sounding) {
+            (true, _) => (
+                egui::Color32::from_rgb(78, 62, 38),
+                egui::Color32::from_rgb(186, 146, 84),
+                egui::Color32::from_rgb(226, 190, 130),
+            ),
+            (false, true) => (
+                egui::Color32::from_rgb(74, 100, 138),
+                PLAYHEAD,
+                egui::Color32::from_rgb(245, 225, 220),
+            ),
+            (false, false) => (
+                egui::Color32::from_rgb(52, 66, 92),
+                egui::Color32::from_rgb(110, 150, 200),
+                egui::Color32::from_rgb(200, 218, 240),
+            ),
+        };
 
-        if let Some((from, to)) = pending_move {
-            if row.move_note(from, to) {
-                if let Some(d) = drag.as_mut().filter(|d| d.row_id == row.id) {
-                    d.slot = to.max(0) as usize;
-                }
-            }
-        }
-        if let Some(slot) = pending_delete {
-            row.delete_note(slot);
-            *drag = None;
-        }
+        let mut deleted = false;
+        let id = item.id;
+        ui.allocate_ui_with_layout(
+            egui::vec2(CARD_W, CARD_H),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::new()
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0, stroke))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        let inner_w = CARD_W - 10.0;
+                        ui.set_width(inner_w);
+                        ui.set_min_height(CARD_H - 10.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+
+                        // Header: what the frame is and how long, plus its
+                        // delete button. Laid out from the right so the button
+                        // keeps its corner and a long title truncates instead of
+                        // pushing the card wider than its neighbours.
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(egui::Button::new("✖").small().frame(false))
+                                        .on_hover_text(if space {
+                                            "Delete this space"
+                                        } else {
+                                            "Delete this note"
+                                        })
+                                        .clicked()
+                                    {
+                                        deleted = true;
+                                    }
+                                    let title = match item.pitch {
+                                        Some(p) => {
+                                            format!("{} · {}", pitch_name(p), item.dur.label())
+                                        }
+                                        None => format!("space · {}", item.dur.label()),
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(title).small().color(header),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                        });
+
+                        if let Some(pitch) = item.pitch.as_mut() {
+                            egui::ComboBox::from_id_salt(("pitch", row_id, id))
+                                .width(inner_w)
+                                .height(260.0)
+                                .selected_text(pitch_name(*pitch))
+                                .show_ui(ui, |ui| {
+                                    for p in PITCH_MIN..=PITCH_MAX {
+                                        ui.selectable_value(pitch, p, pitch_name(p));
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Pitch");
+                        }
+
+                        egui::ComboBox::from_id_salt(("wholes", row_id, id))
+                            .width(inner_w)
+                            .height(260.0)
+                            .selected_text(format!("{} whole", item.dur.wholes))
+                            .show_ui(ui, |ui| {
+                                for w in 0..=MAX_WHOLES {
+                                    ui.selectable_value(
+                                        &mut item.dur.wholes,
+                                        w,
+                                        format!("{w} whole"),
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text("Whole notes — the whole part of the length");
+
+                        egui::ComboBox::from_id_salt(("frac", row_id, id))
+                            .width(inner_w)
+                            .selected_text(item.dur.frac.label())
+                            .show_ui(ui, |ui| {
+                                for f in Fraction::ALL {
+                                    ui.selectable_value(&mut item.dur.frac, f, f.label());
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Fractional part of the length, down to a 1/256 — added \
+                                 to the whole notes above",
+                            );
+                    });
+            },
+        );
+        deleted
     }
 
     /// Play / stop, tempo, and where the transport currently is.
@@ -675,6 +700,7 @@ impl ComposerPanel {
             )
             .on_hover_text("A beat is a quarter note; every note length scales with this.");
             ui.add_space(12.0);
+            let length_secs = self.end_units() as f64 * self.secs_per_unit();
             match &self.player {
                 Some(p) => ui.label(
                     egui::RichText::new(format!(
@@ -682,10 +708,10 @@ impl ComposerPanel {
                         p.position_secs(),
                         p.total_secs
                     ))
-                    .color(egui::Color32::from_rgb(130, 210, 150)),
+                    .color(PLAYHEAD),
                 ),
                 None => ui.label(
-                    egui::RichText::new(format!("{:.1} s", self.length_secs()))
+                    egui::RichText::new(format!("{length_secs:.1} s"))
                         .color(egui::Color32::from_gray(160)),
                 ),
             };
@@ -693,98 +719,161 @@ impl ComposerPanel {
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_gray(170)));
 
-        // While playing, keep the position readout moving and notice the end of
-        // the composition promptly; otherwise stay idle like the rest of the app.
+        // While playing, repaint fast enough for the sounding frame to light up
+        // on time; otherwise stay idle like the rest of the app.
         if self.player.is_some() {
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
+                .request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 }
+
+/// Colour of the transport's position readout, and of the frame sounding under
+/// it.
+const PLAYHEAD: egui::Color32 = egui::Color32::from_rgb(240, 120, 110);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row_with(slots: Vec<Option<Note>>) -> Row {
-        Row {
-            id: 0,
-            track_id: None,
-            gain: 1.0,
-            slots,
+    const QUARTER: i64 = UNITS_PER_WHOLE / 4;
+    const EIGHTH: i64 = UNITS_PER_WHOLE / 8;
+
+    fn row_with(items: &[(Option<u8>, u8, Fraction)]) -> Row {
+        let mut row = Row::new(0, None);
+        for (pitch, wholes, frac) in items {
+            row.push(*pitch, Duration::new(*wholes, *frac));
         }
+        row
     }
 
-    fn note(pitch: u8, length: NoteLength) -> Option<Note> {
-        Some(Note { pitch, length })
-    }
-
-    /// "Right after the last note", including when the row is empty.
+    /// The requirement: one press of "Add Note" leaves a note *and* the space
+    /// behind it, in that order, and the space has no pitch to edit.
     #[test]
-    fn add_note_appends_after_the_last_note() {
-        let mut row = row_with(Vec::new());
+    fn adding_a_note_appends_the_note_and_a_space_behind_it() {
+        let mut row = row_with(&[]);
         row.add_note();
+        assert_eq!(row.items.len(), 2);
+        assert_eq!(row.items[0].pitch, Some(DEFAULT_PITCH));
+        assert!(!row.items[0].is_space());
+        assert!(row.items[1].is_space());
+        assert_eq!(row.items[1].pitch, None);
+
+        // And again: the chain grows note, space, note, space.
         row.add_note();
-        assert_eq!(row.slots.len(), 2);
-        assert!(row.slots.iter().all(Option::is_some));
+        let kinds: Vec<bool> = row.items.iter().map(Item::is_space).collect();
+        assert_eq!(kinds, vec![false, true, false, true]);
+        // Ids stay unique, so two frames never share a widget id.
+        let mut ids: Vec<u64> = row.items.iter().map(|i| i.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), row.items.len());
     }
 
-    /// The whole point of dragging: a gap in the row, and no way to stack two
-    /// notes on the same slot.
+    /// A length is the whole part plus the fractional part, and 1/256 is the
+    /// finest value the boxes offer.
     #[test]
-    fn a_note_moves_into_free_slots_only() {
-        let mut row = row_with(vec![note(60, NoteLength::Quarter), note(62, NoteLength::Quarter)]);
-
-        // Right, into empty space past the end: the row grows and slot 1 is now
-        // a rest.
-        assert!(row.move_note(1, 2));
-        assert_eq!(row.slots.len(), 3);
-        assert!(row.slots[1].is_none());
-        assert_eq!(row.slots[2].unwrap().pitch, 62);
-
-        // Onto the note still sitting in slot 0: refused, nothing moves.
-        assert!(!row.move_note(2, 0));
-        assert_eq!(row.slots[2].unwrap().pitch, 62);
-        assert_eq!(row.slots[0].unwrap().pitch, 60);
-
-        // Off the left edge: refused.
-        assert!(!row.move_note(0, -1));
-        assert_eq!(row.slots[0].unwrap().pitch, 60);
-    }
-
-    /// Trailing rests are silence after the music stops — dropping them keeps a
-    /// dragged-and-returned note from leaving the row longer every time.
-    #[test]
-    fn trailing_rests_are_trimmed() {
-        let mut row = row_with(vec![note(60, NoteLength::Quarter), note(62, NoteLength::Quarter)]);
-        assert!(row.move_note(1, 4));
-        assert_eq!(row.slots.len(), 5);
-        assert!(row.move_note(4, 1));
-        assert_eq!(row.slots.len(), 2, "the empty tail should be gone");
-    }
-
-    /// Sequential timing: each note starts where the previous slot ended, and a
-    /// rest is worth one beat.
-    #[test]
-    fn notes_are_scheduled_back_to_back_with_rests_between() {
-        let row = row_with(vec![
-            note(60, NoteLength::Quarter), // 1 beat
-            note(62, NoteLength::Half),    // 2 beats
-            None,                          // 1 beat of silence
-            note(64, NoteLength::Eighth),  // 0.5 beats
-        ]);
-        // 120 BPM: one beat is half a second.
-        let spb = 0.5;
-        let notes = row.planned_notes(spb);
-        let times: Vec<(f64, f64, u8)> = notes
-            .iter()
-            .map(|n| (n.at_secs, n.dur_secs, n.pitch))
-            .collect();
+    fn a_length_is_its_whole_part_plus_its_fraction() {
+        assert_eq!(Duration::new(0, Fraction::None).units(), 0);
+        assert_eq!(Duration::new(1, Fraction::None).units(), UNITS_PER_WHOLE);
         assert_eq!(
-            times,
-            vec![(0.0, 0.5, 60), (0.5, 1.0, 62), (2.0, 0.25, 64)]
+            Duration::new(1, Fraction::Half).units(),
+            UNITS_PER_WHOLE + UNITS_PER_WHOLE / 2
         );
-        assert_eq!(row.length_secs(spb), 2.25);
+        // A dotted half: 1/2 + 1/4.
+        assert_eq!(
+            Duration::new(0, Fraction::Half).units() + Duration::new(0, Fraction::Quarter).units(),
+            UNITS_PER_WHOLE * 3 / 4
+        );
+        // Every fraction is a whole number of units, halving down to a 1/256.
+        assert_eq!(Fraction::TwoHundredFiftySixth.units(), 1);
+        for pair in Fraction::ALL[1..].windows(2) {
+            assert_eq!(pair[1].units(), pair[0].units() / 2);
+        }
+        assert_eq!(Duration::new(2, Fraction::Eighth).label(), "2 + 1/8");
+        assert_eq!(Duration::new(0, Fraction::Eighth).label(), "1/8");
+        assert_eq!(Duration::new(3, Fraction::None).label(), "3");
+    }
+
+    /// Frames are played one after another: a frame starts where the previous
+    /// one ended, and a space is silence of exactly its own length.
+    #[test]
+    fn frames_play_in_sequence_and_spaces_are_the_silences() {
+        let spu = 1.0; // one second per unit keeps the arithmetic readable
+        let row = row_with(&[
+            (Some(60), 0, Fraction::Quarter),
+            (None, 0, Fraction::Eighth),
+            (Some(64), 0, Fraction::Quarter),
+        ]);
+        let notes = row.planned_notes(spu);
+        assert_eq!(notes.len(), 2); // the space is not played
+        assert_eq!(notes[0].at_secs, 0.0);
+        assert_eq!(notes[0].dur_secs, QUARTER as f64);
+        // The second note waits out the quarter *and* the eighth of silence.
+        assert_eq!(notes[1].at_secs, (QUARTER + EIGHTH) as f64);
+        assert_eq!(notes[1].pitch, 64);
+        assert_eq!(row.end_units(), QUARTER + EIGHTH + QUARTER);
+
+        // A note left at length zero is silence, not a click.
+        let row = row_with(&[(Some(60), 0, Fraction::None), (Some(62), 0, Fraction::Half)]);
+        let notes = row.planned_notes(spu);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].pitch, 62);
+        assert_eq!(notes[0].at_secs, 0.0);
+    }
+
+    /// Every row starts at zero, so rows sound together exactly when the lengths
+    /// before a note add up the same — that is the only thing that makes a chord
+    /// now that nothing is positioned by hand.
+    #[test]
+    fn equal_lengths_before_a_note_make_it_sound_with_another_row() {
+        let spu = 0.5 / UNITS_PER_BEAT as f64; // 120 BPM
+
+        // Two eighths played, then the note.
+        let dense = row_with(&[
+            (Some(60), 0, Fraction::Eighth),
+            (Some(62), 0, Fraction::Eighth),
+            (Some(64), 1, Fraction::None),
+        ]);
+        // A quarter of silence, then the note — the same moment, reached by a
+        // different route.
+        let sparse = row_with(&[(None, 0, Fraction::Quarter), (Some(67), 1, Fraction::None)]);
+
+        let third = dense.planned_notes(spu)[2].at_secs;
+        // The space is not a played note, so the row's only note is at index 0.
+        let second = sparse.planned_notes(spu)[0].at_secs;
+        assert_eq!(third, second);
+        assert_eq!(third, QUARTER as f64 * spu);
+        // …and a row whose lengths do not add up the same does not join them.
+        let off = row_with(&[
+            (None, 0, Fraction::Eighth),
+            (Some(67), 1, Fraction::None),
+        ]);
+        assert_ne!(off.planned_notes(spu)[0].at_secs, third);
+    }
+
+    /// Deleting a frame closes the gap: everything behind it moves earlier by
+    /// exactly that frame's length.
+    #[test]
+    fn deleting_a_frame_pulls_the_rest_forward() {
+        let mut row = row_with(&[
+            (Some(60), 0, Fraction::Quarter),
+            (None, 0, Fraction::Half),
+            (Some(64), 0, Fraction::Quarter),
+        ]);
+        assert_eq!(row.starts(), vec![0, QUARTER, QUARTER + UNITS_PER_WHOLE / 2]);
+        row.delete_item(1); // drop the silence
+        assert_eq!(row.items.len(), 2);
+        assert_eq!(row.starts(), vec![0, QUARTER]);
+        assert_eq!(row.end_units(), 2 * QUARTER);
+    }
+
+    #[test]
+    fn pitch_names_follow_scientific_notation() {
+        assert_eq!(pitch_name(60), "C4");
+        assert_eq!(pitch_name(61), "C#4");
+        assert_eq!(pitch_name(PITCH_MIN), "C0");
+        assert_eq!(pitch_name(PITCH_MAX), "B8");
     }
 
     fn registry_with(names: &[&str]) -> (TrackRegistry, Vec<u64>) {
@@ -838,10 +927,10 @@ mod tests {
     }
 
     /// Lay the whole panel out for real (headless egui, no window) in the states
-    /// that have layout of their own: no rows, a row with notes and a gap, and a
-    /// row whose track list has gone empty. Catches the panics a layout test can
-    /// catch — duplicate widget ids, bad rects — which no amount of model testing
-    /// would.
+    /// that have layout of their own: no rows, an empty row, a row of note and
+    /// space frames, two rows, and a row whose track list has gone empty.
+    /// Catches the panics a layout test can catch — duplicate widget ids, bad
+    /// rects — which no amount of model testing would.
     #[test]
     fn the_panel_lays_out_in_every_state_without_panicking() {
         let (registry, ids) = registry_with(&["one"]);
@@ -856,35 +945,24 @@ mod tests {
         frame(&mut panel); // no rows: just the add button and the transport
 
         panel.add_row();
+        frame(&mut panel); // a row with no frames yet
+
         panel.rows[0].add_note();
         panel.rows[0].add_note();
-        assert!(panel.rows[0].move_note(1, 3)); // a gap between the two notes
         frame(&mut panel);
 
         // Two rows on the same track, which the spec allows.
         panel.add_row();
         panel.rows[1].add_note();
+        panel.rows[1].items[0].dur = Duration::new(MAX_WHOLES, Fraction::TwoHundredFiftySixth);
+        frame(&mut panel);
+
+        // A deleted frame must not leave a stale widget id behind.
+        panel.rows[0].delete_item(0);
         frame(&mut panel);
 
         registry.remove(ids[0]);
         frame(&mut panel);
         assert!(panel.rows.iter().all(|r| r.track_id.is_none()));
-    }
-
-    #[test]
-    fn pitch_names_follow_scientific_notation() {
-        assert_eq!(pitch_name(60), "C4");
-        assert_eq!(pitch_name(61), "C#4");
-        assert_eq!(pitch_name(PITCH_MIN), "C0");
-        assert_eq!(pitch_name(PITCH_MAX), "B8");
-    }
-
-    #[test]
-    fn note_lengths_halve_from_a_whole_note() {
-        assert_eq!(NoteLength::Whole.beats(), 4.0);
-        for pair in NoteLength::ALL.windows(2) {
-            assert_eq!(pair[1].beats(), pair[0].beats() / 2.0);
-        }
-        assert_eq!(NoteLength::HundredTwentyEighth.beats(), 4.0 / 128.0);
     }
 }
