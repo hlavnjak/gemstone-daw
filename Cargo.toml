@@ -2,6 +2,9 @@
 name = "gemstone-daw"
 version = "0.1.0"
 edition = "2021"
+# The crate also ships `src/bin/dump_render.rs`, a debugging tool. Without this,
+# two binaries make a bare `cargo run` ambiguous and it refuses to start.
+default-run = "gemstone-daw"
 authors = ["Jakub Hlavnicka <hlavnickajakub@gmail.com>"]
 license = "Apache-2.0"
 description = "A Rust DAW (egui/eframe) that hosts VST3 plugins and resynthesizes arbitrary audio through an embedded LeSynth Fourier additive synth."

@@ -22,7 +22,12 @@ FOURIER_SRCS := $(shell find $(FOURIER_DIR)/src -name '*.rs' 2>/dev/null) \
 # precompiled binary committed under internal_plugins/ is used as-is.
 HAVE_FOURIER_SRC := $(wildcard $(FOURIER_DIR)/Cargo.toml)
 
-.PHONY: run build build-windows fourier fourier-windows copy-internal copy-internal-windows clean clean-all
+.PHONY: run build build-windows fourier fourier-windows copy-internal copy-internal-windows clean clean-all dump scan
+
+# ── Buzz debugging ──────────────────────────────────────────────────────────
+# Source to render offline, and where the dumps land.
+DUMP_SRC ?= D5.wav
+DUMP_OUT ?= target/dump
 
 # ── Linux build ─────────────────────────────────────────────────────────────
 
@@ -84,6 +89,25 @@ endif
 # Build for Windows, embedding the VST3 plugin.
 build-windows: copy-internal-windows
 	cargo build --release --target $(WIN_TARGET)
+
+# ── Buzz debugging ──────────────────────────────────────────────────────────
+
+# Render a source offline through a real plugin instance — no cpal, no engine
+# ring buffer, no system mixer — so a defect found here is the plugin's.
+#   make dump DUMP_SRC=my_voice.m4a DUMP_OUT=target/dump_voice
+dump: copy-internal
+	cargo build --release --bin dump_render
+	./target/release/dump_render $(DUMP_SRC) --out $(DUMP_OUT)
+
+# Scan what `dump` wrote. exact.wav is subtracted from source.wav (they are
+# meant to be sample-identical); the playback render is scanned on its own,
+# because it de-phases from the source by design.
+scan: dump
+	@echo "── exact.wav residual vs source.wav ────────────────────────────────"
+	python3 tools/buzzscan.py $(DUMP_OUT)/exact.wav --ref $(DUMP_OUT)/source.wav
+	@echo
+	@echo "── playback render ─────────────────────────────────────────────────"
+	@for f in $(DUMP_OUT)/play_*.wav; do python3 tools/buzzscan.py $$f; done
 
 clean:
 	cargo clean
