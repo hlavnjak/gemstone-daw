@@ -13,38 +13,25 @@
 // limitations under the License.
 //! Track Composer — arrange the registered Tracks in rows of frames and play them.
 //!
-//! **A row is a sequence, not a canvas.** Each row plays exactly one Track
-//! (picked in the select box at its head), and several rows may share the same
-//! Track. A row holds a chain of frames laid left to right, and each frame is
-//! simply played after the one before it: nothing is positioned, nothing is
-//! dragged, and nothing can overlap. Every row starts at time zero, so rows sound
+//! **A row is a sequence, not a canvas.** It plays one Track (several rows may
+//! share it) as a chain of frames laid left to right, each simply played after
+//! the one before: nothing is positioned, dragged, or overlapping. Rows sound
 //! together exactly to the extent that the lengths before a frame add up the
 //! same — that is what makes a chord.
 //!
-//! **Two kinds of frame, tied in pairs.** A *note* frame carries a pitch and a
-//! length. A *space* frame (drawn in its own colour) carries only a length: it is
-//! the silence after that note. "➕ Add Note" appends both, and they stay
-//! together — the space has no delete button of its own and leaves only when its
-//! note is deleted. In the model they are one [`Item`], so no code path can
-//! orphan a space or leave a note without one. A space of length zero is normal:
-//! a placeholder that holds its frame, ready to be given a length, while the next
-//! note follows on immediately.
+//! **Frames come in pairs.** A *note* frame carries a pitch and a length; the
+//! *space* behind it carries the silence that follows. They are one [`Item`], so
+//! no code path can orphan a space or leave a note without one, and the space
+//! has no delete button of its own. Zero length is normal — a placeholder ready
+//! to be given one.
 //!
-//! **Every row also opens with a space**, before its very first note — the
-//! silence a row waits through before it starts, which is how one row is offset
-//! against another. It belongs to the *row* ([`Row::lead`]), not to any note, so
-//! deleting the first note leaves it exactly where it is and it becomes the lead
-//! of whichever note is first now. Like a tied space it has no delete button,
-//! and it starts at zero length so a row still begins at time zero until it is
-//! given one.
+//! **Every row also opens with a space** ([`Row::lead`]), which is how one row is
+//! offset against another. It belongs to the row, not to a note, so deleting the
+//! first note leaves it in place to lead the next; it starts at zero.
 //!
-//! **Length is two select boxes**, not one: a whole-note count and a fraction
-//! down to a 1/256, added together. Time is counted in [`UNITS_PER_WHOLE`]ths of
-//! a whole note, so every length either box can name is a whole number of units
-//! and the arithmetic stays exact.
-//!
-//! Playback (and the transport that highlights the sounding frame) lives in
-//! [`player`].
+//! **Length is two select boxes**: whole notes plus a fraction down to 1/256.
+//! Time is counted in [`UNITS_PER_WHOLE`]ths, so every length is a whole number
+//! of units and the arithmetic stays exact. Playback lives in [`player`].
 
 pub mod player;
 
@@ -209,13 +196,9 @@ struct Row {
     /// is empty.
     track_id: Option<u64>,
     gain: f32,
-    /// The silence before the row's first note — see the module docs. Held by
-    /// the row rather than by an item so that deleting the first note cannot
-    /// take it with it: it stays at the head and leads whichever note is first
-    /// afterwards.
-    ///
-    /// Zero by default, so a row still starts at time zero until this is given
-    /// a length.
+    /// The silence before the row's first note. Held by the row, not an item, so
+    /// deleting the first note cannot take it along — it stays at the head and
+    /// leads whichever note is first afterwards. Zero by default.
     lead: Duration,
     /// In play order: item `n` starts where item `n - 1`'s space ended.
     items: Vec<Item>,
@@ -482,34 +465,15 @@ impl ComposerPanel {
                                                     .map(|(_, n)| n.clone())
                                             })
                                             .unwrap_or_else(|| "— no track —".to_string());
-                                        // The salt carries `row_id` — like every
-                                        // other select box here, so two rows can
-                                        // never share a popup — **and the number
-                                        // of tracks**, which is what makes a
-                                        // track added later show up at all.
-                                        //
-                                        // A `ComboBox`'s popup is an `egui::Area`
-                                        // keyed by this id, and an `Area`
-                                        // measures itself exactly once, on the
-                                        // sizing pass it runs the first time that
-                                        // id is shown (`area.rs`:
-                                        // `state.size.get_or_insert_with(...)`).
-                                        // From then on that stored size is the
-                                        // Ui's max size, the `ScrollArea` inside
-                                        // clips the list to it, and the clipped
-                                        // list measures the same again — so the
-                                        // popup is stuck at whatever height it
-                                        // needed the first time it was opened,
-                                        // for as long as the id lives.
-                                        //
-                                        // A row whose box was first opened with
-                                        // two tracks therefore kept a two-track
-                                        // popup for the rest of the session,
-                                        // while a row added afterwards showed
-                                        // them all — which is exactly the shape
-                                        // of the report. Keying the popup on the
-                                        // count makes a list of a new length a
-                                        // new Area, which measures itself afresh.
+                                        // Salt = `row_id` (so two rows never
+                                        // share a popup) + the track count. An
+                                        // `egui::Area` measures itself only on
+                                        // the first pass a given id is shown and
+                                        // then caps the Ui, so the ScrollArea
+                                        // clips the list and it measures the same
+                                        // again — a box first opened with two
+                                        // tracks stayed two tall. A new count is
+                                        // a new Area, measured afresh.
                                         egui::ComboBox::from_id_salt(("track", row_id, tracks.len()))
                                             .width(168.0)
                                             .selected_text(label)
@@ -631,12 +595,10 @@ impl ComposerPanel {
 
     /// One frame. Returns `true` when its delete button was pressed.
     ///
-    /// `pitch` is what decides which frame this is: `Some` draws the blue note
-    /// frame — three select boxes (pitch, whole part of the length, fractional
-    /// part) and a delete button. `None` draws the amber space frame, which has
-    /// no pitch to choose and *no delete button*: a space is tied to its note
-    /// and can only leave with it, and the row's lead space belongs to the row
-    /// and never leaves at all.
+    /// `pitch` decides which frame this is: `Some` draws the blue note frame
+    /// (pitch, two length boxes, delete); `None` the amber space frame, which has
+    /// *no delete button* — a space leaves only with its note, and the row's lead
+    /// space never leaves at all.
     fn frame_ui(
         ui: &mut egui::Ui,
         row_id: u64,
@@ -1184,16 +1146,11 @@ mod tests {
     /// A row's track select box must offer every track in the registry, not the
     /// ones that happened to exist when the row was added.
     ///
-    /// Driven the way a user drives it — a real click opening the real popup
-    /// Area — and, crucially, the box is **opened once before the track is
-    /// created**. That is what used to freeze it: an `Area` measures itself only
-    /// on the first pass it is shown for a given id, so a popup first opened
-    /// with one track stayed one track tall and clipped everything added later,
-    /// while a row created afterwards showed them all.
-    ///
-    /// The assertion is on the text actually painted, so it fails whether the
-    /// list is stale, the popup is clipped away, or two rows' select boxes
-    /// collide on one widget id.
+    /// Driven with a real click on the real popup Area, and — crucially — the
+    /// box is **opened before the tracks are created**, which is what used to
+    /// freeze it (an Area measures itself once per id). The assertion is on the
+    /// text actually painted, so it fails whether the list is stale, the popup is
+    /// clipped away, or two rows collide on one widget id.
     #[test]
     fn a_rows_select_box_offers_tracks_created_after_the_row() {
         let registry = TrackRegistry::default();

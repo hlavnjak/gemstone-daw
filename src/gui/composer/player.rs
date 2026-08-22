@@ -14,22 +14,18 @@
 //! Real-time playback of a composition: one output stream, one plugin instance
 //! per row, mixed with per-row gain.
 //!
-//! **One stream, many plugins.** A track editor drives its own instance from its
-//! own `cpal` stream ([`crate::audio::AudioEngine`]); that is right for one
-//! instrument played by hand, but a composition has to keep several instruments
-//! on a single timeline, so it needs them summed inside one callback with one
-//! sample clock. Hence this second, separate audio path.
+//! **One stream, many plugins.** An editor drives its own instance from its own
+//! `cpal` stream; a composition needs several instruments summed inside one
+//! callback on one sample clock, hence this second audio path.
 //!
 //! **The Composer loads its own instances** from each track's recipe
-//! ([`PlaybackSource`]) rather than borrowing the editor's. A VST3 processor is
-//! not re-entrant, so a plugin already being pulled by an editor's stream cannot
-//! also be pulled by this one, and requiring every editor to be open before you
-//! can hear your composition would be worse still. The grid is snapshotted from
-//! the live editor when there is one, so what plays is what the user is editing.
+//! ([`PlaybackSource`]) rather than borrowing the editor's: a VST3 processor is
+//! not re-entrant, so one already pulled by an editor's stream cannot also be
+//! pulled by this one. The grid is snapshotted from the live editor when there
+//! is one, so what plays is what the user is editing.
 //!
-//! The schedule is resolved to sample times up front. The callback only walks a
-//! sorted per-row cursor, so no allocation or locking beyond what the existing
-//! engine already does per block.
+//! The schedule is resolved to sample times up front, so the callback only walks
+//! a sorted per-row cursor — no allocation or locking of its own.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

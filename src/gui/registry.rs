@@ -13,17 +13,14 @@
 // limitations under the License.
 //! The one list of **Tracks** every panel agrees on.
 //!
-//! A Track is a playable sound source: an instrument track from the Tracks panel
-//! (LeSynth Fourier or a custom VST3) or a subtrack the Resynthesis panel has
-//! analysed. The Composer maps each of its rows onto one of these by id, so the
-//! registry — not any single panel — is what "all Tracks" means.
+//! A Track is a playable sound source — an instrument track from the Tracks
+//! panel or a subtrack published from Resynthesis. Composer rows map onto one by
+//! id, so the registry, not any single panel, is what "all Tracks" means.
 //!
-//! Registered entries are *recipes*, not live plugins: a library path, a class
-//! id, and (for LeSynth) the grid to import. The Composer loads its own instance
-//! per row from that recipe, so a composition plays whether or not the track's
-//! editor happens to be open. When it *is* open, [`TrackEntry::live`] points at
-//! that instance so the Composer can snapshot the grid the user is editing right
-//! now instead of the one that was registered.
+//! Entries are *recipes*, not live plugins: a library path, a class id, and (for
+//! LeSynth) the grid to import, so a composition plays whether or not the
+//! track's editor is open. When it is, [`TrackEntry::live`] points at that
+//! instance, so the Composer can snapshot the grid being edited right now.
 //!
 //! GUI-thread only (`Rc<RefCell<_>>`) — every user of it is an egui panel.
 

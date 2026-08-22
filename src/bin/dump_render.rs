@@ -13,30 +13,24 @@
 // limitations under the License.
 //! Offline render dump — the debugging counterpart to a loopback capture.
 //!
-//! Decodes a source file, segments it, analyses one subtrack through a real
-//! LeSynth Fourier instance and writes the renders straight to disk as 32-bit
-//! float wavs. Nothing here touches cpal, the audio engine's ring buffer or the
-//! system mixer, so a defect that shows up in these files is the plugin's, and
-//! one that shows up only in a loopback capture is the host path's or
-//! PulseAudio's resampler.
+//! Decodes a source, segments it, analyses one subtrack through a real LeSynth
+//! Fourier instance and writes the renders to disk as 32-bit float wavs. Nothing
+//! here touches cpal, the ring buffer or the system mixer, so a defect visible
+//! in these files is the plugin's and one visible only in a loopback capture is
+//! the host path's.
 //!
-//! Two renders come out, because they are different code paths and only one of
-//! them is supposed to be exact:
+//! The renders are different code paths and only one is meant to be exact:
 //!
-//! * `exact.wav` — [`PluginInstance::resynthesize_exact`], one inverse FFT per
-//!   bucket at the analysis rate. This is the transform's inverse; against
+//! * `exact.wav` — one inverse FFT per bucket at the analysis rate; against
 //!   `source.wav` it should sit at the float noise floor.
-//! * `key_<hz>.wav` — [`PluginInstance::resynthesize_key`], the path the
-//!   keyboard plays through: the plugin's `PlaybackGrid`, one true fractional
-//!   period per bucket, walked on the source's own clock. Not exact by design,
-//!   but it must not buzz. **This is the one to scan for a keyboard buzz.**
-//! * `contour_<hz>.wav` — [`PluginInstance::resynthesize`], the host bridge's
-//!   path: the analysis grid's *rounded* buckets on a uniform time grid. A
-//!   different signal, and the one this tool used to dump alone — which is how
-//!   a keyboard defect stayed invisible to it.
+//! * `key_<hz>.wav` — what the keyboard plays: the `PlaybackGrid`, one true
+//!   fractional period per bucket. Not exact by design, but it must not buzz.
+//!   **This is the one to scan for a keyboard buzz.**
+//! * `contour_<hz>.wav` — the host bridge: rounded buckets on a uniform time
+//!   grid. A different signal, and the one this tool used to dump alone, which
+//!   is how a keyboard defect stayed invisible to it.
 //!
-//! Feed the results to `tools/buzzscan.py`, which reads these float wavs
-//! directly.
+//! Feed the results to `tools/buzzscan.py`, `resampcmp.py` or `psolaref.py`.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -253,15 +247,11 @@ fn main() -> Result<()> {
         report_diff(samples, &exact);
     }
 
-    // 5) The two transposing paths, which are *not* the same signal.
-    //
-    // `key_<hz>.wav` is what the keyboard plays: the plugin's `PlaybackGrid`,
-    // one true fractional period per bucket, walked on the source's own clock.
-    // `contour_<hz>.wav` is the host bridge's path — the analysis grid's rounded
-    // buckets on a uniform time grid — which is what this tool used to dump and
-    // call "the path a key plays". It is kept because the bridge is real and a
-    // regression in it matters, but a keyboard defect is only visible in the
-    // first, and comparing the two localises the rounding directly.
+    // 5) The two transposing paths, which are *not* the same signal: `key_` is
+    // what the keyboard plays (the `PlaybackGrid`, true fractional periods) and
+    // `contour_` is the host bridge's (rounded buckets, uniform time grid). Only
+    // the first can show a keyboard defect; comparing the two localises the
+    // rounding directly.
     let note = num("--note", sub.base_freq)?;
     // Which piano key the live render presses. Default: the one nearest the
     // source's own pitch, so it is comparable with everything else here.
@@ -272,12 +262,10 @@ fn main() -> Result<()> {
     if note > 0.0 {
         let base_period = grid.sample_rate / note;
         // `--synth-timeline` renders one cycle per bucket instead of walking the
-        // source's wall clock. It is a different note (its length follows the
-        // key), but a bucket is then exactly one rendered cycle, so a bucket
-        // change can only ever land on a cycle boundary. Driven by time the
-        // bucket is chosen from the wall clock every sample, and once the key
-        // transposes, that lands the change in the middle of a cycle. Comparing
-        // the two says whether that matters.
+        // wall clock. A different note (its length follows the key), but a bucket
+        // is then exactly one rendered cycle, so a bucket change can only land on
+        // a cycle boundary — whereas on the wall clock, once the key transposes,
+        // it lands mid-cycle. Comparing the two says whether that matters.
         let synth_timeline = args.iter().any(|a| a == "--synth-timeline");
         // `--max-harmonic N` caps the rendered band. A source is usually
         // band-limited well below Nyquist (a lossy codec lowpasses it), and the
@@ -307,12 +295,10 @@ fn main() -> Result<()> {
             base_period
         );
 
-        // 5b) The same key, but rendered by a live engine inside the plugin —
-        // `load_analysis` then `assemble_buffer_for_key`, the calls an editor key
-        // press makes. This is the only render here that can show an integration
-        // fault: the live path builds its own `PlaybackGrid` from `SharedParams`
-        // and falls back to the contour renderer, silently, if anything is
-        // missing.
+        // 5b) The same key through a live engine — the calls an editor key press
+        // makes. The only render here that can show an integration fault: the
+        // live path builds its own `PlaybackGrid` and falls back to the contour
+        // renderer, silently, if anything is missing.
         let key_hz = 27.5f32 * 2f32.powf(key_index as f32 / 12.0);
         match plugin.render_key_live(
             samples,

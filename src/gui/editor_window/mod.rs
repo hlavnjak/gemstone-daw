@@ -14,18 +14,11 @@
 //! Plugin editor window — hosts the VST3 plugin's own GUI in a native
 //! top-level window and embeds the plugin view via the platform handle.
 //!
-//! Each backend exposes the same entry point:
-//!
-//! ```ignore
-//! pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle>;
-//! ```
-//!
-//! The returned [`EditorHandle`] carries two flags:
-//!   * `close_flag` (host → thread): set it to `true` to ask the editor to close.
-//!   * `closed` (thread → host): the thread sets it to `true` once the window has
-//!     gone away — whether the host asked (via `close_flag`) or the user clicked
-//!     the window's own close button. The host polls it each frame to reap the
-//!     instance and free its resources (audio stream, plugin, thread).
+//! Every backend exposes `open_editor_in_thread(&PluginInstance) ->
+//! Result<EditorHandle>`. The handle carries two flags: `close_flag` asks the
+//! editor to close, and `closed` is set by the thread once the window has gone —
+//! whether the host asked or the user clicked its own close button. The host
+//! polls `closed` each frame to reap the instance and free its resources.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

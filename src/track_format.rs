@@ -13,13 +13,11 @@
 // limitations under the License.
 //! `.lsft` — the custom LeSynth Fourier Track format.
 //!
-//! A saved track is the full harmonic grid a user built/edited in a LeSynth
-//! editor: `amplitude[h][b]` and `phase[h][b]` for every harmonic and bucket,
-//! plus the per-bucket pitch (`pitch_ratio[b]`, i.e. `f_local / base_freq`) and
-//! the reference `base_freq`, so the per-bucket absolute frequency is
-//! `base_freq * pitch_ratio[b]`. The host reads/writes this file; the grid is
-//! transferred to/from a live plugin instance over the C ABI (see
-//! `PluginInstance::export_state` / `import_state`).
+//! A saved track is the full harmonic grid from a LeSynth editor:
+//! `amplitude[h][b]`, `phase[h][b]`, the per-bucket pitch (`pitch_ratio[b]` =
+//! `f_local / base_freq`) and the reference `base_freq`. The host reads/writes
+//! the file; the grid crosses the C ABI (`PluginInstance::export_state` /
+//! `import_state`).
 //!
 //! Layout (little-endian):
 //! ```text
@@ -32,18 +30,13 @@
 //! ```
 //!
 //! Version 2 added `display_gain`, without which a reloaded track cannot be
-//! auditioned at the level of the audio it came from.
-//!
-//! **Version 3 added the three fields the exact inverse needs**, none of which
-//! the grid carries: the per-bucket *length* is not derivable from `pitch_ratio`
-//! (the last bucket absorbs the remainder, so pitch and length are separate),
-//! and DC and Nyquist are not harmonics, so they have no row. Dropping DC alone
-//! costs ~120 dB. Without them a reloaded track could only be auditioned through
-//! the transposing renderer — i.e. it sounded worse than before you saved it.
-//!
-//! Older files still load, reporting `display_gain` unknown (`0.0`, v1) and an
-//! empty [`TrackState::bucket_lengths`] (v1/v2), which switches the exact path
-//! off rather than feeding it numbers it cannot trust.
+//! auditioned at its source's level. **Version 3 added the three fields the
+//! exact inverse needs**, none of them derivable from the grid: the per-bucket
+//! length (the last bucket absorbs the remainder, so pitch and length differ),
+//! and DC and Nyquist, which are not harmonics and have no row — dropping DC
+//! alone costs ~120 dB. Older files load with `display_gain` unknown (`0.0`) and
+//! empty [`TrackState::bucket_lengths`], which switches the exact path off
+//! rather than feeding it numbers it cannot trust.
 
 use std::fs;
 use std::path::Path;

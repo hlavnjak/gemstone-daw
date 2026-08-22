@@ -35,12 +35,10 @@ use super::handler::ParamChangeHandler;
 type GetPluginFactoryProc = unsafe extern "C" fn() -> *mut IPluginFactory;
 
 // LeSynth Fourier's host-facing analysis C ABI (see lesynth-fourier/src/lib.rs).
-// The `contour` (ptr,len) carries the per-position fundamental in absolute Hz,
-// uniformly resampled across the subtrack; null/0 means flat (legacy).
-// Addressed to the instance carrying `token` (first argument), so the job can't
-// be claimed by a different open editor. Returns 0 on success. (The plugin also
-// exports an untargeted `lesynth_fourier_push_analysis`, kept for other hosts;
-// it is unusable here because we open several editors at once.)
+// `contour` (ptr,len) is the per-position fundamental in Hz, uniformly resampled
+// across the subtrack; null/0 means flat. Addressed to the instance carrying
+// `token`, so another open editor cannot claim the job — the plugin's untargeted
+// entry point is unusable here because we open several editors at once.
 type PushAnalysisToProc =
     unsafe extern "C" fn(u64, *const f32, usize, f32, f32, *const f32, usize) -> i64;
 type AnalyzeProc = unsafe extern "C" fn(
@@ -237,12 +235,10 @@ impl AnalysisGrid {
         (base_period / r.max(1e-3)).max(2.0)
     }
 
-    /// The same grid as a [`TrackState`] — the form an instance is loaded from
-    /// ([`PluginInstance::import_state`]) and a `.lsft` is written in. Lets an
-    /// analysis be turned into a playable track without an editor ever opening.
-    ///
-    /// `bucket_periods` are whole sample counts here; they are `f32` in the grid
-    /// only because that is the ABI's array type.
+    /// The same grid as a [`TrackState`] — what an instance is loaded from and a
+    /// `.lsft` is written in, so an analysis can become a playable track without
+    /// an editor opening. `bucket_periods` are whole sample counts, `f32` only
+    /// because that is the ABI's array type.
     pub fn to_track_state(&self) -> TrackState {
         TrackState {
             num_harmonics: self.num_harmonics,
@@ -276,12 +272,9 @@ pub struct PluginInstance {
 impl PluginInstance {
     /// Load a VST3 plugin from a shared library path and initialize it.
     ///
-    /// `class_id`: The 16-byte class ID to look for in the plugin factory.
-    /// If None, loads the first available class.
-    ///
-    /// `token`: if `Some`, tag this instance (via the LeSynth `prepare_instance`
-    /// C ABI, called before the instance is created) so its live grid can later
-    /// be exported/imported by token. Ignored for plugins lacking that symbol.
+    /// `class_id` is the 16-byte factory class to select (`None` = the first).
+    /// `token`, if given, tags the instance before it is created so its live grid
+    /// can be exported/imported by token; ignored if the plugin lacks the symbol.
     pub fn load(
         plugin_path: &Path,
         class_id: Option<&[i8; 16]>,
@@ -546,12 +539,9 @@ impl PluginInstance {
     /// Push a recorded subtrack to this instance for analysis; its editor picks
     /// the job up, switches to Analysis mode and shows the grid.
     ///
-    /// Addressed by token, so it waits for *this* instance's editor. The
-    /// untargeted entry point lets an editor already open for another track
-    /// claim it first, leaving this one with empty charts.
-    ///
-    /// `contour` is the per-position fundamental in Hz, uniformly resampled
-    /// across the subtrack; empty = flat.
+    /// Addressed by token, so it waits for *this* editor — the untargeted entry
+    /// point would let another open editor claim it and leave this one empty.
+    /// `contour` is the per-position fundamental in Hz; empty = flat.
     pub fn push_analysis(
         &self,
         samples: &[f32],
@@ -624,12 +614,11 @@ impl PluginInstance {
         Ok((amp, phase))
     }
 
-    /// Full stateless analysis through the plugin's DSP: the same grid
-    /// `analyze_and_load` builds when the plugin ingests a subtrack, including
-    /// the per-bucket pitch ratio and bucket period that [`Self::analyze`]
-    /// leaves out. `num_buckets == 0` selects the plugin's own
-    /// period-synchronous bucketing, in which case the count is derived from the
-    /// source (hence the two-call probe below).
+    /// Full stateless analysis through the plugin's DSP: the grid
+    /// `analyze_and_load` builds, including the per-bucket pitch ratio and period
+    /// that [`Self::analyze`] leaves out. `num_buckets == 0` selects the plugin's
+    /// own period-synchronous bucketing, whose count comes from the source —
+    /// hence the two-call probe below.
     pub fn analyze_full(
         &self,
         samples: &[f32],
@@ -719,17 +708,13 @@ impl PluginInstance {
     }
 
     /// Reproduce the analysed source from its grid — the exact inverse of
-    /// [`Self::analyze_full`]. One inverse FFT per bucket returns that period's
-    /// samples, and the concatenation returns the subtrack, exact to float
-    /// rounding. Use [`Self::resynthesize`] for anything transposed onto a key,
-    /// which must resample.
+    /// [`Self::analyze_full`], exact to float rounding. Use
+    /// [`Self::resynthesize`] for anything transposed, which must resample.
     ///
-    /// `restore_source_level` divides out [`AnalysisGrid::display_gain`], giving
-    /// the source file's own absolute level.
-    ///
-    /// `output_sample_rate` is the rate this will be played at: the grid's own
-    /// rate is the bit-exact case, any other band-limit-resamples the finished
-    /// reconstruction.
+    /// `restore_source_level` divides out [`AnalysisGrid::display_gain`] for the
+    /// file's own level. `output_sample_rate` is what this will be played at: the
+    /// grid's own rate is the bit-exact case, any other band-limit-resamples the
+    /// finished reconstruction.
     pub fn resynthesize_exact(
         &self,
         grid: &AnalysisGrid,
@@ -786,15 +771,12 @@ impl PluginInstance {
     }
 
     /// Render a grid back to audio through the plugin's own playback path, with
-    /// no plugin state involved. `base_period` is the **fractional** rendered
-    /// fundamental period in samples (`sample_rate / freq`, unrounded),
-    /// `max_harmonic` an anti-alias cap (`0` = none beyond Nyquist), and
-    /// `target_samples` the Analysis-mode "preserve seconds" length (`0` = one
-    /// cycle per bucket).
-    ///
-    /// `restore_source_level` divides out [`AnalysisGrid::display_gain`], giving
-    /// the source's own absolute level — the only form comparable against the
-    /// file. `false` renders at the grid's level, which is what a key plays.
+    /// no plugin state involved. `base_period` is the **fractional** fundamental
+    /// period in samples, `max_harmonic` an anti-alias cap (`0` = Nyquist only),
+    /// `target_samples` the "preserve seconds" length (`0` = one cycle per
+    /// bucket). `restore_source_level` divides out
+    /// [`AnalysisGrid::display_gain`] for the level comparable against the file;
+    /// `false` renders at the grid's level, which is what a key plays.
     pub fn resynthesize(
         &self,
         grid: &AnalysisGrid,
@@ -835,13 +817,10 @@ impl PluginInstance {
     /// Render a key **the way the keyboard does** — through the plugin's
     /// `PlaybackGrid` and the source's own two clocks.
     ///
-    /// [`Self::resynthesize`] is not that path: it passes a pitch contour and no
-    /// bucket lengths, so the plugin renders the analysis grid's *rounded*
-    /// buckets on a uniform time grid. A key does neither, so a dump made
-    /// through it cannot show a keyboard defect. Use this one to ask why a key
-    /// buzzes.
-    ///
-    /// `base_period` is the key's period in output samples, fractional.
+    /// [`Self::resynthesize`] is not that path — it renders the analysis grid's
+    /// *rounded* buckets on a uniform time grid, so a dump made through it cannot
+    /// show a keyboard defect. `base_period` is the key's period in output
+    /// samples, fractional.
     #[allow(clippy::too_many_arguments)]
     pub fn resynthesize_key(
         &self,
@@ -891,13 +870,12 @@ impl PluginInstance {
     /// Render a key through a **live engine** inside the plugin — the same
     /// `load_analysis` + `assemble_buffer_for_key` an editor key press makes.
     ///
-    /// [`Self::resynthesize_key`] calls the renderer with a `PlaybackGrid` built
-    /// for it, so it can only ever prove the renderer sound. The live path
-    /// builds that grid from the plugin's own `SharedParams` and falls back to
-    /// the contour renderer whenever anything is missing — silently, same call,
-    /// different signal. `used_playback_grid` in the result is `false` when that
-    /// happened, which is the answer to "the offline dump is clean but the
-    /// plugin still buzzes".
+    /// [`Self::resynthesize_key`] hands the renderer a `PlaybackGrid` built for
+    /// it, so it can only prove the renderer sound. The live path builds that
+    /// grid from the plugin's own `SharedParams` and falls back to the contour
+    /// renderer if anything is missing — silently, same call, different signal.
+    /// `used_playback_grid` is `false` when that happened, which answers "the
+    /// offline dump is clean but the plugin still buzzes".
     #[allow(clippy::too_many_arguments)]
     pub fn render_key_live(
         &self,
@@ -923,14 +901,11 @@ impl PluginInstance {
                     sample_rate,
                     out_sample_rate,
                     base_freq,
-                    // The pitch contour, which this used to pass as null. Without
-                    // it the engine analyses a *flat* source: every bucket gets
-                    // the same true period, the render tracks none of the
-                    // recording's vibrato, and it comes out 52 dB from the same
-                    // key rendered through `resynthesize_key` — which reads as
-                    // "the keyboard does not play what the offline dump
-                    // measures" when in fact the probe was asking for a
-                    // different note.
+                    // The pitch contour. Passing null here analyses a *flat*
+                    // source — every bucket the same period, no vibrato — and
+                    // lands 52 dB from `resynthesize_key` on the same key, which
+                    // reads as "the keyboard plays something else" when the probe
+                    // was simply asking for a different note.
                     if contour.is_empty() { std::ptr::null() } else { contour.as_ptr() },
                     contour.len(),
                     num_buckets,
