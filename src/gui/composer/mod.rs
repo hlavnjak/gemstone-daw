@@ -34,6 +34,9 @@
 //! of units and the arithmetic stays exact. Playback lives in [`player`].
 
 pub mod player;
+pub mod project;
+
+use std::path::PathBuf;
 
 use eframe::egui;
 
@@ -167,18 +170,18 @@ fn pitch_name(pitch: u8) -> String {
 /// because the space is not independently removable: it exists only as the
 /// silence after *this* note, and goes when the note goes. Making that
 /// structural means no code path can leave a space orphaned.
-#[derive(Clone, Copy)]
-struct Item {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Item {
     /// Stable within its row, so the egui widget ids survive frames being
     /// deleted around it.
-    id: u64,
-    pitch: u8,
+    pub(crate) id: u64,
+    pub(crate) pitch: u8,
     /// How long the note sounds.
-    dur: Duration,
+    pub(crate) dur: Duration,
     /// The silence after it. Zero is legal and useful: the frame stays on
     /// screen as a placeholder, ready to be given a length, while the next note
     /// follows on immediately.
-    space: Duration,
+    pub(crate) space: Duration,
 }
 
 impl Item {
@@ -200,6 +203,19 @@ struct Row {
     /// deleting the first note cannot take it along — it stays at the head and
     /// leads whichever note is first afterwards. Zero by default.
     lead: Duration,
+    /// Re-export this row's LeSynth grid into the project folder on every save.
+    /// On by default, so a project saved after an edit carries the edit; off
+    /// pins whatever `.lsft` is already there.
+    autosave: bool,
+    /// The source a loaded project asked for and the app could not find. Kept
+    /// whole, not just as a message, so saving the project again preserves the
+    /// reference rather than quietly replacing it with "no track" — a save after
+    /// a load must not be the thing that loses the file name.
+    ///
+    /// A row in this state is **not** auto-adopted onto another track by
+    /// [`ComposerPanel::reconcile_tracks`]: the point is that the user is told
+    /// what is missing and picks the replacement.
+    missing: Option<project::TrackSource>,
     /// In play order: item `n` starts where item `n - 1`'s space ended.
     items: Vec<Item>,
     next_item_id: u64,
@@ -212,6 +228,8 @@ impl Row {
             track_id,
             gain: 1.0,
             lead: Duration::new(0, Fraction::None),
+            autosave: true,
+            missing: None,
             items: Vec::new(),
             next_item_id: 0,
         }
@@ -289,12 +307,32 @@ impl Row {
     }
 }
 
+/// What the Composer wants the app to do with the project. The panel owns the
+/// composition but not the plugin instances a save has to read the grids from,
+/// nor the Tracks panel a load has to put them into, so the button records the
+/// intent and [`ComposerPanel::take_request`] hands it over.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProjectRequest {
+    /// Write the project to `dir`, creating it if needed.
+    Save { dir: PathBuf, name: String },
+    /// Read the manifest at this path and replace the composition with it.
+    Load { file: PathBuf },
+}
+
 /// The Composer panel.
 pub struct ComposerPanel {
     registry: TrackRegistry,
     rows: Vec<Row>,
     next_row_id: u64,
     tempo_bpm: f32,
+    /// Project name as typed. Sanitised into the folder and manifest name only
+    /// when saving, so what the user sees is what they wrote.
+    project_name: String,
+    /// Where this project was last saved to or loaded from, if anywhere.
+    project_dir: Option<PathBuf>,
+    /// Set by the Save/Load buttons and taken by the app, which owns the plugin
+    /// instances the grids have to be exported from.
+    request: Option<ProjectRequest>,
     status: String,
     player: Option<CompositionPlayer>,
 }
@@ -306,6 +344,9 @@ impl ComposerPanel {
             rows: Vec::new(),
             next_row_id: 0,
             tempo_bpm: 120.0,
+            project_name: "Untitled".to_string(),
+            project_dir: None,
+            request: None,
             status: "Add a track row to start composing.".to_string(),
             player: None,
         }
@@ -330,9 +371,16 @@ impl ComposerPanel {
     /// Keep every row pointed at a track that still exists: a row whose track was
     /// removed falls back to the first one available, and a row left without any
     /// (the registry went empty) adopts the first track added afterwards.
+    ///
+    /// A row whose loaded source went **missing** is left alone. Quietly moving
+    /// it onto some other track would hide the one thing the user has to be told
+    /// about, and would make the replacement look like it had always been there.
     fn reconcile_tracks(&mut self) {
         let first = self.registry.first_id();
         for row in &mut self.rows {
+            if row.missing.is_some() {
+                continue;
+            }
             let valid = row.track_id.is_some_and(|id| self.registry.contains(id));
             if !valid {
                 row.track_id = first;
@@ -425,6 +473,8 @@ impl ComposerPanel {
                 );
             }
         });
+        ui.add_space(6.0);
+        self.project_ui(ui);
 
         if !self.rows.is_empty() {
             ui.add_space(6.0);
@@ -434,6 +484,198 @@ impl ComposerPanel {
         ui.add_space(8.0);
         ui.separator();
         self.transport_ui(ui);
+    }
+
+    /// Take whatever the Save/Load buttons asked for, if anything. The app calls
+    /// this after drawing and performs the request — see [`ProjectRequest`].
+    pub fn take_request(&mut self) -> Option<ProjectRequest> {
+        self.request.take()
+    }
+
+    /// The composition as it would be saved. `source_of` maps a row's registry
+    /// id onto the source to record for it, which only the app can decide: it
+    /// knows which tracks are LeSynth, where their grids went, and where a
+    /// custom VST was loaded from.
+    pub fn to_project(
+        &self,
+        name: &str,
+        mut source_of: impl FnMut(Option<u64>) -> project::TrackSource,
+    ) -> project::Project {
+        project::Project {
+            name: name.to_string(),
+            tempo_bpm: self.tempo_bpm,
+            rows: self
+                .rows
+                .iter()
+                .map(|row| project::ProjectRow {
+                    track_name: row
+                        .track_id
+                        .and_then(|id| self.registry.name_of(id))
+                        .or_else(|| row.missing.as_ref().map(|s| s.describe()))
+                        .unwrap_or_default(),
+                    // An unresolved row round-trips the source it was looking
+                    // for; anything else asks the app what its track is now.
+                    source: match &row.missing {
+                        Some(src) => src.clone(),
+                        None => source_of(row.track_id),
+                    },
+                    gain: row.gain,
+                    lead: row.lead,
+                    autosave: row.autosave,
+                    items: row.items.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Replace the composition with a loaded project. `resolved` is one entry
+    /// per row, in order: the registry id the app managed to bind that row's
+    /// source to, or `None` if it could not be found.
+    pub fn apply_project(
+        &mut self,
+        project: &project::Project,
+        dir: PathBuf,
+        resolved: &[Option<u64>],
+    ) {
+        self.stop_playback();
+        self.tempo_bpm = project.tempo_bpm;
+        self.project_name = project.name.clone();
+        self.project_dir = Some(dir);
+        self.rows.clear();
+        for (i, prow) in project.rows.iter().enumerate() {
+            let id = self.next_row_id;
+            self.next_row_id += 1;
+            let track_id = resolved.get(i).copied().flatten();
+            let mut row = Row::new(id, track_id);
+            row.gain = prow.gain;
+            row.lead = prow.lead;
+            row.autosave = prow.autosave;
+            // Nothing to bind means the source is gone. Keep what it was so the
+            // row can say so and the user knows what to replace.
+            row.missing = match (track_id, &prow.source) {
+                (None, project::TrackSource::None) => None,
+                (None, src) => Some(src.clone()),
+                (Some(_), _) => None,
+            };
+            for item in &prow.items {
+                let item_id = row.next_item_id;
+                row.next_item_id += 1;
+                row.items.push(Item { id: item_id, ..*item });
+            }
+            self.rows.push(row);
+        }
+        let missing = self.rows.iter().filter(|r| r.missing.is_some()).count();
+        self.status = match missing {
+            0 => format!("Loaded {} — {} row(s).", project.name, self.rows.len()),
+            n => format!(
+                "Loaded {} — {} row(s), {n} with a missing source: pick a new one \
+                 in the row's select box.",
+                project.name,
+                self.rows.len()
+            ),
+        };
+    }
+
+    /// Which rows want their grid re-exported on the next save, as registry ids.
+    pub fn autosave_track_ids(&self) -> Vec<u64> {
+        self.rows
+            .iter()
+            .filter(|r| r.autosave)
+            .filter_map(|r| r.track_id)
+            .collect()
+    }
+
+    /// Record where a save actually landed, so the next one goes to the same
+    /// folder rather than asking again.
+    pub fn set_project_dir(&mut self, dir: PathBuf, name: String) {
+        self.project_dir = Some(dir);
+        self.project_name = name;
+    }
+
+    pub fn set_status(&mut self, status: String) {
+        self.status = status;
+    }
+
+    /// Name, Save and Load. The name is the folder's name and the manifest's,
+    /// so there is one thing to type and no separate "save as" dialog to keep in
+    /// step with it: saving under a new name writes a new folder beside the old.
+    fn project_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Project");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.project_name)
+                    .desired_width(180.0)
+                    .hint_text("Untitled"),
+            )
+            .on_hover_text(
+                "The project's name — also the folder it is saved in and the \
+                 .gmstn file inside it.\n\nSaving under a new name writes a new \
+                 folder next to the old one and leaves that one untouched.",
+            );
+
+            let stem = project::sanitize_name(&self.project_name);
+            if ui
+                .button("💾 Save Project")
+                .on_hover_text(format!(
+                    "Write {stem}/{stem}.{ext}, with a .lsft beside it for every \
+                     LeSynth Fourier track a row plays.",
+                    ext = project::EXTENSION
+                ))
+                .clicked()
+            {
+                self.request_save(&stem);
+            }
+            if ui
+                .button("📂 Load Project")
+                .on_hover_text("Open a .gmstn project — this replaces the rows below.")
+                .clicked()
+            {
+                if let Some(file) = rfd::FileDialog::new()
+                    .add_filter("Gemstone project", &[project::EXTENSION])
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+                {
+                    self.request = Some(ProjectRequest::Load { file });
+                }
+            }
+            if let Some(dir) = &self.project_dir {
+                ui.label(
+                    egui::RichText::new(dir.display().to_string())
+                        .small()
+                        .color(egui::Color32::from_gray(130)),
+                );
+            }
+        });
+    }
+
+    /// Where to save. An existing project saves in place unless the name has
+    /// changed, in which case the new name gets its own folder beside it; a
+    /// project that has never been saved asks where to put its folder.
+    fn request_save(&mut self, stem: &str) {
+        let existing = self.project_dir.clone().filter(|d| {
+            d.file_name().is_some_and(|n| n == std::ffi::OsStr::new(stem))
+        });
+        let parent = match &existing {
+            Some(dir) => return self.request = Some(ProjectRequest::Save {
+                dir: dir.clone(),
+                name: stem.to_string(),
+            }),
+            None => self
+                .project_dir
+                .as_ref()
+                .and_then(|d| d.parent().map(PathBuf::from)),
+        };
+        let parent = match parent {
+            Some(p) => Some(p),
+            None => rfd::FileDialog::new()
+                .set_title("Where should the project folder go?")
+                .pick_folder(),
+        };
+        let Some(parent) = parent else { return };
+        self.request = Some(ProjectRequest::Save {
+            dir: parent.join(stem),
+            name: stem.to_string(),
+        });
     }
 
     /// One strip per row: the head on the left, the chain of frames scrolling on
@@ -456,15 +698,21 @@ impl ComposerPanel {
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
                                     ui.horizontal(|ui| {
-                                        let label = row
-                                            .track_id
-                                            .and_then(|id| {
-                                                tracks
-                                                    .iter()
-                                                    .find(|(t, _)| *t == id)
-                                                    .map(|(_, n)| n.clone())
-                                            })
-                                            .unwrap_or_else(|| "— no track —".to_string());
+                                        // A row whose loaded source is missing
+                                        // says so in the box itself, and says
+                                        // what it was: picking anything from the
+                                        // list is how it gets repaired.
+                                        let label = match (&row.missing, row.track_id) {
+                                            (Some(want), _) => {
+                                                format!("⚠ missing: {}", want.describe())
+                                            }
+                                            (None, Some(id)) => tracks
+                                                .iter()
+                                                .find(|(t, _)| *t == id)
+                                                .map(|(_, n)| n.clone())
+                                                .unwrap_or_else(|| "— no track —".to_string()),
+                                            (None, None) => "— no track —".to_string(),
+                                        };
                                         // Salt = `row_id` (so two rows never
                                         // share a popup) + the track count. An
                                         // `egui::Area` measures itself only on
@@ -482,11 +730,19 @@ impl ComposerPanel {
                                                     ui.label("— no track —");
                                                 }
                                                 for (id, name) in tracks {
-                                                    ui.selectable_value(
-                                                        &mut row.track_id,
-                                                        Some(*id),
-                                                        name,
-                                                    );
+                                                    if ui
+                                                        .selectable_label(
+                                                            row.missing.is_none()
+                                                                && row.track_id == Some(*id),
+                                                            name,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        row.track_id = Some(*id);
+                                                        // Repaired: the row is
+                                                        // an ordinary row again.
+                                                        row.missing = None;
+                                                    }
                                                 }
                                             });
                                         if ui
@@ -509,12 +765,22 @@ impl ComposerPanel {
                                             row.add_note();
                                         }
                                         ui.label("Gain");
-                                        ui.spacing_mut().slider_width = 96.0;
+                                        ui.spacing_mut().slider_width = 76.0;
                                         ui.add(
                                             egui::Slider::new(&mut row.gain, 0.0..=2.0)
                                                 .fixed_decimals(2)
                                                 .show_value(true),
                                         );
+                                        ui.checkbox(&mut row.autosave, "auto")
+                                            .on_hover_text(
+                                                "Re-export this row's LeSynth Fourier \
+                                                 grid into the project folder every time \
+                                                 the project is saved, so the project \
+                                                 carries what you last edited.\n\n\
+                                                 Off keeps the .lsft already in the \
+                                                 folder, which pins the sound as it was \
+                                                 when it was first written.",
+                                            );
                                     });
                                 },
                             );
@@ -1238,13 +1504,29 @@ mod tests {
                 .collect()
         };
 
+        // Where the row heads' select boxes are, found from the painted track
+        // name rather than hardcoded — the panel grows a header now and then,
+        // and a test that silently clicks past it proves nothing.
+        let boxes = |texts: &[String]| -> Vec<egui::Pos2> {
+            texts
+                .iter()
+                .filter_map(|s| {
+                    let (name, pos) = s.rsplit_once('@')?;
+                    let (nx, ny) = pos.split_once(',')?;
+                    let (nx, ny): (f32, f32) = (nx.parse().ok()?, ny.parse().ok()?);
+                    (name.starts_with('t') && (20.0..28.0).contains(&nx))
+                        .then(|| egui::pos2(nx + 66.0, ny + 2.0))
+                })
+                .collect()
+        };
+
         panel.add_row();
-        run(&mut panel, egui::RawInput::default());
+        let laid_out = run(&mut panel, egui::RawInput::default());
 
         // The first row's select box, opened once while only one track exists.
         // Opening it is the whole point: that first view is what its popup used
         // to be stuck at.
-        let box1 = egui::pos2(90.0, 52.0);
+        let box1 = *boxes(&laid_out).first().expect("the row's select box is drawn");
         run(&mut panel, click(box1));
         let open = run(&mut panel, egui::RawInput::default());
         assert_eq!(
@@ -1266,7 +1548,8 @@ mod tests {
         for n in 3..=4 {
             registry.add(format!("t{n}"), std::path::PathBuf::from("/x"), None, false, None);
         }
-        run(&mut panel, egui::RawInput::default());
+        let laid_out = run(&mut panel, egui::RawInput::default());
+        let box2 = *boxes(&laid_out).get(1).expect("the second row's select box is drawn");
 
         // The first row must now offer them too. It is a fresh popup Area, so it
         // takes a sizing pass to appear — hence the second frame.
@@ -1283,7 +1566,6 @@ mod tests {
         // And the row added later, which never had a popup of its own.
         run(&mut panel, click(egui::pos2(900.0, 900.0)));
         run(&mut panel, egui::RawInput::default());
-        let box2 = egui::pos2(90.0, 198.0);
         run(&mut panel, click(box2));
         run(&mut panel, egui::RawInput::default());
         let second = run(&mut panel, egui::RawInput::default());
@@ -1292,5 +1574,116 @@ mod tests {
             vec!["t1", "t2", "t3", "t4"],
             "the second row's select box is missing a track: {second:?}"
         );
+    }
+
+    /// The requirement's second half: a project whose grid has been deleted must
+    /// load with that row marked, must not have some other track silently
+    /// adopted onto it, must still say what it wanted, and must **survive being
+    /// saved again** — losing the file name on the next save would make the
+    /// damage permanent.
+    #[test]
+    fn a_missing_source_is_kept_until_the_user_replaces_it() {
+        let (registry, ids) = registry_with(&["other"]);
+        let mut panel = ComposerPanel::new(registry.clone());
+        let loaded = project::Project {
+            name: "Song".to_string(),
+            tempo_bpm: 100.0,
+            rows: vec![project::ProjectRow {
+                track_name: "Voice".to_string(),
+                source: project::TrackSource::LeSynth { file: "Voice.lsft".to_string() },
+                gain: 0.5,
+                lead: Duration::new(0, Fraction::Eighth),
+                autosave: false,
+                items: vec![Item {
+                    id: 0,
+                    pitch: 62,
+                    dur: Duration::new(0, Fraction::Quarter),
+                    space: Duration::new(0, Fraction::None),
+                }],
+            }],
+        };
+        // The app could not bind it: the grid is gone.
+        panel.apply_project(&loaded, std::path::PathBuf::from("/tmp/Song"), &[None]);
+
+        assert_eq!(panel.rows.len(), 1);
+        assert!(panel.rows[0].missing.is_some(), "the row must be marked");
+        assert_eq!(panel.rows[0].track_id, None);
+        assert_eq!(panel.rows[0].gain, 0.5);
+        assert!(!panel.rows[0].autosave, "autosave must round-trip");
+        assert_eq!(panel.rows[0].items.len(), 1);
+
+        // A track exists, and the row must NOT be quietly moved onto it.
+        panel.reconcile_tracks();
+        assert_eq!(panel.rows[0].track_id, None, "an unresolved row was adopted silently");
+
+        // Saving again keeps the reference rather than erasing it.
+        let again = panel.to_project("Song", |_| project::TrackSource::None);
+        assert_eq!(
+            again.rows[0].source,
+            project::TrackSource::LeSynth { file: "Voice.lsft".to_string() },
+            "a re-save lost what the row was looking for"
+        );
+        assert_eq!(again.rows[0].track_name, "Voice.lsft");
+
+        // The user picks a replacement: the row becomes ordinary again.
+        panel.rows[0].track_id = Some(ids[0]);
+        panel.rows[0].missing = None;
+        panel.reconcile_tracks();
+        assert_eq!(panel.rows[0].track_id, Some(ids[0]));
+        let fixed = panel.to_project("Song", |_| project::TrackSource::LeSynthDefault);
+        assert_eq!(fixed.rows[0].source, project::TrackSource::LeSynthDefault);
+    }
+
+    /// Loading replaces the composition, and everything on a row that is not the
+    /// notes has to come back too — a project that forgets the tempo or a row's
+    /// lead is not a saved project.
+    #[test]
+    fn a_loaded_project_restores_every_row_setting() {
+        let (registry, ids) = registry_with(&["a", "b"]);
+        let mut panel = ComposerPanel::new(registry);
+        panel.add_row();
+        let loaded = project::Project {
+            name: "Two".to_string(),
+            tempo_bpm: 88.0,
+            rows: vec![
+                project::ProjectRow {
+                    track_name: "a".to_string(),
+                    source: project::TrackSource::LeSynthDefault,
+                    gain: 1.5,
+                    lead: Duration::new(1, Fraction::Sixteenth),
+                    autosave: true,
+                    items: vec![],
+                },
+                project::ProjectRow {
+                    track_name: "b".to_string(),
+                    source: project::TrackSource::LeSynthDefault,
+                    gain: 0.25,
+                    lead: Duration::new(0, Fraction::None),
+                    autosave: false,
+                    items: vec![Item {
+                        id: 0,
+                        pitch: 70,
+                        dur: Duration::new(0, Fraction::Half),
+                        space: Duration::new(0, Fraction::Quarter),
+                    }],
+                },
+            ],
+        };
+        panel.apply_project(&loaded, std::path::PathBuf::from("/tmp/Two"), &[
+            Some(ids[0]),
+            Some(ids[1]),
+        ]);
+
+        assert_eq!(panel.rows.len(), 2, "the old row must be replaced, not appended to");
+        assert_eq!(panel.tempo_bpm, 88.0);
+        assert_eq!(panel.rows[0].gain, 1.5);
+        assert_eq!(panel.rows[0].lead, Duration::new(1, Fraction::Sixteenth));
+        assert_eq!(panel.rows[1].track_id, Some(ids[1]));
+        assert!(!panel.rows[1].autosave);
+        assert_eq!(panel.rows[1].items[0].pitch, 70);
+        // Row ids stay unique, so two rows never share egui widget state.
+        assert_ne!(panel.rows[0].id, panel.rows[1].id);
+        // And only rows with autosave on ask for a fresh grid.
+        assert_eq!(panel.autosave_track_ids(), vec![ids[0]]);
     }
 }

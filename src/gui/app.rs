@@ -11,11 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use anyhow::Context;
 use eframe::egui;
 
 use crate::midi::{self, MidiEventQueue};
 
-use super::composer::ComposerPanel;
+use super::composer::project::{self, Project, TrackSource};
+use super::composer::{ComposerPanel, ProjectRequest};
 use super::registry::TrackRegistry;
 use super::resynth::ResynthPanel;
 use super::track::TracksPanel;
@@ -37,6 +39,10 @@ pub struct DawApp {
     composer: ComposerPanel,
     // Resynthesis (.wav/.mp3/.m4a → LeSynth Fourier analysis)
     resynth: ResynthPanel,
+    // The shared track list, kept here too so saving a project can read every
+    // track — including subtracks published straight from Resynthesis, which
+    // never pass through the Tracks panel.
+    registry: TrackRegistry,
 }
 
 impl Default for DawApp {
@@ -55,7 +61,8 @@ impl Default for DawApp {
             composer: ComposerPanel::new(registry.clone()),
             midi_queue,
             _midi_connection: None,
-            resynth: ResynthPanel::new(registry),
+            resynth: ResynthPanel::new(registry.clone()),
+            registry,
         }
     }
 }
@@ -227,6 +234,136 @@ impl DawApp {
             Self::status_label(ui, &self.midi_status);
         });
     }
+    /// Save or load a project — see [`ProjectRequest`].
+    fn perform_project_request(&mut self, request: ProjectRequest) {
+        let status = match request {
+            ProjectRequest::Save { dir, name } => match self.save_project(&dir, &name) {
+                Ok(n) => {
+                    self.composer.set_project_dir(dir.clone(), name);
+                    format!("Saved to {} ({n} grid file(s)).", dir.display())
+                }
+                Err(e) => format!("Save failed: {e:#}"),
+            },
+            ProjectRequest::Load { file } => match self.load_project(&file) {
+                Ok(()) => return, // `apply_project` sets its own status.
+                Err(e) => format!("Load failed: {e:#}"),
+            },
+        };
+        self.composer.set_status(status);
+    }
+
+    /// Write the project folder: the manifest, plus one `.lsft` for every
+    /// LeSynth Fourier track a row plays. Returns how many grids were written.
+    ///
+    /// A grid is re-exported when any row playing it has autosave on; otherwise
+    /// an existing file is left as it is, which is what pins a sound. A track
+    /// with no grid at all (plain synth mode, or a custom VST) writes no file —
+    /// the manifest records what it is instead.
+    fn save_project(&mut self, dir: &std::path::Path, name: &str) -> anyhow::Result<usize> {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create {}", dir.display()))?;
+
+        let autosave: Vec<u64> = self.composer.autosave_track_ids();
+        let mut sources: std::collections::HashMap<u64, TrackSource> = Default::default();
+        let mut taken: Vec<String> = Vec::new();
+        let mut written = 0usize;
+
+        // One file per distinct track, however many rows share it. Read through
+        // the registry rather than the Tracks panel: a subtrack published from
+        // Resynthesis is a real playable track that never appears there, and
+        // asking the panel would silently drop its sound from the project.
+        for (id, track_name) in self.registry.list() {
+            // `playback_source` snapshots the live editor when one is open, so
+            // what gets written is what the user can currently hear.
+            let Some(src) = self.registry.playback_source(id) else { continue };
+            if !src.is_lesynth {
+                sources.insert(
+                    id,
+                    TrackSource::Vst { path: src.plugin_path, class_id: src.class_id },
+                );
+                continue;
+            }
+            let Some(state) = src.state else {
+                // A LeSynth track in plain synth mode: nothing to save, and the
+                // manifest says so rather than pointing at a file that is not there.
+                sources.insert(id, TrackSource::LeSynthDefault);
+                continue;
+            };
+            let file = project::grid_file_name(&track_name, &taken);
+            let full = dir.join(&file);
+            // Autosave off with a file already there means "keep what is pinned".
+            if autosave.contains(&id) || !full.exists() {
+                state
+                    .write(&full)
+                    .with_context(|| format!("write {}", full.display()))?;
+                written += 1;
+            }
+            taken.push(file.clone());
+            sources.insert(id, TrackSource::LeSynth { file });
+        }
+
+        let project = self.composer.to_project(name, |track_id| {
+            track_id
+                .and_then(|id| sources.get(&id).cloned())
+                .unwrap_or(TrackSource::None)
+        });
+        project.write(&dir.join(format!("{name}.{}", project::EXTENSION)))?;
+        Ok(written)
+    }
+
+    /// Read a project folder back: adopt every track it names into the Tracks
+    /// panel, then hand the composition to the Composer with one resolved
+    /// registry id per row (`None` where the source could not be found).
+    fn load_project(&mut self, file: &std::path::Path) -> anyhow::Result<()> {
+        let project = Project::read(file)?;
+        let dir = file
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // The loaded project replaces what is open, so the tracks it brings are
+        // the only ones left — otherwise the previous project's tracks would sit
+        // in the list looking like part of this one.
+        self.tracks.clear();
+
+        // Distinct sources first, so rows sharing a track share one instance.
+        let mut adopted: Vec<(TrackSource, Option<u64>)> = Vec::new();
+        let mut resolved = Vec::with_capacity(project.rows.len());
+        for row in &project.rows {
+            if let Some((_, id)) = adopted.iter().find(|(src, _)| *src == row.source) {
+                resolved.push(*id);
+                continue;
+            }
+            let id = self.adopt_source(&row.source, &dir, &row.track_name);
+            adopted.push((row.source.clone(), id));
+            resolved.push(id);
+        }
+        self.composer.apply_project(&project, dir, &resolved);
+        Ok(())
+    }
+
+    /// Bind one project source to a track, or `None` when it cannot be found —
+    /// a deleted `.lsft`, or a VST that has moved. The row then shows what is
+    /// missing and the user picks a replacement.
+    fn adopt_source(
+        &mut self,
+        source: &TrackSource,
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Option<u64> {
+        let name = if name.is_empty() { "Track" } else { name };
+        match source {
+            TrackSource::None => None,
+            TrackSource::LeSynthDefault => self.tracks.adopt_lesynth(name, None).ok(),
+            TrackSource::LeSynth { file } => {
+                let state = crate::track_format::TrackState::read(&dir.join(file)).ok()?;
+                self.tracks.adopt_lesynth(name, Some(state)).ok()
+            }
+            TrackSource::Vst { path, class_id } => {
+                self.tracks.adopt_vst(name, path.clone(), *class_id).ok()
+            }
+        }
+    }
 }
 
 impl eframe::App for DawApp {
@@ -273,6 +410,14 @@ impl eframe::App for DawApp {
                     Self::section(ui, "Track Composer", |ui| {
                         self.composer.ui(ui);
                     });
+                    // Saving reads the grids out of the live plugin instances and
+                    // loading puts tracks into the Tracks panel, so the request is
+                    // performed here rather than inside the Composer, which owns
+                    // neither. Deferred past the draw so the panel is not mutated
+                    // mid-frame.
+                    if let Some(request) = self.composer.take_request() {
+                        self.perform_project_request(request);
+                    }
                     ui.add_space(14.0);
                     self.midi_section(ui);
                     ui.add_space(14.0);

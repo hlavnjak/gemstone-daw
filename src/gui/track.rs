@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui;
 
 use super::editor_window::{open_editor_in_thread, EditorHandle};
@@ -290,6 +290,69 @@ impl TracksPanel {
             editor: None,
         });
         self.status = "Created custom VST track.".to_string();
+    }
+
+    /// Adopt a LeSynth Fourier track from an already-parsed grid — what loading a
+    /// project does for every row that plays one. Returns its registry id.
+    ///
+    /// `state` is `None` for a plain synth-mode track (no grid to import).
+    pub fn adopt_lesynth(&mut self, name: &str, state: Option<TrackState>) -> Result<u64> {
+        let path = Self::internal_plugin_path()
+            .filter(|p| p.exists())
+            .context("internal LeSynth Fourier plugin not found")?;
+        let id = self.take_id();
+        let registry_id = self.registry.add(
+            name,
+            path.clone(),
+            Some(class_ids::FOURIER_SYNTH),
+            true,
+            state.clone(),
+        );
+        self.tracks.push(PluginTrack {
+            id,
+            registry_id,
+            name: name.to_string(),
+            kind: TrackKind::LeSynth,
+            plugin_path: path,
+            class_id: Some(class_ids::FOURIER_SYNTH),
+            import_state: state,
+            editor: None,
+        });
+        Ok(registry_id)
+    }
+
+    /// Adopt a custom VST3 track by path — the other half of loading a project.
+    pub fn adopt_vst(
+        &mut self,
+        name: &str,
+        path: PathBuf,
+        class_id: Option<[i8; 16]>,
+    ) -> Result<u64> {
+        if !path.exists() {
+            anyhow::bail!("plugin not found at {}", path.display());
+        }
+        let id = self.take_id();
+        let registry_id = self.registry.add(name, path.clone(), class_id, false, None);
+        self.tracks.push(PluginTrack {
+            id,
+            registry_id,
+            name: name.to_string(),
+            kind: TrackKind::CustomVst,
+            plugin_path: path,
+            class_id,
+            import_state: None,
+            editor: None,
+        });
+        Ok(registry_id)
+    }
+
+    /// Drop every track and its editor — what loading a project does before it
+    /// adopts the project's own.
+    pub fn clear(&mut self) {
+        for track in self.tracks.drain(..) {
+            self.registry.remove(track.registry_id);
+        }
+        self.status = "Cleared for a loaded project.".to_string();
     }
 
     /// Load a saved `.lsft` LeSynth track: pick the file, parse it, and add a
