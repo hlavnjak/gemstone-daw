@@ -104,6 +104,44 @@ type ResynthesizeProc = unsafe extern "C" fn(
     usize,      // out_cap
 ) -> i64;
 
+/// The keyboard's own render path — see `lesynth_fourier_resynthesize_key`.
+type ResynthesizeKeyProc = unsafe extern "C" fn(
+    usize,       // num_harmonics
+    usize,       // num_buckets
+    *const f32,  // amp
+    *const f32,  // phase
+    *const u32,  // bucket_lengths
+    *const f32,  // dc
+    *const f32,  // nyquist
+    *const f32,  // pitch_ratio
+    f32,         // base_period (output samples, fractional)
+    f32,         // base_freq
+    f32,         // analysis_rate
+    f32,         // out_rate
+    usize,       // max_harmonic
+    usize,       // target_samples
+    f32,         // display_gain
+    *mut f32,    // out
+    usize,       // out_cap
+) -> i64;
+
+/// A key rendered through a live engine — see `lesynth_fourier_render_key_live`.
+type RenderKeyLiveProc = unsafe extern "C" fn(
+    *const f32, // samples
+    usize,      // len
+    f32,        // sample_rate
+    f32,        // out_sample_rate
+    f32,        // base_freq
+    *const f32, // contour
+    usize,      // contour_len
+    usize,      // num_buckets
+    usize,      // num_harmonics
+    usize,      // key
+    *mut i32,   // out_used_playback_grid
+    *mut f32,   // out
+    usize,      // out_cap
+) -> i64;
+
 // LeSynth Fourier's state save/load C ABI (see lesynth-fourier/src/lib.rs). The
 // host tags an instance with a token before creating it, then exports/imports
 // that exact instance's grid by token.
@@ -791,6 +829,124 @@ impl PluginInstance {
             let written = call(out.as_mut_ptr(), out.len());
             anyhow::ensure!(written == n, "resynthesize length changed ({written} vs {n})");
             Ok(out)
+        }
+    }
+
+    /// Render a key **the way the keyboard does** — through the plugin's
+    /// `PlaybackGrid` and the source's own two clocks.
+    ///
+    /// [`Self::resynthesize`] is not that path: it passes a pitch contour and no
+    /// bucket lengths, so the plugin renders the analysis grid's *rounded*
+    /// buckets on a uniform time grid. A key does neither, so a dump made
+    /// through it cannot show a keyboard defect. Use this one to ask why a key
+    /// buzzes.
+    ///
+    /// `base_period` is the key's period in output samples, fractional.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resynthesize_key(
+        &self,
+        grid: &AnalysisGrid,
+        base_period: f32,
+        max_harmonic: usize,
+        target_samples: usize,
+        output_sample_rate: f32,
+        restore_source_level: bool,
+    ) -> Result<Vec<f32>> {
+        unsafe {
+            let func: libloading::Symbol<ResynthesizeKeyProc> = self
+                ._library
+                .get(b"lesynth_fourier_resynthesize_key\0")
+                .context("plugin does not export lesynth_fourier_resynthesize_key")?;
+            let lengths: Vec<u32> = grid.bucket_periods.iter().map(|&p| p as u32).collect();
+            let call = |out: *mut f32, cap: usize| {
+                func(
+                    grid.num_harmonics,
+                    grid.num_buckets,
+                    grid.amplitude.as_ptr(),
+                    grid.phase.as_ptr(),
+                    lengths.as_ptr(),
+                    grid.dc.as_ptr(),
+                    grid.nyquist.as_ptr(),
+                    grid.pitch_ratio.as_ptr(),
+                    base_period,
+                    grid.base_freq,
+                    grid.sample_rate,
+                    output_sample_rate,
+                    max_harmonic,
+                    target_samples,
+                    if restore_source_level { grid.display_gain } else { 0.0 },
+                    out,
+                    cap,
+                )
+            };
+            let n = call(std::ptr::null_mut(), 0);
+            anyhow::ensure!(n >= 0, "resynthesize_key returned error {n}");
+            let mut out = vec![0.0f32; n as usize];
+            let written = call(out.as_mut_ptr(), out.len());
+            anyhow::ensure!(written == n, "resynthesize_key length changed ({written} vs {n})");
+            Ok(out)
+        }
+    }
+
+    /// Render a key through a **live engine** inside the plugin — the same
+    /// `load_analysis` + `assemble_buffer_for_key` an editor key press makes.
+    ///
+    /// [`Self::resynthesize_key`] calls the renderer with a `PlaybackGrid` built
+    /// for it, so it can only ever prove the renderer sound. The live path
+    /// builds that grid from the plugin's own `SharedParams` and falls back to
+    /// the contour renderer whenever anything is missing — silently, same call,
+    /// different signal. `used_playback_grid` in the result is `false` when that
+    /// happened, which is the answer to "the offline dump is clean but the
+    /// plugin still buzzes".
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_key_live(
+        &self,
+        samples: &[f32],
+        sample_rate: f32,
+        out_sample_rate: f32,
+        base_freq: f32,
+        contour: &[f32],
+        num_buckets: usize,
+        num_harmonics: usize,
+        key: usize,
+    ) -> Result<(Vec<f32>, bool)> {
+        unsafe {
+            let func: libloading::Symbol<RenderKeyLiveProc> = self
+                ._library
+                .get(b"lesynth_fourier_render_key_live\0")
+                .context("plugin does not export lesynth_fourier_render_key_live")?;
+            let mut used: i32 = 0;
+            let call = |out: *mut f32, cap: usize, used: *mut i32| {
+                func(
+                    samples.as_ptr(),
+                    samples.len(),
+                    sample_rate,
+                    out_sample_rate,
+                    base_freq,
+                    // The pitch contour, which this used to pass as null. Without
+                    // it the engine analyses a *flat* source: every bucket gets
+                    // the same true period, the render tracks none of the
+                    // recording's vibrato, and it comes out 52 dB from the same
+                    // key rendered through `resynthesize_key` — which reads as
+                    // "the keyboard does not play what the offline dump
+                    // measures" when in fact the probe was asking for a
+                    // different note.
+                    if contour.is_empty() { std::ptr::null() } else { contour.as_ptr() },
+                    contour.len(),
+                    num_buckets,
+                    num_harmonics,
+                    key,
+                    used,
+                    out,
+                    cap,
+                )
+            };
+            let n = call(std::ptr::null_mut(), 0, std::ptr::null_mut());
+            anyhow::ensure!(n >= 0, "render_key_live returned error {n}");
+            let mut out = vec![0.0f32; n as usize];
+            let written = call(out.as_mut_ptr(), out.len(), &mut used);
+            anyhow::ensure!(written == n, "render_key_live length changed ({written} vs {n})");
+            Ok((out, used != 0))
         }
     }
 
