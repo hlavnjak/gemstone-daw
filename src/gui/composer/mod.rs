@@ -482,7 +482,35 @@ impl ComposerPanel {
                                                     .map(|(_, n)| n.clone())
                                             })
                                             .unwrap_or_else(|| "— no track —".to_string());
-                                        egui::ComboBox::from_id_salt("track")
+                                        // The salt carries `row_id` — like every
+                                        // other select box here, so two rows can
+                                        // never share a popup — **and the number
+                                        // of tracks**, which is what makes a
+                                        // track added later show up at all.
+                                        //
+                                        // A `ComboBox`'s popup is an `egui::Area`
+                                        // keyed by this id, and an `Area`
+                                        // measures itself exactly once, on the
+                                        // sizing pass it runs the first time that
+                                        // id is shown (`area.rs`:
+                                        // `state.size.get_or_insert_with(...)`).
+                                        // From then on that stored size is the
+                                        // Ui's max size, the `ScrollArea` inside
+                                        // clips the list to it, and the clipped
+                                        // list measures the same again — so the
+                                        // popup is stuck at whatever height it
+                                        // needed the first time it was opened,
+                                        // for as long as the id lives.
+                                        //
+                                        // A row whose box was first opened with
+                                        // two tracks therefore kept a two-track
+                                        // popup for the rest of the session,
+                                        // while a row added afterwards showed
+                                        // them all — which is exactly the shape
+                                        // of the report. Keying the popup on the
+                                        // count makes a list of a new length a
+                                        // new Area, which measures itself afresh.
+                                        egui::ComboBox::from_id_salt(("track", row_id, tracks.len()))
                                             .width(168.0)
                                             .selected_text(label)
                                             .show_ui(ui, |ui| {
@@ -1152,5 +1180,160 @@ mod tests {
         registry.remove(ids[0]);
         frame(&mut panel);
         assert!(panel.rows.iter().all(|r| r.track_id.is_none()));
+    }
+    /// A row's track select box must offer every track in the registry, not the
+    /// ones that happened to exist when the row was added.
+    ///
+    /// Driven the way a user drives it — a real click opening the real popup
+    /// Area — and, crucially, the box is **opened once before the track is
+    /// created**. That is what used to freeze it: an `Area` measures itself only
+    /// on the first pass it is shown for a given id, so a popup first opened
+    /// with one track stayed one track tall and clipped everything added later,
+    /// while a row created afterwards showed them all.
+    ///
+    /// The assertion is on the text actually painted, so it fails whether the
+    /// list is stale, the popup is clipped away, or two rows' select boxes
+    /// collide on one widget id.
+    #[test]
+    fn a_rows_select_box_offers_tracks_created_after_the_row() {
+        let registry = TrackRegistry::default();
+        for n in 1..=2 {
+            registry.add(format!("t{n}"), std::path::PathBuf::from("/x"), None, false, None);
+        }
+        let mut panel = ComposerPanel::new(registry.clone());
+        let ctx = egui::Context::default();
+        // The app's own spacing and text sizes: how tall a popup item is decides
+        // how much of the list a stuck popup can still show, so the default
+        // style hides the defect this exists to catch.
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        {
+            use egui::{FontFamily::Proportional, FontId, TextStyle};
+            style.text_styles = [
+                (TextStyle::Heading, FontId::new(18.0, Proportional)),
+                (TextStyle::Body, FontId::new(14.0, Proportional)),
+                (TextStyle::Button, FontId::new(14.0, Proportional)),
+                (TextStyle::Monospace, FontId::new(13.0, egui::FontFamily::Monospace)),
+                (TextStyle::Small, FontId::new(11.0, Proportional)),
+            ]
+            .into();
+        }
+        ctx.set_style(style);
+
+        // Every string the frame paints, popups included, with where it landed.
+        let run = |panel: &mut ComposerPanel, input: egui::RawInput| -> Vec<String> {
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| panel.ui(ui));
+                });
+            });
+            let mut texts = Vec::new();
+            fn walk(sh: &egui::Shape, out: &mut Vec<String>) {
+                match sh {
+                    egui::Shape::Text(t) => {
+                        out.push(format!("{}@{},{}", t.galley.text(), t.pos.x, t.pos.y))
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+        let click = |at: egui::Pos2| {
+            let mut i = egui::RawInput::default();
+            i.events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ];
+            i
+        };
+        // What the popup that opened under `y` is listing: the items sit in the
+        // popup's own left column, below the button that opened it.
+        let listed = |texts: &[String], y: f32| -> Vec<String> {
+            texts
+                .iter()
+                .filter_map(|s| {
+                    let (name, pos) = s.rsplit_once('@')?;
+                    let (nx, ny) = pos.split_once(',')?;
+                    let (nx, ny): (f32, f32) = (nx.parse().ok()?, ny.parse().ok()?);
+                    // The popup's own column: its frame indents its items past
+                    // the row controls behind it.
+                    ((29.0..40.0).contains(&nx) && ny > y + 10.0 && ny < y + 260.0)
+                        .then(|| name.to_string())
+                })
+                .collect()
+        };
+
+        panel.add_row();
+        run(&mut panel, egui::RawInput::default());
+
+        // The first row's select box, opened once while only one track exists.
+        // Opening it is the whole point: that first view is what its popup used
+        // to be stuck at.
+        let box1 = egui::pos2(90.0, 52.0);
+        run(&mut panel, click(box1));
+        let open = run(&mut panel, egui::RawInput::default());
+        assert_eq!(
+            listed(&open, box1.y),
+            vec!["t1", "t2"],
+            "the popup did not open over the first row's select box — the click \
+             missed, and this test is not testing anything: {open:?}"
+        );
+
+        // Close it, add a second row, then create another track.
+        run(&mut panel, click(egui::pos2(900.0, 900.0)));
+        let closed = run(&mut panel, egui::RawInput::default());
+        assert!(
+            listed(&closed, box1.y).is_empty(),
+            "the popup was still open, so reopening it proves nothing: {closed:?}"
+        );
+        panel.add_row();
+        run(&mut panel, egui::RawInput::default());
+        for n in 3..=4 {
+            registry.add(format!("t{n}"), std::path::PathBuf::from("/x"), None, false, None);
+        }
+        run(&mut panel, egui::RawInput::default());
+
+        // The first row must now offer them too. It is a fresh popup Area, so it
+        // takes a sizing pass to appear — hence the second frame.
+        run(&mut panel, click(box1));
+        run(&mut panel, egui::RawInput::default());
+        let reopened = run(&mut panel, egui::RawInput::default());
+        assert_eq!(
+            listed(&reopened, box1.y),
+            vec!["t1", "t2", "t3", "t4"],
+            "tracks created after this row's select box was first opened are \
+             missing from it: {reopened:?}"
+        );
+
+        // And the row added later, which never had a popup of its own.
+        run(&mut panel, click(egui::pos2(900.0, 900.0)));
+        run(&mut panel, egui::RawInput::default());
+        let box2 = egui::pos2(90.0, 198.0);
+        run(&mut panel, click(box2));
+        run(&mut panel, egui::RawInput::default());
+        let second = run(&mut panel, egui::RawInput::default());
+        assert_eq!(
+            listed(&second, box2.y),
+            vec!["t1", "t2", "t3", "t4"],
+            "the second row's select box is missing a track: {second:?}"
+        );
     }
 }

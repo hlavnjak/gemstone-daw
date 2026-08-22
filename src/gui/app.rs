@@ -171,7 +171,13 @@ impl DawApp {
                         .selected_usb_keyboard
                         .clone()
                         .unwrap_or_else(|| "Select USB keyboard…".to_string());
-                    egui::ComboBox::from_id_salt("usb_keyboard")
+                    // The list length is part of the id: a `ComboBox` popup is
+                    // an `egui::Area`, and an `Area` measures itself only on the
+                    // first pass it is shown for a given id, then reuses that
+                    // size forever — so a picker first opened with two entries
+                    // clips away everything a later rescan finds. See the
+                    // Composer's track select box for the long version.
+                    egui::ComboBox::from_id_salt(("usb_keyboard", self.usb_keyboards.len()))
                         .width(260.0)
                         .selected_text(usb_label)
                         .show_ui(ui, |ui| {
@@ -194,7 +200,7 @@ impl DawApp {
                         .selected_midi_port
                         .clone()
                         .unwrap_or_else(|| "Select MIDI port…".to_string());
-                    egui::ComboBox::from_id_salt("midi_port")
+                    egui::ComboBox::from_id_salt(("midi_port", self.midi_ports.len()))
                         .width(260.0)
                         .selected_text(port_label)
                         .show_ui(ui, |ui| {
