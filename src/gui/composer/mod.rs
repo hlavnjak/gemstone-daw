@@ -30,6 +30,14 @@
 //! a placeholder that holds its frame, ready to be given a length, while the next
 //! note follows on immediately.
 //!
+//! **Every row also opens with a space**, before its very first note — the
+//! silence a row waits through before it starts, which is how one row is offset
+//! against another. It belongs to the *row* ([`Row::lead`]), not to any note, so
+//! deleting the first note leaves it exactly where it is and it becomes the lead
+//! of whichever note is first now. Like a tied space it has no delete button,
+//! and it starts at zero length so a row still begins at time zero until it is
+//! given one.
+//!
 //! **Length is two select boxes**, not one: a whole-note count and a fraction
 //! down to a 1/256, added together. Time is counted in [`UNITS_PER_WHOLE`]ths of
 //! a whole note, so every length either box can name is a whole number of units
@@ -201,6 +209,14 @@ struct Row {
     /// is empty.
     track_id: Option<u64>,
     gain: f32,
+    /// The silence before the row's first note — see the module docs. Held by
+    /// the row rather than by an item so that deleting the first note cannot
+    /// take it with it: it stays at the head and leads whichever note is first
+    /// afterwards.
+    ///
+    /// Zero by default, so a row still starts at time zero until this is given
+    /// a length.
+    lead: Duration,
     /// In play order: item `n` starts where item `n - 1`'s space ended.
     items: Vec<Item>,
     next_item_id: u64,
@@ -212,14 +228,27 @@ impl Row {
             id,
             track_id,
             gain: 1.0,
+            lead: Duration::new(0, Fraction::None),
             items: Vec::new(),
             next_item_id: 0,
         }
     }
 
-    /// Total length of the row in units — the items simply add up.
+    /// Where the row's first note starts: the lead space, which counts only
+    /// while there is a note for it to lead. An empty row has no first note and
+    /// so no lead — and draws none.
+    fn lead_units(&self) -> i64 {
+        if self.items.is_empty() {
+            0
+        } else {
+            self.lead.units()
+        }
+    }
+
+    /// Total length of the row in units — the lead space plus the items, which
+    /// simply add up.
     fn end_units(&self) -> i64 {
-        self.items.iter().map(Item::total_units).sum()
+        self.lead_units() + self.items.iter().map(Item::total_units).sum::<i64>()
     }
 
     /// Append a note and, tied behind it, the space that separates it from
@@ -246,7 +275,7 @@ impl Row {
     /// Where each note starts, in units — the running sum of everything before
     /// it. One entry per item; its space starts where the note ends.
     fn starts(&self) -> Vec<i64> {
-        let mut at = 0;
+        let mut at = self.lead_units();
         self.items
             .iter()
             .map(|i| {
@@ -260,7 +289,7 @@ impl Row {
     /// The row's notes in seconds, at `spu` seconds per grid unit. Spaces only
     /// advance the clock, and a note given no length at all is not played.
     fn planned_notes(&self, spu: f64) -> Vec<PlannedNote> {
-        let mut at = 0i64;
+        let mut at = self.lead_units();
         let mut out = Vec::new();
         for item in &self.items {
             let units = item.dur.units();
@@ -521,10 +550,11 @@ impl ComposerPanel {
         }
     }
 
-    /// A row's frames, left to right in play order — each item drawn as its note
-    /// frame followed by its tied space frame. Editing a frame's length or pitch
-    /// is immediate; everything after it simply shifts, because a frame's
-    /// position is nothing but the sum of the lengths before it.
+    /// A row's frames, left to right in play order — the row's lead space, then
+    /// each item as its note frame followed by its tied space frame. Editing a
+    /// frame's length or pitch is immediate; everything after it simply shifts,
+    /// because a frame's position is nothing but the sum of the lengths before
+    /// it.
     fn chain_ui(ui: &mut egui::Ui, row: &mut Row, playhead: Option<f64>) {
         // Deferred: removing a frame rewrites the list this loop walks.
         let mut pending_delete: Option<usize> = None;
@@ -540,6 +570,12 @@ impl ComposerPanel {
                     egui::RichText::new("Empty row — press “➕ Add Note”.")
                         .color(egui::Color32::from_gray(120)),
                 );
+            }
+            // The lead space, ahead of the first note. It belongs to the row,
+            // so it stays put when that note is deleted and leads the next one
+            // instead. Drawn only when there is a note for it to lead.
+            if !row.items.is_empty() {
+                Self::frame_ui(ui, row_id, LEAD_SPACE_ID, None, &mut row.lead, false);
             }
             for (idx, (item, start)) in row.items.iter_mut().zip(starts).enumerate() {
                 let sounding = playhead
@@ -571,7 +607,8 @@ impl ComposerPanel {
     /// frame — three select boxes (pitch, whole part of the length, fractional
     /// part) and a delete button. `None` draws the amber space frame, which has
     /// no pitch to choose and *no delete button*: a space is tied to its note
-    /// and can only leave with it.
+    /// and can only leave with it, and the row's lead space belongs to the row
+    /// and never leaves at all.
     fn frame_ui(
         ui: &mut egui::Ui,
         row_id: u64,
@@ -635,8 +672,14 @@ impl ComposerPanel {
                                     {
                                         deleted = true;
                                     }
+                                    // The lead space says so, because it is the
+                                    // one space that is not the silence after
+                                    // some note and does not leave with one.
                                     let title = match &pitch {
                                         Some(p) => format!("{} · {}", pitch_name(**p), dur.label()),
+                                        None if id == LEAD_SPACE_ID => {
+                                            format!("lead · {}", dur.label())
+                                        }
                                         None => format!("space · {}", dur.label()),
                                     };
                                     ui.add(
@@ -752,6 +795,10 @@ impl ComposerPanel {
     }
 }
 
+/// Widget id of a row's lead space frame. Item ids count up from zero and are
+/// handed out one at a time, so this cannot collide with one.
+const LEAD_SPACE_ID: u64 = u64::MAX;
+
 /// Colour of the transport's position readout, and of the frame sounding under
 /// it.
 const PLAYHEAD: egui::Color32 = egui::Color32::from_rgb(240, 120, 110);
@@ -782,6 +829,62 @@ mod tests {
     /// Shorthand for a length with no whole-note part.
     const fn frac(f: Fraction) -> Duration {
         Duration::new(0, f)
+    }
+
+    /// The requirement: a row opens with a space before its very first note, and
+    /// everything the row plays waits for it.
+    #[test]
+    fn a_row_opens_with_a_space_before_its_first_note() {
+        let mut row = row_with(&[
+            (60, frac(Fraction::Quarter), frac(Fraction::None)),
+            (62, frac(Fraction::Quarter), frac(Fraction::None)),
+        ]);
+        // Zero by default, so a row still starts at time zero.
+        assert_eq!(row.lead.units(), 0);
+        assert_eq!(row.starts(), vec![0, QUARTER]);
+
+        row.lead = frac(Fraction::Eighth);
+        assert_eq!(
+            row.starts(),
+            vec![EIGHTH, EIGHTH + QUARTER],
+            "the lead space must push every note in the row, not just the first"
+        );
+        assert_eq!(row.end_units(), EIGHTH + 2 * QUARTER);
+        let notes = row.planned_notes(1.0);
+        assert_eq!(notes[0].at_secs, EIGHTH as f64);
+        assert_eq!(notes[1].at_secs, (EIGHTH + QUARTER) as f64);
+    }
+
+    /// The other half of it: deleting the first note must leave the lead space
+    /// where it is, leading whichever note is first afterwards. It belongs to
+    /// the row, so there is no path that can take it away with a note.
+    #[test]
+    fn deleting_the_first_note_keeps_the_lead_space_for_the_next_one() {
+        let mut row = row_with(&[
+            (60, frac(Fraction::Quarter), frac(Fraction::None)),
+            (62, frac(Fraction::Half), frac(Fraction::None)),
+        ]);
+        row.lead = frac(Fraction::Eighth);
+
+        row.delete_item(0);
+
+        assert_eq!(row.lead, frac(Fraction::Eighth), "the lead space went with the note");
+        assert_eq!(row.items.len(), 1);
+        assert_eq!(row.items[0].pitch, 62);
+        assert_eq!(
+            row.starts(),
+            vec![EIGHTH],
+            "the note that is first now must wait through the same lead space"
+        );
+
+        // And deleting the last note leaves the lead intact for the next one
+        // added, though an empty row has no first note to lead and so no delay.
+        row.delete_item(0);
+        assert!(row.items.is_empty());
+        assert_eq!(row.lead, frac(Fraction::Eighth));
+        assert_eq!(row.end_units(), 0, "an empty row has nothing to wait for");
+        row.add_note();
+        assert_eq!(row.starts(), vec![EIGHTH]);
     }
 
     /// The requirement: one press of "Add Note" leaves a note *and* the space
@@ -1025,6 +1128,11 @@ mod tests {
 
         panel.rows[0].add_note();
         panel.rows[0].add_note();
+        frame(&mut panel);
+
+        // The lead space is drawn too, and must lay out at a real length as
+        // well as at its zero default.
+        panel.rows[0].lead = Duration::new(MAX_WHOLES, Fraction::TwoHundredFiftySixth);
         frame(&mut panel);
 
         // Two rows on the same track, which the spec allows. The longest length
