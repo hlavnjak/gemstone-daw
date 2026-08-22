@@ -99,15 +99,34 @@ dump: copy-internal
 	cargo build --release --bin dump_render
 	./target/release/dump_render $(DUMP_SRC) --out $(DUMP_OUT)
 
-# Scan what `dump` wrote. exact.wav is subtracted from source.wav (they are
-# meant to be sample-identical); the playback render is scanned on its own,
-# because it de-phases from the source by design.
+# Scan what `dump` wrote.
+#
+#  1. exact.wav is subtracted from source.wav — they are meant to be sample-
+#     identical, so anything left is the transform's own error.
+#  2. the key render is compared against exact.wav with --vs, which fits out the
+#     constant lag and level a render always has. At the source's own pitch the
+#     two are supposed to be the same signal, so this residual is the keyboard's
+#     added error with the voice's glottal pulse cancelled — the one number that
+#     answers "does a key buzz".
+#  3. the key render is compared against the host bridge's contour render, which
+#     is what the keyboard used to play, so a change here is a change a listener
+#     would hear.
+#  4. each render on its own, for the event/recurrence view.
 scan: dump
 	@echo "── exact.wav residual vs source.wav ────────────────────────────────"
 	python3 tools/buzzscan.py $(DUMP_OUT)/exact.wav --ref $(DUMP_OUT)/source.wav
 	@echo
-	@echo "── playback render ─────────────────────────────────────────────────"
-	@for f in $(DUMP_OUT)/play_*.wav; do python3 tools/buzzscan.py $$f; done
+	@echo "── key render vs the exact inverse (the keyboard's added error) ────"
+	@for f in $(DUMP_OUT)/key_*.wav; do \
+		python3 tools/buzzscan.py $$f --vs $(DUMP_OUT)/exact.wav; done
+	@echo
+	@echo "── key render vs the host-bridge contour path ──────────────────────"
+	@for f in $(DUMP_OUT)/key_*.wav; do \
+		c=$$(echo $$f | sed 's|/key_|/contour_|'); \
+		test -f $$c && python3 tools/buzzscan.py $$f --vs $$c | head -12; done
+	@echo
+	@echo "── each render on its own ──────────────────────────────────────────"
+	@for f in $(DUMP_OUT)/key_*.wav $(DUMP_OUT)/contour_*.wav; do python3 tools/buzzscan.py $$f; done
 
 clean:
 	cargo clean
