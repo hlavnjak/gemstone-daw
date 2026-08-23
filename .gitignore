@@ -14,6 +14,8 @@
 # Local scratch / recordings — not part of the repo.
 /my_voice.m4a
 /notes
+/misc_notes
+/track1.lsft
 
 # Python bytecode from the tools/ scripts.
 __pycache__/
