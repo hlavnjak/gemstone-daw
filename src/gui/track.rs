@@ -16,7 +16,8 @@
 //!
 //!   * **LeSynth Fourier** — the embedded internal plugin, opened in its plain
 //!     (non-analysis, empty) synth mode. No `push_analysis`, so no bucket grid.
-//!   * **Custom VST** — an arbitrary VST3 `.so` chosen from a file dialog.
+//!   * **Custom VST** — any third-party VST3, picked in [`PluginBrowser`] from
+//!     the plugins installed on this machine or browsed for by hand.
 //!
 //! A track is lightweight metadata (name + plugin path); the heavy plugin
 //! instance, its audio stream and its editor window live in [`EditorInstance`]
@@ -36,7 +37,7 @@ use super::registry::TrackRegistry;
 use crate::audio::AudioEngine;
 use crate::midi::MidiEventQueue;
 use crate::track_format::TrackState;
-use crate::vst::{class_ids, next_instance_token, PluginInstance};
+use crate::vst::{class_ids, next_instance_token, validate_module, PluginInstance};
 
 /// A live plugin editor: the loaded instance, its editor-window thread and an
 /// audio stream driving `process()` so the plugin's in-GUI piano is audible.
@@ -69,10 +70,10 @@ impl EditorInstance {
             closed,
         } = open_editor_in_thread(&plugin)?;
 
-        let engine = match AudioEngine::start(plugin.processor.clone(), midi_queue) {
+        let engine = match AudioEngine::start(plugin.processor.clone(), plugin.io(), midi_queue) {
             Ok(e) => Some(e),
             Err(e) => {
-                log::warn!("Track audio start failed: {}", e);
+                log::warn!("Track audio start failed: {e:#}");
                 None
             }
         };
@@ -179,7 +180,7 @@ impl PluginTrack {
         // Push a loaded grid (Analysis mode) before the window renders it.
         if let Some(state) = &self.import_state {
             if let Err(e) = inst.import_state(state) {
-                log::warn!("Track import failed: {}", e);
+                log::warn!("Track import failed: {e:#}");
             }
         }
 
@@ -200,11 +201,105 @@ impl PluginTrack {
     }
 }
 
-/// The Tracks panel: the two "add" buttons and the list of instrument tracks.
+/// The "add a custom VST3" picker.
+///
+/// A VST3 is a *bundle* — a `Foo.vst3` directory with the real library buried at
+/// `Contents/x86_64-linux/Foo.so` — and a file dialog cannot select a directory,
+/// so "pick the plugin file" alone is a dead end for every plugin a user actually
+/// has installed. This lists what is installed instead, and keeps both browse
+/// buttons for anything outside the standard locations.
+pub struct PluginBrowser {
+    /// `(display name, path to the bundle or library)`.
+    pub found: Vec<(String, PathBuf)>,
+    /// Where the scan looked, shown when it found nothing.
+    pub searched: Vec<PathBuf>,
+    error: Option<String>,
+}
+
+impl PluginBrowser {
+    pub fn scan() -> Self {
+        let mut found: Vec<(String, PathBuf)> = Vec::new();
+        let searched = vst3_search_paths();
+        for dir in &searched {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_bundle = path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("vst3"));
+                if !is_bundle {
+                    continue;
+                }
+                let name = path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                found.push((name, path));
+            }
+        }
+        found.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        found.dedup_by(|a, b| a.1 == b.1);
+        // The same plugin installed in two places (a user copy and a system one)
+        // would otherwise show as two identical rows; name each by its directory.
+        let names: Vec<String> = found.iter().map(|(n, _)| n.clone()).collect();
+        for (idx, entry) in found.iter_mut().enumerate() {
+            if names.iter().enumerate().any(|(i, n)| i != idx && *n == entry.0) {
+                if let Some(dir) = entry.1.parent() {
+                    entry.0 = format!("{}  —  {}", entry.0, dir.display());
+                }
+            }
+        }
+        PluginBrowser {
+            found,
+            searched,
+            error: None,
+        }
+    }
+}
+
+/// The directories a VST3 is installed into, most specific first. `VST3_PATH`
+/// overrides nothing — it adds to the list, as it does for other hosts.
+pub fn vst3_search_paths() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(extra) = std::env::var_os("VST3_PATH") {
+        dirs.extend(std::env::split_paths(&extra));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(&home).join(".vst3"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        dirs.push(PathBuf::from("/usr/lib/vst3"));
+        dirs.push(PathBuf::from("/usr/local/lib/vst3"));
+        dirs.push(PathBuf::from("/usr/lib64/vst3"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(pf) = std::env::var_os("CommonProgramFiles") {
+            dirs.push(PathBuf::from(pf).join("VST3"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3"));
+        }
+        dirs.push(PathBuf::from("/Library/Audio/Plug-Ins/VST3"));
+    }
+    dirs.retain(|d| d.is_dir());
+    dirs.dedup();
+    dirs
+}
+
+/// The Tracks panel: the "add" buttons and the list of instrument tracks.
 pub struct TracksPanel {
     tracks: Vec<PluginTrack>,
     next_id: u64,
     status: String,
+    /// The custom-VST picker, while it is open.
+    browser: Option<PluginBrowser>,
     /// Shared MIDI queue, so a connected keyboard plays the open track editors.
     midi_queue: MidiEventQueue,
     /// The app-wide track list the Composer draws its rows from. Every track
@@ -218,6 +313,7 @@ impl TracksPanel {
             tracks: Vec::new(),
             next_id: 0,
             status: "Add a LeSynth Fourier or custom VST track.".to_string(),
+            browser: None,
             midi_queue,
             registry,
         }
@@ -264,32 +360,143 @@ impl TracksPanel {
         self.status = "Created LeSynth Fourier track.".to_string();
     }
 
-    /// Add a custom VST track from a `.so` chosen in a file dialog.
-    fn add_custom_vst_track(&mut self) {
-        let dialog = rfd::FileDialog::new()
-            .add_filter("VST3 plugin (.so)", &["so"])
-            .add_filter("All files", &["*"]);
-        let Some(path) = dialog.pick_file() else {
-            return;
-        };
+    /// Add a custom VST3 track for `path` — a `.vst3` bundle or a bare library.
+    ///
+    /// The plugin is checked here rather than when its editor is opened: a file
+    /// that is not a VST3, or one whose dependencies the loader cannot satisfy,
+    /// should say so while the user is still looking at the picker.
+    fn add_custom_vst_track(&mut self, path: PathBuf) -> Result<()> {
+        let resolved = validate_module(&path)?;
+        // Name the track after the bundle, not the library inside it: "Dexed"
+        // rather than "Dexed.so", and never "libsomething.so".
         let name = path
-            .file_name()
+            .file_stem()
+            .or_else(|| resolved.file_stem())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        // Take the first class in the factory — we don't know the plugin's ID.
+        // Take the first audio-module class in the factory — we don't know the
+        // plugin's own class id, and a bundle may hold several classes.
         let registry_id = self.registry.add(&name, path.clone(), None, false, None);
         let id = self.take_id();
         self.tracks.push(PluginTrack {
             id,
             registry_id,
-            name,
+            name: name.clone(),
             kind: TrackKind::CustomVst,
             plugin_path: path,
             class_id: None,
             import_state: None,
             editor: None,
         });
-        self.status = "Created custom VST track.".to_string();
+        self.status = format!("Created custom VST track '{name}'.");
+        Ok(())
+    }
+
+    /// The picker window: installed plugins, plus the two browse buttons for
+    /// anything that lives elsewhere.
+    fn browser_ui(&mut self, ctx: &egui::Context) {
+        let Some(browser) = &mut self.browser else {
+            return;
+        };
+        let mut open = true;
+        let mut chosen: Option<PathBuf> = None;
+        let mut close = false;
+
+        egui::Window::new("Add a custom VST3")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                if browser.found.is_empty() {
+                    ui.label("No VST3 plugins found in:");
+                    for dir in &browser.searched {
+                        ui.label(
+                            egui::RichText::new(format!("  {}", dir.display()))
+                                .color(egui::Color32::from_gray(160)),
+                        );
+                    }
+                    if browser.searched.is_empty() {
+                        ui.label(
+                            egui::RichText::new("  (none of the standard plugin directories exist)")
+                                .color(egui::Color32::from_gray(160)),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.label("Use the browse buttons below.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (name, path) in &browser.found {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Add").clicked() {
+                                        chosen = Some(path.clone());
+                                    }
+                                    ui.label(egui::RichText::new(name).strong())
+                                        .on_hover_text(path.display().to_string());
+                                });
+                            }
+                        });
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("📁 Browse bundle…")
+                        .on_hover_text("Pick a .vst3 bundle directory")
+                        .clicked()
+                    {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            chosen = Some(dir);
+                        }
+                    }
+                    if ui
+                        .button("📄 Browse library…")
+                        .on_hover_text("Pick a plugin library file directly")
+                        .clicked()
+                    {
+                        if let Some(file) = rfd::FileDialog::new()
+                            .add_filter("VST3 plugin", &["so", "vst3", "dll", "dylib"])
+                            .add_filter("All files", &["*"])
+                            .pick_file()
+                        {
+                            chosen = Some(file);
+                        }
+                    }
+                    if ui.button("↻ Rescan").clicked() {
+                        let refreshed = PluginBrowser::scan();
+                        browser.found = refreshed.found;
+                        browser.searched = refreshed.searched;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+
+                if let Some(err) = &browser.error {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(err).color(egui::Color32::from_rgb(240, 140, 140)),
+                    );
+                }
+            });
+
+        if let Some(path) = chosen {
+            match self.add_custom_vst_track(path) {
+                Ok(()) => close = true,
+                // Stay open with the reason on screen — the user is most likely
+                // to want to pick something else straight away.
+                Err(e) => {
+                    if let Some(browser) = &mut self.browser {
+                        browser.error = Some(format!("{e:#}"));
+                    }
+                }
+            }
+        }
+        if close || !open {
+            self.browser = None;
+        }
     }
 
     /// Adopt a LeSynth Fourier track from an already-parsed grid — what loading a
@@ -368,7 +575,7 @@ impl TracksPanel {
         let state = match TrackState::read(&file) {
             Ok(s) => s,
             Err(e) => {
-                self.status = format!("Load failed: {}", e);
+                self.status = format!("Load failed: {e:#}");
                 return;
             }
         };
@@ -421,7 +628,7 @@ impl TracksPanel {
         let state = match result {
             Ok(s) => s,
             Err(e) => {
-                self.status = format!("Export failed: {}", e);
+                self.status = format!("Export failed: {e:#}");
                 return;
             }
         };
@@ -434,7 +641,7 @@ impl TracksPanel {
         };
         self.status = match state.write(&path) {
             Ok(()) => format!("Exported {name}."),
-            Err(e) => format!("Export failed: {e}"),
+            Err(e) => format!("Export failed: {e:#}"),
         };
     }
 
@@ -449,8 +656,12 @@ impl TracksPanel {
             if ui.button("➕ Create LeSynth Fourier Track").clicked() {
                 self.add_lesynth_track();
             }
-            if ui.button("➕ Create Custom VST Track").clicked() {
-                self.add_custom_vst_track();
+            if ui
+                .button("➕ Create Custom VST Track")
+                .on_hover_text("Pick an installed VST3, or browse for one")
+                .clicked()
+            {
+                self.browser = Some(PluginBrowser::scan());
             }
             if ui
                 .button("➕ Load LeSynth Fourier Track")
@@ -460,6 +671,10 @@ impl TracksPanel {
                 self.load_lesynth_track();
             }
         });
+        // Before the early return below: the picker is a window of its own and
+        // has to be drawn whether or not there are any tracks yet.
+        self.browser_ui(ui.ctx());
+
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_gray(170)));
 
@@ -547,7 +762,7 @@ impl TracksPanel {
                 let queue = self.midi_queue.clone();
                 if let Some(track) = self.tracks.get_mut(idx) {
                     if let Err(e) = track.open_editor(&queue) {
-                        self.status = format!("Open editor failed: {}", e);
+                        self.status = format!("Open editor failed: {e:#}");
                     } else if track.editor.as_ref().is_some_and(|e| !e.is_audible()) {
                         self.status =
                             format!("Opened {} — audio output unavailable.", track.name);

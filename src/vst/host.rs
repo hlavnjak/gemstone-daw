@@ -14,25 +14,29 @@
 use std::ffi::{c_void, CStr};
 use std::mem::zeroed;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use libloading::Library;
 
 use crate::track_format::TrackState;
 
-use vst3::Steinberg::{kResultOk, IPluginFactory, IPluginFactoryTrait, IPluginBaseTrait, PClassInfo};
-use vst3::Steinberg::Vst::{
-    IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait,
-    IEditController, IEditControllerTrait, IComponentHandler,
-    ProcessSetup, SpeakerArr,
+use vst3::Steinberg::{
+    kResultOk, FUnknown, IBStream, IPluginFactory, IPluginFactoryTrait, IPluginBaseTrait,
+    PClassInfo, TUID,
 };
-use vst3::{ComPtr, ComWrapper, Interface};
+use vst3::Steinberg::Vst::{
+    BusDirections_, BusInfo, IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait,
+    IComponentHandler, IConnectionPoint, IConnectionPointTrait, IEditController,
+    IEditControllerTrait, IHostApplication, MediaTypes_, ProcessSetup, SpeakerArr,
+    SpeakerArrangement,
+};
+use vst3::{ComPtr, ComRef, ComWrapper, Interface};
 
 use super::handler::ParamChangeHandler;
-
-type GetPluginFactoryProc = unsafe extern "C" fn() -> *mut IPluginFactory;
+use super::host_context::{HostApplication, MemoryStream};
+use super::module::Vst3Module;
 
 // LeSynth Fourier's host-facing analysis C ABI (see lesynth-fourier/src/lib.rs).
 // `contour` (ptr,len) is the per-position fundamental in Hz, uniformly resampled
@@ -266,74 +270,93 @@ impl AnalysisGrid {
     }
 }
 
+/// The audio bus layout a plugin settled on, so the engine can hand `process()`
+/// buffers that match what it negotiated. Getting this wrong is not cosmetic: a
+/// plugin with an audio input bus reads `ProcessData::inputs` unconditionally, so
+/// an effect handed `numInputs = 0` crashes the audio thread.
+#[derive(Clone, Debug, Default)]
+pub struct PluginIo {
+    /// Channel count of each activated audio input bus, in bus order.
+    pub inputs: Vec<usize>,
+    /// Channel count of each activated audio output bus, in bus order.
+    pub outputs: Vec<usize>,
+}
+
+impl PluginIo {
+    /// Channels on the main (first) output bus — what actually reaches the
+    /// speakers. Zero when the plugin has no audio output at all.
+    pub fn main_output_channels(&self) -> usize {
+        self.outputs.first().copied().unwrap_or(0)
+    }
+}
+
 /// Represents a loaded and initialized VST3 plugin instance.
 pub struct PluginInstance {
     pub component: ComPtr<IComponent>,
     pub processor: ComPtr<IAudioProcessor>,
     pub controller: ComPtr<IEditController>,
-    // Must keep library alive as long as plugin is in use
-    _library: Arc<Library>,
+    /// The two halves of a plugin whose controller is a separate object, so they
+    /// can be disconnected before either is terminated.
+    connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
+    /// Held for the plugin: it keeps our context pointer and calls back into it.
+    _host_context: ComPtr<FUnknown>,
+    /// Ditto for the parameter handler we gave the controller.
+    _param_handler: ComPtr<IComponentHandler>,
+    /// True once the controller is a distinct object that we initialised (and so
+    /// must terminate) ourselves.
+    separate_controller: bool,
+    /// The bus layout negotiated in `initialize_audio`.
+    io: RwLock<PluginIo>,
+    /// Whether the component is active / processing, so teardown is ordered.
+    active: AtomicBool,
+    /// Display name from the factory's class info — the editor window's title.
+    name: String,
     /// Token this instance was tagged with (LeSynth only), so its live grid can
     /// be addressed by the state export/import C ABI. `None` for untagged loads.
     token: Option<u64>,
+    // Must outlive every COM pointer above: dropping it unloads the library they
+    // all live in, so it is deliberately the last field.
+    module: Arc<Vst3Module>,
 }
 
 impl PluginInstance {
-    /// Load a VST3 plugin from a shared library path and initialize it.
+    /// Load a VST3 plugin and initialize it.
     ///
-    /// `class_id` is the 16-byte factory class to select (`None` = the first).
-    /// `token`, if given, tags the instance before it is created so its live grid
-    /// can be exported/imported by token; ignored if the plugin lacks the symbol.
+    /// `plugin_path` may be a bare shared library or a `.vst3` bundle directory;
+    /// see [`crate::vst::module::resolve_module_path`]. `class_id` is the 16-byte
+    /// factory class to select (`None` = the first audio-module class). `token`,
+    /// if given, tags the instance before it is created so its live grid can be
+    /// exported/imported by token; ignored if the plugin lacks the symbol.
     pub fn load(
         plugin_path: &Path,
         class_id: Option<&[i8; 16]>,
         token: Option<u64>,
     ) -> Result<Self> {
-        unsafe {
-            let lib = Arc::new(
-                Library::new(plugin_path)
-                    .with_context(|| format!("Failed to open {:?}", plugin_path))?,
-            );
+        let module = Arc::new(Vst3Module::open(plugin_path)?);
+        Self::from_module(module, class_id, token)
+    }
 
+    fn from_module(
+        module: Arc<Vst3Module>,
+        class_id: Option<&[i8; 16]>,
+        token: Option<u64>,
+    ) -> Result<Self> {
+        unsafe {
             // Tag the next-created instance, if requested and supported. Must
             // happen before `createInstance` triggers the plugin's constructor.
             if let Some(tok) = token {
-                if let Ok(prepare) =
-                    lib.get::<PrepareInstanceProc>(b"lesynth_fourier_prepare_instance\0")
+                if let Ok(prepare) = module
+                    .library()
+                    .get::<PrepareInstanceProc>(b"lesynth_fourier_prepare_instance\0")
                 {
                     prepare(tok);
                 }
             }
 
-            let get_factory: libloading::Symbol<GetPluginFactoryProc> =
-                lib.get(b"GetPluginFactory\0")?;
-            let raw_fac = get_factory();
-            let factory: ComPtr<IPluginFactory> =
-                ComPtr::from_raw(raw_fac).context("Factory pointer was null")?;
+            let factory = module.factory()?;
             let factory_ref = factory.as_com_ref();
-
-            // Find the matching class ID
-            let num_classes = factory_ref.countClasses();
-            let mut found_cid: Option<[i8; 16]> = None;
-
-            for idx in 0..num_classes {
-                let mut info: PClassInfo = zeroed();
-                factory_ref.getClassInfo(idx, &mut info);
-                log::info!("Found plugin class: cid={:?}", info.cid);
-
-                if let Some(target_cid) = class_id {
-                    if info.cid == *target_cid {
-                        found_cid = Some(info.cid);
-                        break;
-                    }
-                } else {
-                    // Take the first class
-                    found_cid = Some(info.cid);
-                    break;
-                }
-            }
-
-            let cid = found_cid.context("Plugin class ID not found in factory")?;
+            let (cid, name) = select_class(factory_ref, class_id)
+                .with_context(|| format!("in {}", module.path().display()))?;
 
             // Instantiate audio component
             let mut comp_ptr: *mut c_void = std::ptr::null_mut();
@@ -344,42 +367,101 @@ impl PluginInstance {
             );
             anyhow::ensure!(
                 hr == kResultOk && !comp_ptr.is_null(),
-                "Failed to create IComponent"
+                "the factory refused to create '{name}' as an IComponent ({hr:#X})"
             );
-
             let component: ComPtr<IComponent> =
                 ComPtr::from_raw(comp_ptr as *mut IComponent).context("IComponent ptr was null")?;
 
-            // Get controller by casting from component (nih-plug style)
-            let controller: ComPtr<IEditController> = component
-                .clone()
-                .cast::<IEditController>()
-                .context("Failed to get IEditController")?;
+            // The host context. A plugin keeps this pointer for its whole life and
+            // allocates its inter-component messages through it, so it is stored
+            // on the instance rather than dropped at the end of this function.
+            let host_context = HostApplication::new()
+                .to_com_ptr::<IHostApplication>()
+                .context("Failed to create the host context")?
+                .upcast::<FUnknown>();
 
-            let ctrl_ref = controller.as_com_ref();
-            ctrl_ref.initialize(std::ptr::null_mut());
+            let hr = component.as_com_ref().initialize(host_context.as_ptr());
+            anyhow::ensure!(
+                hr == kResultOk,
+                "'{name}' refused to initialize ({hr:#X})"
+            );
+
+            // The controller is either the same object (single-component plugins,
+            // ours included) or a second class the component names.
+            let mut separate_controller = false;
+            let controller = match component.cast::<IEditController>() {
+                Some(c) => c,
+                None => {
+                    let c = create_separate_controller(
+                        factory_ref,
+                        component.as_com_ref(),
+                        host_context.as_ptr(),
+                    )
+                    .with_context(|| format!("'{name}' has no usable edit controller"))?;
+                    separate_controller = true;
+                    c
+                }
+            };
+
+            // A separate controller starts out knowing nothing about the state the
+            // processor was created with; the host is what carries it across.
+            if separate_controller {
+                transfer_component_state(component.as_com_ref(), controller.as_com_ref());
+            }
 
             // Set component handler for parameter changes
-            let param_handler = ComWrapper::new(ParamChangeHandler);
-            let param_handler_ptr = param_handler
+            let param_handler = ComWrapper::new(ParamChangeHandler)
                 .to_com_ptr::<IComponentHandler>()
                 .context("Failed to create component handler")?;
-            ctrl_ref.setComponentHandler(param_handler_ptr.as_ptr());
+            controller
+                .as_com_ref()
+                .setComponentHandler(param_handler.as_ptr());
+
+            // Connect the two halves, so the plugin's own messages get through.
+            let connection = if separate_controller {
+                connect(component.as_com_ref(), controller.as_com_ref())
+            } else {
+                None
+            };
 
             // Get audio processor
             let processor = component
                 .clone()
                 .cast::<IAudioProcessor>()
-                .context("Not an audio processor")?;
+                .with_context(|| format!("'{name}' is not an audio processor"))?;
+
+            log::info!("Loaded '{}' from {}", name, module.path().display());
 
             Ok(PluginInstance {
                 component,
                 processor,
                 controller,
-                _library: lib,
+                connection,
+                _host_context: host_context,
+                _param_handler: param_handler,
+                separate_controller,
+                io: RwLock::new(PluginIo::default()),
+                active: AtomicBool::new(false),
+                name,
                 token,
+                module,
             })
         }
+    }
+
+    /// The plugin's display name, from the factory's class info.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The bus layout negotiated by [`Self::initialize_audio`]; empty before it.
+    pub fn io(&self) -> PluginIo {
+        self.io.read().unwrap().clone()
+    }
+
+    /// The library this instance lives in, for the LeSynth C ABI below.
+    fn lib(&self) -> &Library {
+        self.module.library()
     }
 
     /// Export this instance's live harmonic grid into a [`TrackState`]. Requires
@@ -390,7 +472,7 @@ impl PluginInstance {
             .context("this instance was not tagged for export")?;
         unsafe {
             let dims: libloading::Symbol<ExportDimsProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_export_dims\0")
                 .context("plugin does not export lesynth_fourier_export_dims")?;
             let (mut nh, mut nb, mut base, mut dur, mut sr) = (0u32, 0u32, 0f32, 0f32, 0f32);
@@ -409,7 +491,7 @@ impl PluginInstance {
             let mut nyquist = vec![0f32; nbz];
 
             let grid_fn: libloading::Symbol<ExportGridProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_export_grid\0")
                 .context("plugin does not export lesynth_fourier_export_grid")?;
             let rc2 = grid_fn(
@@ -439,7 +521,7 @@ impl PluginInstance {
             // fine, and "all enabled" is what such a build plays anyway.
             let (mut amp_enabled, mut phase_enabled) = (Vec::new(), Vec::new());
             if let Ok(flags_fn) = self
-                ._library
+                .lib()
                 .get::<ExportFlagsProc>(b"lesynth_fourier_export_flags\0")
             {
                 let mut amp_flags = vec![0u8; nhz];
@@ -489,7 +571,7 @@ impl PluginInstance {
         state.validate()?;
         unsafe {
             let import: libloading::Symbol<ImportGridProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_import_grid\0")
                 .context("plugin does not export lesynth_fourier_import_grid")?;
             let rc = import(
@@ -529,7 +611,7 @@ impl PluginInstance {
             // applied (and the buffers re-dirtied) once it has landed.
             if !state.amp_enabled.is_empty() || !state.phase_enabled.is_empty() {
                 match self
-                    ._library
+                    .lib()
                     .get::<ImportFlagsProc>(b"lesynth_fourier_import_flags\0")
                 {
                     Ok(flags_fn) => {
@@ -564,26 +646,47 @@ impl PluginInstance {
         Ok(())
     }
 
-    /// Initialize the plugin for audio processing.
-    /// Must be called before processing audio.
+    /// Prepare the plugin for audio processing: negotiate its bus layout,
+    /// activate the buses, and switch it on.
+    ///
+    /// The layout is *asked for*, not assumed. Only an instrument has no audio
+    /// input, and only some plugins are happy with stereo — so the buses the
+    /// plugin declares are what we set up, activate and later feed. The result is
+    /// stored on the instance ([`Self::io`]) because the audio callback has to
+    /// hand `process()` exactly the buffers this negotiated.
     pub fn initialize_audio(&self, sample_rate: f64, max_block_size: i32) -> Result<()> {
         unsafe {
             let comp_ref = self.component.as_com_ref();
+            let proc_ref = self.processor.as_com_ref();
 
-            // 1) Initialize component
-            comp_ref.initialize(std::ptr::null_mut());
+            // Re-entering this (a second editor for the same track) must not
+            // reconfigure a running plugin underneath itself.
+            if self.active.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
 
-            // 2) Set bus arrangements: no inputs, stereo output
-            let inputs: [u64; 0] = [];
-            let outputs: [u64; 1] = [SpeakerArr::kStereo];
+            // 1) What buses does it have?
+            let inputs = bus_channel_counts(comp_ref, MediaTypes_::kAudio as i32, BusDirections_::kInput as i32);
+            let outputs = bus_channel_counts(comp_ref, MediaTypes_::kAudio as i32, BusDirections_::kOutput as i32);
 
-            let res = self.processor.as_com_ref().setBusArrangements(
-                inputs.as_ptr() as *mut _,
-                inputs.len() as i32,
-                outputs.as_ptr() as *mut _,
-                outputs.len() as i32,
+            // 2) Ask for exactly those arrangements. A plugin may answer with a
+            //    layout of its own, so the negotiated one is read back below.
+            let in_arr: Vec<u64> = inputs.iter().map(|&n| speaker_arrangement(n)).collect();
+            let out_arr: Vec<u64> = outputs.iter().map(|&n| speaker_arrangement(n)).collect();
+            let res = proc_ref.setBusArrangements(
+                in_arr.as_ptr() as *mut _,
+                in_arr.len() as i32,
+                out_arr.as_ptr() as *mut _,
+                out_arr.len() as i32,
             );
-            log::info!("setBusArrangements returned: {:#X}", res);
+            if res != kResultOk {
+                log::info!(
+                    "'{}' declined the {}-in/{}-out arrangement ({res:#X}); using its own",
+                    self.name,
+                    in_arr.len(),
+                    out_arr.len()
+                );
+            }
 
             // 3) Setup processing
             let setup = ProcessSetup {
@@ -593,18 +696,63 @@ impl PluginInstance {
                 symbolicSampleSize:
                     vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32 as i32,
             };
-            self.processor
-                .as_com_ref()
-                .setupProcessing(&setup as *const _ as *mut _);
+            let res = proc_ref.setupProcessing(&setup as *const _ as *mut _);
+            if res != kResultOk {
+                log::warn!("'{}' rejected setupProcessing ({res:#X})", self.name);
+            }
 
-            // 4) Activate
-            comp_ref.setActive(1);
+            // 4) Activate every bus. A bus left inactive may be skipped by the
+            //    plugin entirely — silence out of the audio buses, and no notes
+            //    at all through the event bus, which is how a hosted synth ends
+            //    up looking like it "opened but does nothing".
+            let mut io = PluginIo::default();
+            for (idx, _) in inputs.iter().enumerate() {
+                comp_ref.activateBus(MediaTypes_::kAudio as i32, BusDirections_::kInput as i32, idx as i32, 1);
+            }
+            for (idx, _) in outputs.iter().enumerate() {
+                comp_ref.activateBus(MediaTypes_::kAudio as i32, BusDirections_::kOutput as i32, idx as i32, 1);
+            }
+            let event_ins = comp_ref.getBusCount(MediaTypes_::kEvent as i32, BusDirections_::kInput as i32);
+            for idx in 0..event_ins {
+                comp_ref.activateBus(MediaTypes_::kEvent as i32, BusDirections_::kInput as i32, idx, 1);
+            }
+
+            // Read the arrangement back: it is the plugin's answer, not our ask,
+            // that says how many channel pointers `process()` will dereference.
+            for (idx, &requested) in inputs.iter().enumerate() {
+                io.inputs.push(negotiated_channels(
+                    proc_ref,
+                    BusDirections_::kInput as i32,
+                    idx,
+                    requested,
+                ));
+            }
+            for (idx, &requested) in outputs.iter().enumerate() {
+                io.outputs.push(negotiated_channels(
+                    proc_ref,
+                    BusDirections_::kOutput as i32,
+                    idx,
+                    requested,
+                ));
+            }
+
+            // 5) Switch on
+            let res = comp_ref.setActive(1);
+            if res != kResultOk {
+                log::warn!("'{}' rejected setActive ({res:#X})", self.name);
+            }
+            proc_ref.setProcessing(1);
 
             log::info!(
-                "Plugin initialized: sr={}, block_size={}",
+                "'{}' initialized: sr={}, block={}, in={:?}, out={:?}, event buses={}",
+                self.name,
                 sample_rate,
-                max_block_size
+                max_block_size,
+                io.inputs,
+                io.outputs,
+                event_ins
             );
+            *self.io.write().unwrap() = io;
         }
         Ok(())
     }
@@ -627,7 +775,7 @@ impl PluginInstance {
             .context("this instance was not tagged; cannot target an analysis push")?;
         unsafe {
             let func: libloading::Symbol<PushAnalysisToProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_push_analysis_to\0")
                 .context("plugin does not export lesynth_fourier_push_analysis_to")?;
             let rc = func(
@@ -660,7 +808,7 @@ impl PluginInstance {
         let mut phase_flat = vec![0.0f32; num_harmonics * num_buckets];
         let written = unsafe {
             let func: libloading::Symbol<AnalyzeProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_analyze\0")
                 .context("plugin does not export lesynth_fourier_analyze")?;
             func(
@@ -703,7 +851,7 @@ impl PluginInstance {
     ) -> Result<AnalysisGrid> {
         unsafe {
             let func: libloading::Symbol<AnalyzeFullProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_analyze_full\0")
                 .context("plugin does not export lesynth_fourier_analyze_full")?;
 
@@ -796,7 +944,7 @@ impl PluginInstance {
     ) -> Result<Vec<f32>> {
         unsafe {
             let func: libloading::Symbol<ResynthesizeExactProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_resynthesize_exact\0")
                 .context("plugin does not export lesynth_fourier_resynthesize_exact")?;
 
@@ -860,7 +1008,7 @@ impl PluginInstance {
     ) -> Result<Vec<f32>> {
         unsafe {
             let func: libloading::Symbol<ResynthesizeProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_resynthesize\0")
                 .context("plugin does not export lesynth_fourier_resynthesize")?;
             let call = |out: *mut f32, cap: usize| {
@@ -906,7 +1054,7 @@ impl PluginInstance {
     ) -> Result<Vec<f32>> {
         unsafe {
             let func: libloading::Symbol<ResynthesizeKeyProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_resynthesize_key\0")
                 .context("plugin does not export lesynth_fourier_resynthesize_key")?;
             let lengths: Vec<u32> = grid.bucket_periods.iter().map(|&p| p as u32).collect();
@@ -963,7 +1111,7 @@ impl PluginInstance {
     ) -> Result<(Vec<f32>, bool)> {
         unsafe {
             let func: libloading::Symbol<RenderKeyLiveProc> = self
-                ._library
+                .lib()
                 .get(b"lesynth_fourier_render_key_live\0")
                 .context("plugin does not export lesynth_fourier_render_key_live")?;
             let mut used: i32 = 0;
@@ -1012,6 +1160,187 @@ impl PluginInstance {
             }
         }
     }
+}
+
+impl Drop for PluginInstance {
+    /// Shut the plugin down in the order the spec lays out. Skipping this is not
+    /// harmless: a JUCE plugin that is still active when its library is unloaded
+    /// takes the process with it.
+    fn drop(&mut self) {
+        unsafe {
+            if self.active.swap(false, Ordering::SeqCst) {
+                self.processor.as_com_ref().setProcessing(0);
+                self.component.as_com_ref().setActive(0);
+            }
+            if let Some((comp_cp, ctrl_cp)) = self.connection.take() {
+                comp_cp.as_com_ref().disconnect(ctrl_cp.as_ptr());
+                ctrl_cp.as_com_ref().disconnect(comp_cp.as_ptr());
+            }
+            self.controller.as_com_ref().setComponentHandler(std::ptr::null_mut());
+            if self.separate_controller {
+                self.controller.as_com_ref().terminate();
+            }
+            self.component.as_com_ref().terminate();
+        }
+    }
+}
+
+/// Pick the class to instantiate out of the factory.
+///
+/// With a `class_id` it is an exact lookup. Without one, the first **audio
+/// module** class wins — not simply the first class, which in a third-party
+/// bundle is as likely to be the edit-controller class (or an ARA extension) and
+/// would fail to create as an `IComponent`.
+fn select_class(
+    factory: ComRef<'_, IPluginFactory>,
+    class_id: Option<&[i8; 16]>,
+) -> Result<([i8; 16], String)> {
+    const AUDIO_MODULE_CLASS: &str = "Audio Module Class";
+    unsafe {
+        let count = factory.countClasses();
+        let mut fallback: Option<([i8; 16], String)> = None;
+        for idx in 0..count {
+            let mut info: PClassInfo = zeroed();
+            if factory.getClassInfo(idx, &mut info) != kResultOk {
+                continue;
+            }
+            let name = c_array_to_string(&info.name);
+            let category = c_array_to_string(&info.category);
+            log::info!("  class {idx}: '{name}' [{category}]");
+
+            if let Some(target) = class_id {
+                if info.cid == *target {
+                    return Ok((info.cid, name));
+                }
+                continue;
+            }
+            if category == AUDIO_MODULE_CLASS {
+                return Ok((info.cid, name));
+            }
+            fallback.get_or_insert((info.cid, name));
+        }
+        if class_id.is_some() {
+            bail!("the requested plugin class is not in this factory");
+        }
+        // No class called itself an audio module: take whatever there was, so a
+        // plugin with an unusual category is still worth a try.
+        fallback.context("the plugin's factory offers no classes at all")
+    }
+}
+
+/// Create the edit controller a component names, for plugins whose two halves are
+/// separate objects (most Steinberg-SDK plugins; JUCE keeps them together).
+unsafe fn create_separate_controller(
+    factory: ComRef<'_, IPluginFactory>,
+    component: ComRef<'_, IComponent>,
+    host_context: *mut FUnknown,
+) -> Result<ComPtr<IEditController>> {
+    let mut cid: TUID = zeroed();
+    let hr = component.getControllerClassId(&mut cid);
+    anyhow::ensure!(hr == kResultOk, "getControllerClassId failed ({hr:#X})");
+
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    let hr = factory.createInstance(
+        cid.as_ptr(),
+        IEditController::IID.as_ptr() as *const i8,
+        &mut ptr,
+    );
+    anyhow::ensure!(
+        hr == kResultOk && !ptr.is_null(),
+        "the factory refused to create the edit controller ({hr:#X})"
+    );
+    let controller: ComPtr<IEditController> =
+        ComPtr::from_raw(ptr as *mut IEditController).context("controller ptr was null")?;
+
+    let hr = controller.as_com_ref().initialize(host_context);
+    anyhow::ensure!(hr == kResultOk, "the edit controller refused to initialize ({hr:#X})");
+    Ok(controller)
+}
+
+/// Pump the component's state through to the controller, so the editor opens
+/// showing what the processor is actually set to.
+unsafe fn transfer_component_state(
+    component: ComRef<'_, IComponent>,
+    controller: ComRef<'_, IEditController>,
+) {
+    let stream = MemoryStream::new();
+    let Some(stream_ptr) = stream.to_com_ptr::<IBStream>() else {
+        return;
+    };
+    if component.getState(stream_ptr.as_ptr()) != kResultOk {
+        return;
+    }
+    stream.rewind();
+    let hr = controller.setComponentState(stream_ptr.as_ptr());
+    if hr != kResultOk {
+        log::debug!("setComponentState returned {hr:#X} ({} bytes)", stream.byte_len());
+    }
+}
+
+/// Wire the component and controller to each other. Returns the pair so they can
+/// be disconnected again before either is terminated.
+unsafe fn connect(
+    component: ComRef<'_, IComponent>,
+    controller: ComRef<'_, IEditController>,
+) -> Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)> {
+    let comp_cp = component.cast::<IConnectionPoint>()?;
+    let ctrl_cp = controller.cast::<IConnectionPoint>()?;
+    comp_cp.as_com_ref().connect(ctrl_cp.as_ptr());
+    ctrl_cp.as_com_ref().connect(comp_cp.as_ptr());
+    Some((comp_cp, ctrl_cp))
+}
+
+/// Channel count of every bus of one media type and direction.
+unsafe fn bus_channel_counts(
+    component: ComRef<'_, IComponent>,
+    media: i32,
+    direction: i32,
+) -> Vec<usize> {
+    let count = component.getBusCount(media, direction);
+    (0..count)
+        .map(|idx| {
+            let mut info: BusInfo = zeroed();
+            if component.getBusInfo(media, direction, idx, &mut info) == kResultOk {
+                info.channelCount.max(0) as usize
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// What the plugin actually settled on for one bus, falling back to what we asked
+/// for if it does not answer.
+unsafe fn negotiated_channels(
+    processor: ComRef<'_, IAudioProcessor>,
+    direction: i32,
+    index: usize,
+    requested: usize,
+) -> usize {
+    let mut arrangement: SpeakerArrangement = 0;
+    if processor.getBusArrangement(direction, index as i32, &mut arrangement) == kResultOk {
+        return arrangement.count_ones() as usize;
+    }
+    requested
+}
+
+/// The speaker arrangement for a plain `n`-channel bus.
+fn speaker_arrangement(channels: usize) -> u64 {
+    match channels {
+        0 => SpeakerArr::kEmpty,
+        1 => SpeakerArr::kMono,
+        2 => SpeakerArr::kStereo,
+        // No named arrangement: the low `n` speaker bits, which is what hosts
+        // and plugins both fall back to for unusual counts.
+        n if n < 64 => (1u64 << n) - 1,
+        _ => SpeakerArr::kStereo,
+    }
+}
+
+/// A NUL-terminated `char8` array from class info as a Rust string.
+fn c_array_to_string(bytes: &[i8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end].iter().map(|&b| b as u8).collect::<Vec<u8>>()).into_owned()
 }
 
 /// Well-known class IDs

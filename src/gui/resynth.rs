@@ -304,7 +304,7 @@ impl ResynthPanel {
         ) {
             Ok(i) => Arc::new(i),
             Err(e) => {
-                self.status = format!("Plugin load failed: {}", e);
+                self.status = format!("Plugin load failed: {e:#}");
                 return;
             }
         };
@@ -321,7 +321,7 @@ impl ResynthPanel {
 
         // Queue the subtrack, then open the editor which will claim it.
         if let Err(e) = inst.push_analysis(&samples, sr, freq, &contour) {
-            self.status = format!("Push analysis failed: {}", e);
+            self.status = format!("Push analysis failed: {e:#}");
             return;
         }
 
@@ -345,7 +345,7 @@ impl ResynthPanel {
                     )
                 };
             }
-            Err(e) => self.status = format!("Editor failed: {}", e),
+            Err(e) => self.status = format!("Editor failed: {e:#}"),
         }
     }
 

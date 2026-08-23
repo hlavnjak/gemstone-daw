@@ -40,13 +40,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use vst3::Steinberg::Vst::{
-    AudioBusBuffers, AudioBusBuffers__type0, IAudioProcessor, IAudioProcessorTrait, IEventList,
+    IAudioProcessor, IAudioProcessorTrait, IEventList,
     ProcessData, SymbolicSampleSizes_,
 };
 use vst3::{ComPtr, ComWrapper};
 
 use crate::audio::midi_to_vst3_event;
 use crate::gui::registry::PlaybackSource;
+use crate::audio::engine::bus_buffers;
 use crate::vst::{next_instance_token, EventList, PluginInstance};
 
 /// Velocity every composed note is played at. The Composer has no velocity
@@ -83,6 +84,15 @@ struct Voice {
     /// `(sample time, pitch, note-on)`, sorted by time.
     schedule: Vec<(u64, u8, bool)>,
     cursor: usize,
+    /// Channels per audio input bus, as this plugin negotiated them. A plugin
+    /// with an input bus reads it whether or not the composition has anything to
+    /// send, so the buffers have to be there.
+    in_buses: Vec<usize>,
+    /// Channels per audio output bus; the first is the one that is mixed down.
+    out_buses: Vec<usize>,
+    /// Per-channel scratch (inputs then outputs), owned so the mix allocates
+    /// nothing per block and one voice's layout cannot disturb another's.
+    scratch: Vec<Vec<f32>>,
 }
 
 /// A running composition. Dropping it stops playback: the stream field is
@@ -132,7 +142,6 @@ impl CompositionPlayer {
         let cb_finished = finished.clone();
         // Scratch for one row's output, reused every block: the callback mixes
         // each row in as soon as it is processed, so one buffer serves them all.
-        let mut planar: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
 
         let stream = device.build_output_stream(
             &stream_cfg,
@@ -143,7 +152,7 @@ impl CompositionPlayer {
                 }
                 let block_start = cb_position.load(Ordering::Relaxed);
                 let block_end = block_start + frames as u64;
-                mix_block(&mut voices, &mut planar, out, channels, block_start, frames);
+                mix_block(&mut voices, out, channels, block_start, frames);
                 cb_position.store(block_end, Ordering::Relaxed);
                 if block_end >= end_sample {
                     cb_finished.store(true, Ordering::Relaxed);
@@ -238,6 +247,19 @@ fn prepare_voices(
             .to_com_ptr::<IEventList>()
             .context("Failed to create event list COM ptr")?;
 
+        // The bus layout the plugin settled on in `initialize_audio`. A plugin
+        // that declares no output bus still needs somewhere to write, so it gets
+        // a stereo one; anything else is taken as declared.
+        let io = inst.io();
+        let out_buses = if io.outputs.is_empty() {
+            vec![2usize]
+        } else {
+            io.outputs.clone()
+        };
+        let total_channels: usize =
+            io.inputs.iter().sum::<usize>() + out_buses.iter().sum::<usize>();
+        let scratch = vec![vec![0.0f32; max_block.max(0) as usize]; total_channels.max(1)];
+
         voices.push(Voice {
             processor: inst.processor.clone(),
             event_impl,
@@ -245,6 +267,9 @@ fn prepare_voices(
             gain: plan.gain,
             schedule,
             cursor: 0,
+            in_buses: io.inputs.clone(),
+            out_buses,
+            scratch,
         });
         plugins.push(inst);
     }
@@ -255,14 +280,13 @@ fn prepare_voices(
 }
 
 /// Process one block of every voice and sum it into `out` (interleaved,
-/// `frames * channels`), which is overwritten. `planar` is per-channel scratch,
-/// reused across blocks so the real-time path allocates nothing.
+/// `frames * channels`), which is overwritten. Each voice carries its own
+/// per-channel scratch, sized to the bus layout its plugin negotiated.
 ///
 /// Shared by the transport's callback and the offline export, so what a `.wav`
 /// contains is what the transport plays — down to the summing and the clamp.
 fn mix_block(
     voices: &mut [Voice],
-    planar: &mut [Vec<f32>],
     out: &mut [f32],
     channels: usize,
     block_start: u64,
@@ -293,23 +317,25 @@ fn mix_block(
             }
         }
 
-        for ch in planar.iter_mut() {
+        for ch in voice.scratch.iter_mut() {
             ch.clear();
             ch.resize(frames, 0.0);
         }
-        let mut ptrs: Vec<*mut f32> = planar.iter_mut().map(|v| v.as_mut_ptr()).collect();
-        let mut bus = AudioBusBuffers {
-            numChannels: channels as i32,
-            silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 {
-                channelBuffers32: ptrs.as_mut_ptr(),
-            },
-        };
+        let n_in: usize = voice.in_buses.iter().sum();
+        let mut ptrs: Vec<*mut f32> = voice.scratch.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let (in_ptrs, out_ptrs) = ptrs.split_at_mut(n_in);
+        let mut in_buses = bus_buffers(&voice.in_buses, in_ptrs);
+        let mut out_buses = bus_buffers(&voice.out_buses, out_ptrs);
+
         let mut data = ProcessData {
-            numInputs: 0,
-            inputs: std::ptr::null_mut(),
-            numOutputs: 1,
-            outputs: &mut bus as *mut _,
+            numInputs: in_buses.len() as i32,
+            inputs: if in_buses.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                in_buses.as_mut_ptr()
+            },
+            numOutputs: out_buses.len() as i32,
+            outputs: out_buses.as_mut_ptr(),
             numSamples: frames as i32,
             processMode: 0,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
@@ -322,9 +348,15 @@ fn mix_block(
         }
         voice.event_impl.events.write().unwrap().clear();
 
-        for frame in 0..frames {
-            for ch in 0..channels {
-                out[frame * channels + ch] += planar[ch][frame] * voice.gain;
+        // Main output bus into the mix. Its channel count is the plugin's, not
+        // the device's: a mono plugin repeats, a wider one has the extra dropped.
+        let main_out = voice.out_buses[0];
+        if main_out > 0 {
+            for frame in 0..frames {
+                for ch in 0..channels {
+                    let src = n_in + ch.min(main_out - 1);
+                    out[frame * channels + ch] += voice.scratch[src][frame] * voice.gain;
+                }
             }
         }
     }
@@ -370,14 +402,13 @@ pub fn render_offline(
     const BLOCK: usize = 512;
     let (mut voices, plugins, end_sample) = prepare_voices(plans, sample_rate, BLOCK as i32)?;
 
-    let mut planar: Vec<Vec<f32>> = (0..channels).map(|_| Vec::new()).collect();
     let mut block = vec![0f32; BLOCK * channels];
     let mut out: Vec<f32> = Vec::with_capacity(end_sample as usize * channels);
     let mut pos = 0u64;
     while pos < end_sample {
         let frames = BLOCK.min((end_sample - pos) as usize);
         let buf = &mut block[..frames * channels];
-        mix_block(&mut voices, &mut planar, buf, channels, pos, frames);
+        mix_block(&mut voices, buf, channels, pos, frames);
         out.extend_from_slice(buf);
         pos += frames as u64;
     }

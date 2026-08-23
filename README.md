@@ -67,8 +67,17 @@ rows may share the same one.
 - **Load Internal plugin** — loads the embedded LeSynth Fourier VST3
   (`internal_plugins/liblesynth_fourier.so`, committed precompiled) by its class
   ID. No separate plugin install required.
-- **External VST3 plugins** — load from a path, unload, and show the plugin's
-  own GUI embedded in a native window (raw X11 on Linux, raw Win32 on Windows).
+- **External VST3 plugins** — "Create Custom VST Track" lists the plugins
+  installed in the standard locations (`VST3_PATH`, `~/.vst3`, `/usr/lib/vst3`,
+  `/usr/local/lib/vst3`) and can browse for a `.vst3` bundle or a plugin library
+  anywhere else. A bundle is resolved to the library inside it
+  (`Foo.vst3/Contents/x86_64-linux/Foo.so`), the module's `ModuleEntry` is run,
+  its component and edit controller are initialised against a host context and
+  connected, and the plugin's own GUI is shown in a native window (raw X11 on
+  Linux, raw Win32 on Windows). The X11 window provides the `IPlugFrame` and
+  `Linux::IRunLoop` a JUCE or Steinberg-SDK editor needs in order to draw at all.
+  Anything that is not a loadable VST3 — a VST2 `.so`, a library with a missing
+  dependency — is reported when the plugin is picked, not when its editor opens.
 - **MIDI input** — pick a USB keyboard / port, connect, refresh.
 - **Logging** to `gemstone-daw.log`.
 
@@ -82,7 +91,10 @@ internal_plugins/   # the embedded LeSynth Fourier VST3 (committed precompiled)
 src/
   main.rs                                 # eframe entry point
   lib.rs
-  vst/{host,handler,event_list,mod}.rs    # VST3 hosting
+  vst/{host,module,host_context,handler,event_list,mod}.rs  # VST3 hosting
+  bin/vst3_probe.rs                       # `cargo run --bin vst3_probe -- <plugin>`:
+                                          #   what the host sees in a plugin, and why
+                                          #   one will not load
   audio/{engine,decode,mod}.rs            # cpal audio engine + audio file decoding
   midi/{input,mod}.rs                     # midir MIDI input
   analysis/{segmentation,mod}.rs          # host-side subtrack segmentation
