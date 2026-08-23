@@ -274,9 +274,16 @@ impl Row {
 
     /// Append a note and, tied behind it, the space that separates it from
     /// whatever comes next.
-    fn add_note(&mut self, pitch: u8) {
+    ///
+    /// The new note carries on from the last one in the row: a row is nearly
+    /// always built by repeating a sound — a run on one note, or the same drum
+    /// over and over — so what was chosen a moment ago is a better guess than
+    /// any fixed default, and saves reaching for the dropdown every time.
+    /// `default_pitch` is what the *first* note of a row starts on.
+    fn add_note(&mut self, default_pitch: u8) {
         let id = self.next_item_id;
         self.next_item_id += 1;
+        let pitch = self.items.last().map_or(default_pitch, |item| item.pitch);
         self.items.push(Item {
             id,
             pitch,
@@ -1368,6 +1375,34 @@ mod tests {
         row.track_id = track;
         panel.rows.push(row);
         panel
+    }
+
+    /// Adding a note carries the last one's pitch over. Building a row means
+    /// repeating a sound far more often than changing it — a hi-hat line, a run
+    /// on one drum — so the dropdown should not have to be touched every time.
+    #[test]
+    fn a_new_note_carries_on_from_the_one_before_it() {
+        let mut row = Row::new(0, None);
+        // The first note of a row has nothing to follow, so it takes the default.
+        row.add_note(DEFAULT_DRUM_PITCH);
+        assert_eq!(row.items[0].pitch, DEFAULT_DRUM_PITCH);
+
+        // Change it, and everything added after follows.
+        row.items[0].pitch = 42;
+        row.add_note(DEFAULT_DRUM_PITCH);
+        row.add_note(DEFAULT_DRUM_PITCH);
+        assert_eq!(row.items[1].pitch, 42, "the new note ignored the one before it");
+        assert_eq!(row.items[2].pitch, 42);
+
+        // It follows the *last* note, not the first.
+        row.items[2].pitch = 46;
+        row.add_note(DEFAULT_DRUM_PITCH);
+        assert_eq!(row.items[3].pitch, 46);
+
+        // A row emptied of notes starts from the default again.
+        row.items.clear();
+        row.add_note(DEFAULT_PITCH);
+        assert_eq!(row.items[0].pitch, DEFAULT_PITCH);
     }
 
     /// A drum track names its notes after what they hit; an instrument track
