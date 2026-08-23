@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-use self::player::{CompositionPlayer, PlannedNote, RowPlan};
+use self::player::{CompositionPlayer, PlannedNote, RowEdit, RowPlan};
 use super::registry::TrackRegistry;
 
 /// Time resolution: a whole note is this many units. 256 makes every fraction in
@@ -322,6 +322,20 @@ pub enum ProjectRequest {
     Load { file: PathBuf },
 }
 
+/// What the running transport has been told, so the panel can tell whether the
+/// user has changed anything since.
+struct LiveSnapshot {
+    /// `(row id, track id)` per playing row — the part a live edit *cannot*
+    /// change, because a different track means a different plugin to load.
+    shape: Vec<(u64, Option<u64>)>,
+    /// The part it can: notes and gain, per row.
+    rows: Vec<RowEdit>,
+    loop_secs: f64,
+    /// Whether the user has already been told that the shape changed, so the
+    /// status line is not rewritten on every frame.
+    shape_warned: bool,
+}
+
 /// The Composer panel.
 pub struct ComposerPanel {
     registry: TrackRegistry,
@@ -341,6 +355,9 @@ pub struct ComposerPanel {
     /// Loop the composition instead of stopping at the end. Shared with the
     /// transport's audio callback, so the checkbox works on a running player.
     repeat: Arc<AtomicBool>,
+    /// The composition as the looping transport last received it. What an edit
+    /// is compared against, so an untouched frame publishes nothing.
+    live_sent: Option<LiveSnapshot>,
     /// A running WAV export, which renders on its own thread and sends back the
     /// line to show when it is done. The GUI must not block on it: a long
     /// composition takes seconds, and a frozen window looks like a crash.
@@ -360,6 +377,7 @@ impl ComposerPanel {
             status: "Add a track row to start composing.".to_string(),
             player: None,
             repeat: Arc::new(AtomicBool::new(false)),
+            live_sent: None,
             export: None,
         }
     }
@@ -419,12 +437,78 @@ impl ComposerPanel {
                 continue;
             }
             plans.push(RowPlan {
+                row_id: row.id,
                 source,
                 gain: row.gain,
                 notes,
             });
         }
         plans
+    }
+
+    /// The composition as the transport would need it *now*. Cheap by design:
+    /// it resolves note times and reads row gains, and deliberately does not
+    /// touch the registry — asking that for a playback source exports a
+    /// LeSynth's live grid, which is far too much work for a per-frame check.
+    fn live_snapshot(&self) -> LiveSnapshot {
+        let spu = self.secs_per_unit();
+        let mut shape = Vec::new();
+        let mut rows = Vec::new();
+        for row in &self.rows {
+            // Same filter as `build_plans`: a row with no track or no notes is
+            // not in the composition, so it is not in the transport either.
+            if row.track_id.is_none() {
+                continue;
+            }
+            let notes = row.planned_notes(spu);
+            if notes.is_empty() {
+                continue;
+            }
+            shape.push((row.id, row.track_id));
+            rows.push(RowEdit {
+                row_id: row.id,
+                gain: row.gain,
+                notes,
+            });
+        }
+        LiveSnapshot {
+            shape,
+            rows,
+            loop_secs: self.end_units() as f64 * self.secs_per_unit(),
+            shape_warned: false,
+        }
+    }
+
+    /// While a repeat is running, hand the transport anything the user has
+    /// changed since it last heard from us. Applied at the next loop point.
+    ///
+    /// Only notes, gains and the loop length travel this way. Adding a row, or
+    /// pointing one at another track, means a plugin to load — which cannot
+    /// happen on the audio thread — so that is reported rather than applied.
+    fn push_live_edits(&mut self) {
+        let Some(player) = &self.player else { return };
+        if !self.repeat.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(sent) = &self.live_sent else { return };
+
+        let snapshot = self.live_snapshot();
+        if snapshot.shape != sent.shape {
+            if !sent.shape_warned {
+                self.status = "Rows or their tracks changed — press Play again to \
+                               hear them; note edits still follow the loop."
+                    .to_string();
+                if let Some(sent) = &mut self.live_sent {
+                    sent.shape_warned = true;
+                }
+            }
+            return;
+        }
+        if snapshot.rows == sent.rows && snapshot.loop_secs == sent.loop_secs {
+            return;
+        }
+        player.update_live(&snapshot.rows, snapshot.loop_secs);
+        self.live_sent = Some(snapshot);
     }
 
     fn start_playback(&mut self) {
@@ -447,6 +531,7 @@ impl ComposerPanel {
                         player.loaded_rows, player.total_rows
                     )
                 };
+                self.live_sent = Some(self.live_snapshot());
                 self.player = Some(player);
             }
             Err(e) => self.status = format!("Playback failed: {e}"),
@@ -515,6 +600,7 @@ impl ComposerPanel {
     }
 
     fn stop_playback(&mut self) {
+        self.live_sent = None;
         if self.player.take().is_some() {
             self.status = "Stopped.".to_string();
         }
@@ -533,8 +619,12 @@ impl ComposerPanel {
         // "playing" over silence.
         if self.player.as_ref().is_some_and(CompositionPlayer::is_finished) {
             self.player = None;
+            self.live_sent = None;
             self.status = "Finished.".to_string();
         }
+        // Anything the user changed while a repeat is running goes in at the
+        // next loop point.
+        self.push_live_edits();
         // A finished export reports itself. A dropped sender means the render
         // thread died without a word, which is still an answer the user needs.
         if let Some(rx) = &self.export {
@@ -1158,7 +1248,7 @@ impl ComposerPanel {
                     egui::RichText::new(format!(
                         "🔁 {:.1} s / {:.1} s",
                         p.position_secs(),
-                        p.loop_secs
+                        p.loop_secs()
                     ))
                     .color(PLAYHEAD),
                 ),
@@ -1227,6 +1317,63 @@ mod tests {
     /// Shorthand for a length with no whole-note part.
     const fn frac(f: Fraction) -> Duration {
         Duration::new(0, f)
+    }
+
+    /// A panel with one row of `items`, playing track `track`.
+    fn panel_with(items: &[(u8, Duration, Duration)], track: Option<u64>) -> ComposerPanel {
+        let mut panel = ComposerPanel::new(TrackRegistry::default());
+        let mut row = row_with(items);
+        row.track_id = track;
+        panel.rows.push(row);
+        panel
+    }
+
+    /// What a live edit may and may not change, which is what decides whether the
+    /// looping transport can take it or the user has to press Play again.
+    ///
+    /// The panel compares these snapshots every frame while a repeat runs, so
+    /// "nothing changed" has to come out equal — otherwise the transport would be
+    /// handed the same composition over and over.
+    #[test]
+    fn a_live_snapshot_separates_note_edits_from_track_changes() {
+        let items = [(60, frac(Fraction::Quarter), frac(Fraction::Eighth))];
+        let panel = panel_with(&items, Some(7));
+        let before = panel.live_snapshot();
+        assert_eq!(
+            before.rows,
+            panel.live_snapshot().rows,
+            "an untouched composition must snapshot equal, or every frame \
+             republishes it"
+        );
+
+        // A note edit: same rows and tracks, different schedule — the transport
+        // can swap this in at the loop point.
+        let mut edited = panel_with(&items, Some(7));
+        edited.rows[0].items[0].pitch = 64;
+        let after = edited.live_snapshot();
+        assert_eq!(after.shape, before.shape, "a pitch change is not structural");
+        assert_ne!(after.rows, before.rows, "the pitch change was not noticed");
+
+        // Tempo moves every note *and* the loop length.
+        let mut faster = panel_with(&items, Some(7));
+        faster.tempo_bpm = 180.0;
+        let after = faster.live_snapshot();
+        assert_eq!(after.shape, before.shape, "tempo is not structural");
+        assert_ne!(after.rows, before.rows, "the tempo change did not move the notes");
+        assert_ne!(after.loop_secs, before.loop_secs, "the loop length did not follow");
+
+        // A different track means a different plugin, which an audio callback
+        // cannot load: structural, and reported rather than applied.
+        let moved = panel_with(&items, Some(8));
+        assert_ne!(
+            moved.live_snapshot().shape,
+            before.shape,
+            "pointing a row at another track must count as structural"
+        );
+
+        // A row with nothing to play is in neither the plans nor the snapshot.
+        let silent = panel_with(&[(60, frac(Fraction::None), frac(Fraction::Eighth))], Some(7));
+        assert!(silent.live_snapshot().rows.is_empty());
     }
 
     /// The requirement: a row opens with a space before its very first note, and

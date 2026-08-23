@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //! **Repeat**: the transport loops the composition instead of stopping at the
-//! end, and unticking it lets the pass in flight finish.
+//! end, it picks up edits made while it is looping, and unticking it lets the
+//! pass in flight finish.
 //!
 //! The loop lives inside the audio callback, so this drives a real output
 //! stream. With no audio device there is nothing to drive and the test says so
@@ -23,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gemstone_daw::gui::composer::player::{CompositionPlayer, PlannedNote, RowPlan};
+use gemstone_daw::gui::composer::player::{CompositionPlayer, PlannedNote, RowEdit, RowPlan};
 use gemstone_daw::gui::registry::PlaybackSource;
 use gemstone_daw::track_format::TrackState;
 use gemstone_daw::vst::class_ids;
@@ -77,6 +78,7 @@ fn lesynth_source() -> PlaybackSource {
 #[test]
 fn repeat_loops_the_composition_until_it_is_switched_off() {
     let plans = vec![RowPlan {
+        row_id: 0,
         source: lesynth_source(),
         gain: 1.0,
         notes: vec![
@@ -97,9 +99,9 @@ fn repeat_loops_the_composition_until_it_is_switched_off() {
     // The loop is the written length; playback without a repeat would run on to
     // the last note-off plus the release tail, which is longer.
     assert!(
-        player.total_secs > player.loop_secs,
+        player.total_secs > player.loop_secs(),
         "loop {:.2}s vs total {:.2}s",
-        player.loop_secs,
+        player.loop_secs(),
         player.total_secs
     );
 
@@ -112,9 +114,9 @@ fn repeat_loops_the_composition_until_it_is_switched_off() {
         let position = player.position_secs();
         // A tolerance of one device block: the position is read between blocks.
         assert!(
-            position <= player.loop_secs + 0.25,
+            position <= player.loop_secs() + 0.25,
             "position {position:.2}s ran past the {:.2}s loop",
-            player.loop_secs
+            player.loop_secs()
         );
         assert!(!player.is_finished(), "a looping transport reported finished");
         wrapped |= position < previous;
@@ -124,6 +126,30 @@ fn repeat_loops_the_composition_until_it_is_switched_off() {
         }
     }
     assert!(wrapped, "never wrapped in 6s of a {LOOP_SECS}s loop");
+
+    // An edit made mid-loop is taken up at the next loop point — here a longer
+    // composition, which moves the loop length the transport reports.
+    let edited = LOOP_SECS * 2.0;
+    player.update_live(
+        &[RowEdit {
+            row_id: 0,
+            gain: 1.0,
+            notes: vec![
+                PlannedNote { at_secs: 0.0, dur_secs: 0.4, pitch: 67 },
+                PlannedNote { at_secs: 1.2, dur_secs: 0.4, pitch: 72 },
+            ],
+        }],
+        edited,
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline && (player.loop_secs() - edited).abs() > 0.01 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        (player.loop_secs() - edited).abs() <= 0.01,
+        "the live edit never landed: still looping on {:.2}s",
+        player.loop_secs()
+    );
 
     // Unticking lets the pass in flight play out, then stops.
     repeat.store(false, Ordering::Relaxed);

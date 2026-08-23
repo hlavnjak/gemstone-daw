@@ -57,6 +57,11 @@ rows may share the same one.
   note, so the bar structure survives the wrap and releases ring on across it.
   It can be switched on and off while the transport runs; unticking it makes the
   pass in flight the last one.
+- **A loop follows your edits.** While Repeat is on, changing notes — pitch,
+  length, adding or deleting them — or a row's gain or the tempo is picked up at
+  the next time round, without stopping. Adding a row or pointing one at another
+  track is the exception: that needs a plugin loaded, which cannot happen while
+  the audio callback is running, so the panel says to press Play again.
 - **Play / Stop** at the foot of the section renders the whole arrangement in
   real time, lighting up the frame each row is sounding as it goes: one output
   stream, one plugin instance per row, mixed with each row's own gain. The

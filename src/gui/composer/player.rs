@@ -27,6 +27,13 @@
 //! The schedule is resolved to sample times up front, so the callback only walks
 //! a sorted per-row cursor — no allocation or locking of its own.
 //!
+//! **A repeat picks up edits.** While it loops, the panel hands the transport
+//! the composition again whenever it changes ([`CompositionPlayer::update_live`]);
+//! the callback swaps it in at the loop point, so a pass is never rearranged
+//! under itself. Only the schedules and gains change that way — which plugin
+//! each row plays cannot, because loading one is not something an audio callback
+//! can do.
+//!
 //! **Repeat** loops on the composition's *written* length — the longest row,
 //! trailing silence included — not on the last note plus its release. The wrap is
 //! cut at the exact sample, inside the device block if need be, so a loop does
@@ -40,7 +47,7 @@
 //! for being asked for early.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -66,7 +73,7 @@ const NOTE_VELOCITY: u8 = 100;
 const TAIL_SECS: f64 = 1.5;
 
 /// One note on the timeline, already resolved to seconds.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct PlannedNote {
     pub at_secs: f64,
     pub dur_secs: f64,
@@ -75,13 +82,43 @@ pub struct PlannedNote {
 
 /// One composer row, ready to play.
 pub struct RowPlan {
+    /// The panel's row id, which is how a live edit finds the voice again.
+    pub row_id: u64,
     pub source: PlaybackSource,
     pub gain: f32,
     pub notes: Vec<PlannedNote>,
 }
 
+/// One row of an edit made while the transport is running: everything about a
+/// row that can be changed without loading a different plugin.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RowEdit {
+    pub row_id: u64,
+    pub gain: f32,
+    pub notes: Vec<PlannedNote>,
+}
+
+/// A composition edited mid-flight, waiting for the next loop point.
+struct LiveUpdate {
+    rows: Vec<VoiceEdit>,
+    loop_sample: u64,
+    /// Set by the audio callback once it has taken this. What is left in `rows`
+    /// afterwards is the *old* schedules, swapped out rather than dropped —
+    /// freeing them is the GUI thread's job, not the audio thread's.
+    applied: bool,
+}
+
+struct VoiceEdit {
+    row_id: u64,
+    gain: f32,
+    schedule: Vec<(u64, u8, bool)>,
+}
+
 /// A row's live instance plus its event schedule, as the callback sees it.
 struct Voice {
+    /// The panel's row id: which row of the composition this voice is playing,
+    /// so an edit can be matched to it by identity rather than by position.
+    row_id: u64,
     /// The instance this voice plays. Held here, not just in the player, so the
     /// plugin cannot be terminated or its library unloaded while the callback
     /// that calls `process()` on it still exists.
@@ -117,14 +154,19 @@ pub struct CompositionPlayer {
     _plugins: Vec<Arc<PluginInstance>>,
     position: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
+    /// Where a repeat wraps, in samples. Owned by the callback (it is the one
+    /// that adopts a live edit's new length) and read here for the transport
+    /// readout.
+    loop_sample: Arc<AtomicU64>,
+    /// An edit waiting for the next loop point. The callback only ever
+    /// `try_lock`s it, so a busy GUI thread cannot stall the audio thread.
+    live: Arc<Mutex<Option<LiveUpdate>>>,
     sample_rate: f64,
     /// Rows that actually loaded, and rows asked for.
     pub loaded_rows: usize,
     pub total_rows: usize,
     /// End of the composition, tail included.
     pub total_secs: f64,
-    /// The length a repeat loops on: the composition as written.
-    pub loop_secs: f64,
 }
 
 impl CompositionPlayer {
@@ -160,10 +202,15 @@ impl CompositionPlayer {
         // Where a repeat wraps. Never before the last event: a length that
         // rounds down a hair must not cut the note it lands on.
         let last_event = end_sample.saturating_sub((TAIL_SECS * sample_rate).round() as u64);
-        let loop_sample = ((loop_secs * sample_rate).round().max(1.0) as u64).max(last_event);
+        let loop_sample = Arc::new(AtomicU64::new(
+            loop_sample_for(loop_secs, sample_rate, last_event),
+        ));
+        let live: Arc<Mutex<Option<LiveUpdate>>> = Arc::new(Mutex::new(None));
 
         let cb_position = position.clone();
         let cb_finished = finished.clone();
+        let cb_loop = loop_sample.clone();
+        let cb_live = live.clone();
         let cb_repeat = repeat;
 
         let stream = device.build_output_stream(
@@ -180,6 +227,7 @@ impl CompositionPlayer {
                 while done < frames {
                     let pos = cb_position.load(Ordering::Relaxed);
                     let repeat = cb_repeat.load(Ordering::Relaxed);
+                    let loop_sample = cb_loop.load(Ordering::Relaxed);
 
                     // Ticking Repeat on during the release tail: the loop point
                     // is already behind us and will not come round again, so go
@@ -216,6 +264,10 @@ impl CompositionPlayer {
                         // Straight into the next pass: nothing is reset on the
                         // plugins, so releases ring on over the loop.
                         rewind(&mut voices, &cb_position);
+                        // The loop point is also where an edit made while this
+                        // was playing comes in, so a pass is never rearranged
+                        // underneath itself.
+                        take_live_update(&cb_live, &mut voices, &cb_loop);
                     } else if !repeat && new_pos >= end_sample {
                         cb_finished.store(true, Ordering::Relaxed);
                     }
@@ -237,12 +289,53 @@ impl CompositionPlayer {
             _plugins: plugins,
             position,
             finished,
+            loop_sample,
+            live,
             sample_rate,
             loaded_rows,
             total_rows,
             total_secs: end_sample as f64 / sample_rate,
-            loop_secs: loop_sample as f64 / sample_rate,
         })
+    }
+
+    /// The length the transport is looping on, in seconds — it follows a live
+    /// edit, so a tempo change or an added note moves it.
+    pub fn loop_secs(&self) -> f64 {
+        self.loop_sample.load(Ordering::Relaxed) as f64 / self.sample_rate.max(1.0)
+    }
+
+    /// Hand the transport a composition edited while it plays. It is taken up
+    /// whole at the next loop point; until then the pass in flight is untouched.
+    ///
+    /// Rows are matched by [`RowEdit::row_id`]: a row the transport is not
+    /// playing is ignored (it has no plugin loaded, and an audio callback cannot
+    /// load one), and a row it *is* playing that no longer appears simply falls
+    /// silent. Which track a row plays therefore cannot be changed this way.
+    pub fn update_live(&self, rows: &[RowEdit], loop_secs: f64) {
+        let mut last_event = 0u64;
+        let rows: Vec<VoiceEdit> = rows
+            .iter()
+            .map(|row| {
+                let (schedule, last) = schedule_from(&row.notes, self.sample_rate);
+                last_event = last_event.max(last);
+                VoiceEdit {
+                    row_id: row.row_id,
+                    gain: row.gain,
+                    schedule,
+                }
+            })
+            .collect();
+        let update = LiveUpdate {
+            rows,
+            loop_sample: loop_sample_for(loop_secs, self.sample_rate, last_event),
+            applied: false,
+        };
+        // Blocking is fine here: the audio callback only ever tries the lock, and
+        // holds it for the length of a swap. Replacing what is in the slot drops
+        // the previous update — old schedule buffers included — on this thread.
+        if let Ok(mut slot) = self.live.lock() {
+            *slot = Some(update);
+        }
     }
 
     /// Seconds played so far.
@@ -254,6 +347,62 @@ impl CompositionPlayer {
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Relaxed)
     }
+}
+
+/// Where a repeat wraps, in samples: the written length, but never before the
+/// last event — a length that rounds down a hair must not cut the note on it.
+fn loop_sample_for(loop_secs: f64, sample_rate: f64, last_event: u64) -> u64 {
+    ((loop_secs * sample_rate).round().max(1.0) as u64).max(last_event)
+}
+
+/// A row's notes as the sorted `(sample, pitch, note-on)` schedule the callback
+/// walks, and the sample its last event falls on.
+fn schedule_from(notes: &[PlannedNote], sample_rate: f64) -> (Vec<(u64, u8, bool)>, u64) {
+    let mut schedule: Vec<(u64, u8, bool)> = Vec::with_capacity(notes.len() * 2);
+    let mut last_event = 0u64;
+    for n in notes {
+        let on = (n.at_secs * sample_rate).round().max(0.0) as u64;
+        // At least one sample of note, so a 1/128 at a low tempo cannot
+        // collapse into a note-off that precedes its own note-on.
+        let off = on + ((n.dur_secs * sample_rate).round().max(1.0) as u64);
+        schedule.push((on, n.pitch, true));
+        schedule.push((off, n.pitch, false));
+        last_event = last_event.max(off);
+    }
+    schedule.sort_by_key(|&(t, _, on)| (t, on));
+    (schedule, last_event)
+}
+
+/// Adopt an edit, if one is waiting. Called at the loop point, from the audio
+/// thread, so it must not allocate or free: the new schedules are *swapped* with
+/// the old, which are left in the slot for the GUI thread to drop.
+fn take_live_update(
+    live: &Mutex<Option<LiveUpdate>>,
+    voices: &mut [Voice],
+    loop_sample: &AtomicU64,
+) {
+    let Ok(mut slot) = live.try_lock() else {
+        // The GUI is mid-write; next pass, then.
+        return;
+    };
+    let Some(update) = slot.as_mut() else { return };
+    if update.applied {
+        return;
+    }
+    for voice in voices.iter_mut() {
+        match update.rows.iter_mut().find(|r| r.row_id == voice.row_id) {
+            Some(edit) => {
+                std::mem::swap(&mut voice.schedule, &mut edit.schedule);
+                voice.gain = edit.gain;
+            }
+            // The row was deleted. Its plugin stays loaded — unloading is not
+            // something this thread can do — but it has nothing left to play.
+            None => voice.schedule.clear(),
+        }
+        voice.cursor = 0;
+    }
+    loop_sample.store(update.loop_sample, Ordering::Relaxed);
+    update.applied = true;
 }
 
 /// Back to the top of the composition: every row plays its schedule again from
@@ -304,17 +453,8 @@ fn prepare_voices(
             }
         }
 
-        let mut schedule: Vec<(u64, u8, bool)> = Vec::with_capacity(plan.notes.len() * 2);
-        for n in &plan.notes {
-            let on = (n.at_secs * sample_rate).round().max(0.0) as u64;
-            // At least one sample of note, so a 1/128 at a low tempo cannot
-            // collapse into a note-off that precedes its own note-on.
-            let off = on + ((n.dur_secs * sample_rate).round().max(1.0) as u64);
-            schedule.push((on, n.pitch, true));
-            schedule.push((off, n.pitch, false));
-            last_event = last_event.max(off);
-        }
-        schedule.sort_by_key(|&(t, _, on)| (t, on));
+        let (schedule, row_last_event) = schedule_from(&plan.notes, sample_rate);
+        last_event = last_event.max(row_last_event);
 
         let event_impl = Arc::new(EventList::default());
         let event_list = ComWrapper::new((*event_impl).clone())
@@ -345,6 +485,7 @@ fn prepare_voices(
         );
 
         voices.push(Voice {
+            row_id: plan.row_id,
             plugin: inst.clone(),
             event_impl,
             event_list,

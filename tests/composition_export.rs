@@ -80,6 +80,7 @@ fn a_composition_exports_the_audio_it_plays() {
     ];
     let last_off = 0.9;
     let plans = vec![RowPlan {
+        row_id: 0,
         source: lesynth_source(),
         gain: 1.0,
         notes,

@@ -70,6 +70,7 @@ fn installed_vst3_plugins_load_and_render() {
         // 3) Two notes through the Composer's offline render — the path that
         //    hands `process()` its buffers, for exactly this bus layout.
         let plan = RowPlan {
+            row_id: 0,
             source: PlaybackSource {
                 name: name.clone(),
                 plugin_path: path.clone(),
