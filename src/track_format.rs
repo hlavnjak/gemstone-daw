@@ -26,7 +26,8 @@
 //! display_gain f32 (version >= 2 only) |
 //! amplitude[nh*nb] f32 (row-major, h*nb + b) | phase[nh*nb] f32 |
 //! pitch_ratio[nb] f32 |
-//! bucket_lengths[nb] u32 | dc[nb] f32 | nyquist[nb] f32   (version >= 3 only)
+//! bucket_lengths[nb] u32 | dc[nb] f32 | nyquist[nb] f32   (version >= 3 only) |
+//! amp_enabled[nh] u8 | phase_enabled[nh] u8                (version >= 4 only)
 //! ```
 //!
 //! Version 2 added `display_gain`, without which a reloaded track cannot be
@@ -37,6 +38,13 @@
 //! alone costs ~120 dB. Older files load with `display_gain` unknown (`0.0`) and
 //! empty [`TrackState::bucket_lengths`], which switches the exact path off
 //! rather than feeding it numbers it cannot trust.
+//!
+//! **Version 4 added the per-harmonic enable flags** — the editor's `amp` and
+//! `phase` checkboxes. They are not part of the grid (a disabled harmonic keeps
+//! its analysed row and is skipped when rendering), so a file without them
+//! reloads with every harmonic switched back on, quietly discarding the
+//! selection the track was saved with. Older files load with both vectors empty,
+//! which means "all enabled" — the state they were saved in.
 
 use std::fs;
 use std::path::Path;
@@ -44,11 +52,11 @@ use std::path::Path;
 use anyhow::{bail, ensure, Context, Result};
 
 const MAGIC: [u8; 4] = *b"LSFT";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// magic..sample_rate — the fields every version has.
 const HEADER_V1_LEN: usize = 4 + 4 + 4 + 4 + 4 + 4 + 4;
-/// …plus `display_gain`, from version 2 on. The header is unchanged in v3, which
-/// only appends payload.
+/// …plus `display_gain`, from version 2 on. The header is unchanged in v3 and
+/// v4, which only append payload.
 const HEADER_V2_LEN: usize = HEADER_V1_LEN + 4;
 
 /// The full state of one LeSynth Fourier track.
@@ -88,6 +96,13 @@ pub struct TrackState {
     /// exactly when [`Self::bucket_lengths`] is.
     pub dc: Vec<f32>,
     pub nyquist: Vec<f32>,
+    /// The editor's per-harmonic `amp` / `phase` checkboxes (`num_harmonics`
+    /// long), or **empty** for "every harmonic enabled" — a pre-v4 file, or a
+    /// plugin too old to report them. They are not in the grid: a disabled
+    /// harmonic keeps its analysed row and is dropped when the note is rendered,
+    /// so without these a saved track comes back with the whole spectrum on.
+    pub amp_enabled: Vec<bool>,
+    pub phase_enabled: Vec<bool>,
 }
 
 impl TrackState {
@@ -133,6 +148,14 @@ impl TrackState {
         for b in 0..self.num_buckets {
             let v = if exact { self.nyquist[b] } else { 0.0 };
             out.extend_from_slice(&v.to_le_bytes());
+        }
+        // v4 tail: the enable checkboxes, one byte each. Also always written —
+        // an empty vector is a grid whose flags were never reported, and "all
+        // enabled" is exactly what such a grid plays.
+        for flags in [&self.amp_enabled, &self.phase_enabled] {
+            for h in 0..self.num_harmonics {
+                out.push(u8::from(flags.get(h).copied().unwrap_or(true)));
+            }
         }
         out
     }
@@ -182,7 +205,13 @@ impl TrackState {
             .and_then(|g| num_buckets.checked_mul(per_bucket).and_then(|t| g.checked_add(t)))
             .context("payload size overflow")?;
         let header = if version >= 2 { HEADER_V2_LEN } else { HEADER_V1_LEN };
-        let expected = header + floats * 4;
+        // v4 appends two bytes per harmonic — the enable checkboxes.
+        let flag_bytes = if version >= 4 {
+            num_harmonics.checked_mul(2).context("flag size overflow")?
+        } else {
+            0
+        };
+        let expected = header + floats * 4 + flag_bytes;
         ensure!(
             bytes.len() == expected,
             "corrupt .lsft: expected {expected} bytes, got {}",
@@ -220,6 +249,27 @@ impl TrackState {
             (Vec::new(), Vec::new(), Vec::new())
         };
 
+        // A vector that is all-true carries no information the default does not,
+        // so it collapses back to empty — "every harmonic enabled" has one
+        // representation, whichever version the file was written in.
+        let read_flags = |cur: &mut usize| -> Vec<bool> {
+            if version < 4 {
+                return Vec::new();
+            }
+            let v: Vec<bool> = bytes[*cur..*cur + num_harmonics]
+                .iter()
+                .map(|&b| b != 0)
+                .collect();
+            *cur += num_harmonics;
+            if v.iter().all(|&e| e) {
+                Vec::new()
+            } else {
+                v
+            }
+        };
+        let amp_enabled = read_flags(&mut cur);
+        let phase_enabled = read_flags(&mut cur);
+
         Ok(Self {
             num_harmonics,
             num_buckets,
@@ -233,6 +283,8 @@ impl TrackState {
             bucket_lengths,
             dc,
             nyquist,
+            amp_enabled,
+            phase_enabled,
         })
     }
 
@@ -265,6 +317,14 @@ impl TrackState {
         if !tail.iter().all(|&n| n == 0) && !tail.iter().all(|&n| n == self.num_buckets) {
             bail!("bucket_lengths/dc/nyquist must all be empty or all num_buckets long");
         }
+        // Empty means "all enabled"; anything else must cover every harmonic, or
+        // the harmonics past its end would take their state from where the
+        // vector happens to stop.
+        for flags in [&self.amp_enabled, &self.phase_enabled] {
+            if !flags.is_empty() && flags.len() != self.num_harmonics {
+                bail!("harmonic enable flags must be empty or num_harmonics long");
+            }
+        }
         Ok(())
     }
 }
@@ -291,6 +351,9 @@ mod tests {
             bucket_lengths: vec![200, 198, 202, 200],
             dc: vec![0.01, -0.02, 0.03, 0.0],
             nyquist: vec![0.001, 0.0, -0.002, 0.0],
+            // Harmonic 2's amplitude and harmonic 1's phase switched off.
+            amp_enabled: vec![true, false, true],
+            phase_enabled: vec![false, true, true],
         }
     }
 
@@ -317,8 +380,16 @@ mod tests {
     /// minus the fields that version predates, and payload minus the v3 tail.
     fn downgrade(s: &TrackState, version: u32) -> Vec<u8> {
         let cur = s.to_bytes();
-        let tail = s.num_buckets * 3 * 4; // bucket_lengths + dc + nyquist
-        let body = &cur[HEADER_V2_LEN..cur.len() - tail];
+        // Strip whatever the target version predates: the enable flags (v4),
+        // then bucket_lengths + dc + nyquist (v3).
+        let flags = s.num_harmonics * 2;
+        let exact = s.num_buckets * 3 * 4;
+        let drop_tail = match version {
+            0..=2 => flags + exact,
+            3 => flags,
+            _ => 0,
+        };
+        let body = &cur[HEADER_V2_LEN..cur.len() - drop_tail];
         let mut out = Vec::new();
         out.extend_from_slice(&cur[..4]); // magic
         out.extend_from_slice(&version.to_le_bytes());
@@ -343,6 +414,8 @@ mod tests {
                 bucket_lengths: Vec::new(),
                 dc: Vec::new(),
                 nyquist: Vec::new(),
+                amp_enabled: Vec::new(),
+                phase_enabled: Vec::new(),
                 ..s
             },
             parsed,
@@ -367,6 +440,51 @@ mod tests {
         );
         assert_eq!(parsed.amplitude, s.amplitude);
         assert_eq!(parsed.pitch_ratio, s.pitch_ratio);
+    }
+
+    /// Version 3 predates the enable checkboxes. It must load with them empty —
+    /// "all enabled", which is what a v3 file actually plays as.
+    #[test]
+    fn reads_version_3_without_the_enable_flags() {
+        let s = sample_state();
+        let parsed = TrackState::from_bytes(&downgrade(&s, 3)).expect("v3 parses");
+        assert!(parsed.amp_enabled.is_empty());
+        assert!(parsed.phase_enabled.is_empty());
+        assert_eq!(parsed.bucket_lengths, s.bucket_lengths, "v3 does carry these");
+    }
+
+    /// The point of version 4: a harmonic switched off in the editor is still
+    /// switched off when the track is loaded back, instead of the whole spectrum
+    /// coming back on.
+    #[test]
+    fn version_4_carries_the_enable_flags() {
+        let s = sample_state();
+        let back = TrackState::from_bytes(&s.to_bytes()).expect("parses");
+        assert_eq!(back.amp_enabled, s.amp_enabled);
+        assert_eq!(back.phase_enabled, s.phase_enabled);
+    }
+
+    /// An all-enabled selection is the default, so it round-trips as the default
+    /// (empty) rather than as a vector of `true` that only compares equal by
+    /// accident.
+    #[test]
+    fn an_all_enabled_selection_round_trips_as_the_default() {
+        let s = TrackState {
+            amp_enabled: Vec::new(),
+            phase_enabled: vec![true; 3],
+            ..sample_state()
+        };
+        let back = TrackState::from_bytes(&s.to_bytes()).expect("parses");
+        assert!(back.amp_enabled.is_empty());
+        assert!(back.phase_enabled.is_empty(), "all-true collapses to the default");
+    }
+
+    /// Flags that cover only some harmonics are a bug: the rest would take their
+    /// state from wherever the vector stops.
+    #[test]
+    fn validate_rejects_partial_enable_flags() {
+        let s = TrackState { amp_enabled: vec![true, false], ..sample_state() };
+        assert!(s.validate().is_err());
     }
 
     /// A grid with no exact inverse (hand-drawn, or loaded from an old file)

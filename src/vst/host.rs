@@ -175,6 +175,12 @@ type ImportGridProc = unsafe extern "C" fn(
     *const f32, // dc
     *const f32, // nyquist
 ) -> i64;
+/// The per-harmonic enable checkboxes (`.lsft` version 4). Separate symbols
+/// rather than more arguments on `_export_grid`: a plugin built before them is
+/// still a working plugin, and a missing symbol here simply means "this build
+/// cannot report them", not a failed export.
+type ExportFlagsProc = unsafe extern "C" fn(u64, u32, *mut u8, *mut u8) -> i64;
+type ImportFlagsProc = unsafe extern "C" fn(u64, u32, *const u8, *const u8) -> i64;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -253,6 +259,9 @@ impl AnalysisGrid {
             bucket_lengths: self.bucket_periods.iter().map(|&p| p as u32).collect(),
             dc: self.dc.clone(),
             nyquist: self.nyquist.clone(),
+            // A fresh analysis has no editor behind it, so every harmonic is on.
+            amp_enabled: Vec::new(),
+            phase_enabled: Vec::new(),
         }
     }
 }
@@ -425,6 +434,31 @@ impl PluginInstance {
                 nyquist.clear();
             }
 
+            // The enable checkboxes, which live beside the grid rather than in
+            // it. Optional: a plugin built before this ABI exports the grid
+            // fine, and "all enabled" is what such a build plays anyway.
+            let (mut amp_enabled, mut phase_enabled) = (Vec::new(), Vec::new());
+            if let Ok(flags_fn) = self
+                ._library
+                .get::<ExportFlagsProc>(b"lesynth_fourier_export_flags\0")
+            {
+                let mut amp_flags = vec![0u8; nhz];
+                let mut phase_flags = vec![0u8; nhz];
+                let rc = flags_fn(token, nh, amp_flags.as_mut_ptr(), phase_flags.as_mut_ptr());
+                if rc >= 0 {
+                    // All-on is the default, and stays the empty vector so a
+                    // grid nobody edited is not saved as an explicit selection.
+                    if amp_flags.contains(&0) {
+                        amp_enabled = amp_flags.iter().map(|&f| f != 0).collect();
+                    }
+                    if phase_flags.contains(&0) {
+                        phase_enabled = phase_flags.iter().map(|&f| f != 0).collect();
+                    }
+                } else {
+                    log::warn!("export_flags failed ({rc}); saving with every harmonic enabled");
+                }
+            }
+
             let state = TrackState {
                 num_harmonics: nhz,
                 num_buckets: nbz,
@@ -438,6 +472,8 @@ impl PluginInstance {
                 bucket_lengths,
                 dc,
                 nyquist,
+                amp_enabled,
+                phase_enabled,
             };
             state.validate()?;
             Ok(state)
@@ -487,6 +523,43 @@ impl PluginInstance {
                 },
             );
             anyhow::ensure!(rc == 0, "import_grid failed ({rc})");
+
+            // The enable checkboxes, after the grid: loading a grid leaves them
+            // alone but rebuilds the key buffers, so the flags have to be
+            // applied (and the buffers re-dirtied) once it has landed.
+            if !state.amp_enabled.is_empty() || !state.phase_enabled.is_empty() {
+                match self
+                    ._library
+                    .get::<ImportFlagsProc>(b"lesynth_fourier_import_flags\0")
+                {
+                    Ok(flags_fn) => {
+                        let to_bytes = |v: &Vec<bool>| -> Vec<u8> {
+                            if v.is_empty() {
+                                vec![1u8; state.num_harmonics]
+                            } else {
+                                v.iter().map(|&e| u8::from(e)).collect()
+                            }
+                        };
+                        let amp = to_bytes(&state.amp_enabled);
+                        let phase = to_bytes(&state.phase_enabled);
+                        let rc = flags_fn(
+                            token,
+                            state.num_harmonics as u32,
+                            amp.as_ptr(),
+                            phase.as_ptr(),
+                        );
+                        if rc < 0 {
+                            log::warn!("import_flags failed ({rc}); harmonics stay as loaded");
+                        }
+                    }
+                    // Worth saying out loud: the track plays with harmonics the
+                    // user switched off, and nothing on screen would show why.
+                    Err(e) => log::warn!(
+                        "plugin has no lesynth_fourier_import_flags ({e}); the saved \
+                         per-harmonic selection cannot be restored"
+                    ),
+                }
+            }
         }
         Ok(())
     }

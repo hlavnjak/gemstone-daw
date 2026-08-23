@@ -132,6 +132,9 @@ fn a_saved_track_reloads_with_its_exact_inverse() {
         bucket_lengths: grid.bucket_periods.iter().map(|&p| p as u32).collect(),
         dc: grid.dc.clone(),
         nyquist: grid.nyquist.clone(),
+        // A grid straight from the analyser: no editor, no harmonics switched off.
+        amp_enabled: Vec::new(),
+        phase_enabled: Vec::new(),
     };
     state.validate().expect("validate");
     assert!(
