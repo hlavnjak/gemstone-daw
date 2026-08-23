@@ -77,6 +77,7 @@ fn installed_vst3_plugins_load_and_render() {
                 class_id: None,
                 is_lesynth: false,
                 state: None,
+                vst_state: None,
             },
             gain: 1.0,
             notes: vec![

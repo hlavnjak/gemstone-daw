@@ -13,10 +13,12 @@
 // limitations under the License.
 //! `.gmstn` — the Gemstone project format.
 //!
-//! A saved project is a **folder**, not a file: `MySong/` holds `MySong.gmstn`
-//! plus one `.lsft` per LeSynth Fourier track any row plays. The folder is the
-//! unit you move, copy or hand to someone else, and it carries its own sounds —
-//! a project with no absolute paths in it is portable.
+//! A saved project is a **folder**, not a file: `MySong/` holds `MySong.gmstn`,
+//! one `.lsft` per LeSynth Fourier track any row plays, and one `.vststate` per
+//! custom VST3 track — the plugin's own state, which is where it keeps the knobs
+//! the user set. The folder is the unit you move, copy or hand to someone else,
+//! and it carries its own sounds; only a third-party plugin's *binary* is left
+//! outside it, because that is not ours to copy.
 //!
 //! **The manifest is line-oriented text, deliberately.** The grids are already
 //! binary (`.lsft`); what is left is a small structure whose main job is to hold
@@ -34,6 +36,7 @@
 //! [row]
 //! track = LeSynth Fourier 1
 //! source = lesynth voice.lsft
+//! state = Dexed.vststate
 //! gain = 1
 //! lead = 0 none
 //! autosave = 1
@@ -66,10 +69,14 @@ pub enum TrackSource {
     /// A LeSynth Fourier track carrying no grid — the plugin's own synth mode.
     LeSynthDefault,
     /// A custom VST3, by absolute path. Not portable, and cannot be: the plugin
-    /// is not ours to copy into the folder.
+    /// is not ours to copy into the folder. What *is* saved beside the manifest
+    /// is `state` — the plugin's own `IComponent` state, named relative to the
+    /// project folder. `None` means the project was saved before the plugin had
+    /// any state to keep, or by a build that did not save it.
     Vst {
         path: PathBuf,
         class_id: Option<[i8; 16]>,
+        state: Option<String>,
     },
     /// The row had no track assigned when it was saved.
     None,
@@ -81,6 +88,8 @@ impl TrackSource {
     pub fn required_path(&self, dir: &Path) -> Option<PathBuf> {
         match self {
             Self::LeSynth { file } => Some(dir.join(file)),
+            // The plugin itself. A missing `.vststate` is not fatal — the track
+            // loads with the plugin's defaults — so it is not required here.
             Self::Vst { path, .. } => Some(path.clone()),
             Self::LeSynthDefault | Self::None => None,
         }
@@ -128,6 +137,9 @@ impl Project {
             s += "\n[row]\n";
             s += &format!("track = {}\n", one_line(&row.track_name));
             s += &format!("source = {}\n", write_source(&row.source));
+            if let TrackSource::Vst { state: Some(file), .. } = &row.source {
+                s += &format!("state = {}\n", one_line(file));
+            }
             s += &format!("gain = {}\n", num(row.gain));
             s += &format!("lead = {}\n", write_duration(row.lead));
             s += &format!("autosave = {}\n", u8::from(row.autosave));
@@ -180,6 +192,13 @@ impl Project {
                 ("tempo", None) => project.tempo_bpm = value.parse().unwrap_or(120.0),
                 ("track", Some(row)) => row.track_name = value.to_string(),
                 ("source", Some(row)) => row.source = read_source(value)?,
+                // Belongs to the source above it, which is where the writer puts
+                // it. Ignored for any other kind of source.
+                ("state", Some(row)) => {
+                    if let TrackSource::Vst { state, .. } = &mut row.source {
+                        *state = Some(value.to_string());
+                    }
+                }
                 ("gain", Some(row)) => row.gain = value.parse().unwrap_or(1.0),
                 ("lead", Some(row)) => row.lead = read_duration(value)?,
                 ("autosave", Some(row)) => row.autosave = value != "0",
@@ -223,11 +242,16 @@ pub fn sanitize_name(name: &str) -> String {
 
 /// A `.lsft` file name for a track, unique within `taken`.
 pub fn grid_file_name(track_name: &str, taken: &[String]) -> String {
+    unique_file_name(track_name, "lsft", taken)
+}
+
+/// A file named after a track, with extension `ext`, unique within `taken`.
+pub fn unique_file_name(track_name: &str, ext: &str, taken: &[String]) -> String {
     let stem = sanitize_name(track_name);
-    let mut candidate = format!("{stem}.lsft");
+    let mut candidate = format!("{stem}.{ext}");
     let mut n = 2;
     while taken.iter().any(|t| t.eq_ignore_ascii_case(&candidate)) {
-        candidate = format!("{stem} {n}.lsft");
+        candidate = format!("{stem} {n}.{ext}");
         n += 1;
     }
     candidate
@@ -308,7 +332,9 @@ fn write_source(s: &TrackSource) -> String {
     match s {
         TrackSource::LeSynth { file } => format!("lesynth {}", one_line(file)),
         TrackSource::LeSynthDefault => "lesynth -".to_string(),
-        TrackSource::Vst { path, class_id } => {
+        // The state file, if any, rides on its own `state =` line: the path here
+        // is the rest of the line, so nothing can follow it.
+        TrackSource::Vst { path, class_id, .. } => {
             let mut out = format!("vst {}", one_line(&path.display().to_string()));
             if let Some(id) = class_id {
                 out = format!("vst:{} {}", hex_class(id), one_line(&path.display().to_string()));
@@ -336,10 +362,15 @@ fn read_source(v: &str) -> Result<TrackSource> {
         return Ok(TrackSource::Vst {
             path: PathBuf::from(rest),
             class_id: Some(class_from_hex(hex)?),
+            state: None,
         });
     }
     if kind == "vst" {
-        return Ok(TrackSource::Vst { path: PathBuf::from(rest), class_id: None });
+        return Ok(TrackSource::Vst {
+            path: PathBuf::from(rest),
+            class_id: None,
+            state: None,
+        });
     }
     bail!("unknown track source {v:?}")
 }
@@ -394,6 +425,7 @@ mod tests {
                     source: TrackSource::Vst {
                         path: PathBuf::from("/opt/vst3/some plugin.so"),
                         class_id: Some([1, 2, 3, -4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -16]),
+                        state: Some("some plugin.vststate".to_string()),
                     },
                     gain: 1.0,
                     lead: Duration::new(1, Fraction::Sixteenth),
@@ -421,6 +453,7 @@ mod tests {
         p.rows[1].source = TrackSource::Vst {
             path: PathBuf::from("/opt/vst3/weird = name (v2) [x86].so"),
             class_id: None,
+            state: Some("weird = name.vststate".to_string()),
         };
         p.name = "Song = 2".to_string();
         let back = Project::parse(&p.to_text()).expect("parses");
@@ -454,8 +487,17 @@ mod tests {
             TrackSource::None,
             TrackSource::LeSynthDefault,
             TrackSource::LeSynth { file: "a b.lsft".to_string() },
-            TrackSource::Vst { path: PathBuf::from("/x/y.so"), class_id: None },
-            TrackSource::Vst { path: PathBuf::from("/x/y.so"), class_id: Some([-1i8; 16]) },
+            TrackSource::Vst { path: PathBuf::from("/x/y.so"), class_id: None, state: None },
+            TrackSource::Vst {
+                path: PathBuf::from("/x/y.so"),
+                class_id: Some([-1i8; 16]),
+                state: None,
+            },
+            TrackSource::Vst {
+                path: PathBuf::from("/x/y.so"),
+                class_id: None,
+                state: Some("y.vststate".to_string()),
+            },
         ] {
             let mut p = sample();
             p.rows.truncate(1);
@@ -581,6 +623,7 @@ mod folder_tests {
         let src = TrackSource::Vst {
             path: PathBuf::from("/nowhere/plugin.so"),
             class_id: None,
+            state: Some("plugin.vststate".to_string()),
         };
         assert_eq!(src.required_path(Path::new("/x")).unwrap(), PathBuf::from("/nowhere/plugin.so"));
         assert!(src.describe().contains("plugin.so"));

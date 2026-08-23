@@ -17,17 +17,18 @@
 //! panel or a subtrack published from Resynthesis. Composer rows map onto one by
 //! id, so the registry, not any single panel, is what "all Tracks" means.
 //!
-//! Entries are *recipes*, not live plugins: a library path, a class id, and (for
-//! LeSynth) the grid to import, so a composition plays whether or not the
+//! Entries are *recipes*, not live plugins: a library path, a class id, and the
+//! state to load into a fresh instance — LeSynth's harmonic grid, or any other
+//! plugin's own `IComponent` state — so a composition plays whether or not the
 //! track's editor is open. When it is, [`TrackEntry::live`] points at that
-//! instance, so the Composer can snapshot the grid being edited right now.
+//! instance, so the Composer can snapshot what is being edited right now.
 //!
 //! GUI-thread only (`Rc<RefCell<_>>`) — every user of it is an egui panel.
 
 use std::cell::{Ref, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
 use crate::track_format::TrackState;
 use crate::vst::PluginInstance;
@@ -47,6 +48,10 @@ pub struct TrackEntry {
     /// Grid to import into a freshly loaded instance. `None` = the plugin's own
     /// default state (a plain synth-mode LeSynth, or any custom VST).
     pub state: Option<TrackState>,
+    /// The same idea for every other plugin: an opaque `IComponent` state, which
+    /// is where a third-party VST3 keeps the knob positions the user set in its
+    /// editor. `None` = whatever the plugin starts up with.
+    pub vst_state: Option<Vec<u8>>,
     /// The instance behind this track's open editor, if any. Weak so a closed
     /// editor is simply gone; the entry itself outlives it.
     pub live: Option<Weak<PluginInstance>>,
@@ -62,6 +67,7 @@ pub struct PlaybackSource {
     pub class_id: Option<[i8; 16]>,
     pub is_lesynth: bool,
     pub state: Option<TrackState>,
+    pub vst_state: Option<Vec<u8>>,
 }
 
 struct Inner {
@@ -102,9 +108,29 @@ impl TrackRegistry {
             class_id,
             is_lesynth,
             state,
+            vst_state: None,
             live: None,
         });
         id
+    }
+
+    /// Remember a plugin's own state for this track — what a freshly loaded
+    /// instance is given, and what a project save writes out. Set when a custom
+    /// VST3 editor closes, and when a project is loaded.
+    pub fn set_vst_state(&self, id: u64, state: Option<Vec<u8>>) {
+        if let Some(e) = self.0.borrow_mut().entries.iter_mut().find(|e| e.id == id) {
+            e.vst_state = state;
+        }
+    }
+
+    /// Remember a LeSynth grid for this track, the same way — set when its
+    /// editor closes, so the Composer keeps playing what was edited.
+    pub fn set_state(&self, id: u64, state: Option<TrackState>) {
+        if let Some(e) = self.0.borrow_mut().entries.iter_mut().find(|e| e.id == id) {
+            if state.is_some() {
+                e.state = state;
+            }
+        }
     }
 
     pub fn remove(&self, id: u64) {
@@ -161,23 +187,33 @@ impl TrackRegistry {
     pub fn playback_source(&self, id: u64) -> Option<PlaybackSource> {
         let inner = self.0.borrow();
         let entry = inner.entries.iter().find(|e| e.id == id)?;
-        let live_state = entry
-            .live
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .and_then(|p: Arc<PluginInstance>| match p.export_state() {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    log::debug!("live grid unavailable for '{}': {e}", entry.name);
-                    None
+        let live = entry.live.as_ref().and_then(Weak::upgrade);
+
+        // Whichever kind of state this track carries, prefer the open editor's:
+        // the user is composing with what they can hear there.
+        let (mut live_grid, mut live_vst) = (None, None);
+        if let Some(plugin) = live {
+            if entry.is_lesynth {
+                match plugin.export_state() {
+                    Ok(s) => live_grid = Some(s),
+                    Err(e) => log::debug!("live grid unavailable for '{}': {e}", entry.name),
                 }
-            });
+            } else {
+                // Every other VST3 keeps its knobs in its own opaque state.
+                match plugin.component_state() {
+                    Ok(bytes) if !bytes.is_empty() => live_vst = Some(bytes),
+                    Ok(_) => {}
+                    Err(e) => log::debug!("live state unavailable for '{}': {e:#}", entry.name),
+                }
+            }
+        }
         Some(PlaybackSource {
             name: entry.name.clone(),
             plugin_path: entry.plugin_path.clone(),
             class_id: entry.class_id,
             is_lesynth: entry.is_lesynth,
-            state: live_state.or_else(|| entry.state.clone()),
+            state: live_grid.or_else(|| entry.state.clone()),
+            vst_state: live_vst.or_else(|| entry.vst_state.clone()),
         })
     }
 }

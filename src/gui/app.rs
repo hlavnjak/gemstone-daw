@@ -252,13 +252,16 @@ impl DawApp {
         self.composer.set_status(status);
     }
 
-    /// Write the project folder: the manifest, plus one `.lsft` for every
-    /// LeSynth Fourier track a row plays. Returns how many grids were written.
+    /// Write the project folder: the manifest, one `.lsft` for every LeSynth
+    /// Fourier track a row plays, and one `.vststate` for every custom VST3 —
+    /// the plugin's own state, which is where its knobs live. Returns how many
+    /// sound files were written.
     ///
-    /// A grid is re-exported when any row playing it has autosave on; otherwise
-    /// an existing file is left as it is, which is what pins a sound. A track
-    /// with no grid at all (plain synth mode, or a custom VST) writes no file —
-    /// the manifest records what it is instead.
+    /// A file is re-written when any row playing that track has autosave on;
+    /// otherwise an existing one is left as it is, which is what pins a sound. A
+    /// track with nothing to save (a plain synth-mode LeSynth, or a plugin that
+    /// gives back no state) writes no file — the manifest records what it is
+    /// instead.
     fn save_project(&mut self, dir: &std::path::Path, name: &str) -> anyhow::Result<usize> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create {}", dir.display()))?;
@@ -277,9 +280,30 @@ impl DawApp {
             // what gets written is what the user can currently hear.
             let Some(src) = self.registry.playback_source(id) else { continue };
             if !src.is_lesynth {
+                // A third-party plugin's binary stays where it is — but the state
+                // it is playing does not live in the plugin, it lives in the
+                // instance, so the project keeps a copy beside the manifest.
+                let mut state_file = None;
+                if let Some(bytes) = &src.vst_state {
+                    let file = project::unique_file_name(&track_name, "vststate", &taken);
+                    let full = dir.join(&file);
+                    // Same rule as a grid: autosave off with a file already there
+                    // means "keep what is pinned".
+                    if autosave.contains(&id) || !full.exists() {
+                        std::fs::write(&full, bytes)
+                            .with_context(|| format!("write {}", full.display()))?;
+                        written += 1;
+                    }
+                    taken.push(file.clone());
+                    state_file = Some(file);
+                }
                 sources.insert(
                     id,
-                    TrackSource::Vst { path: src.plugin_path, class_id: src.class_id },
+                    TrackSource::Vst {
+                        path: src.plugin_path,
+                        class_id: src.class_id,
+                        state: state_file,
+                    },
                 );
                 continue;
             }
@@ -359,8 +383,20 @@ impl DawApp {
                 let state = crate::track_format::TrackState::read(&dir.join(file)).ok()?;
                 self.tracks.adopt_lesynth(name, Some(state)).ok()
             }
-            TrackSource::Vst { path, class_id } => {
-                self.tracks.adopt_vst(name, path.clone(), *class_id).ok()
+            TrackSource::Vst { path, class_id, state } => {
+                // A state file that has gone missing is not fatal: the track
+                // loads, and the plugin comes up on its own defaults.
+                let bytes = state.as_ref().and_then(|file| {
+                    let full = dir.join(file);
+                    match std::fs::read(&full) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            log::warn!("'{name}': cannot read {} ({e})", full.display());
+                            None
+                        }
+                    }
+                });
+                self.tracks.adopt_vst(name, path.clone(), *class_id, bytes).ok()
             }
         }
     }

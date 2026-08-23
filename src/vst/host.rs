@@ -1154,6 +1154,60 @@ impl PluginInstance {
         }
     }
 
+    /// The plugin's own saved state — `IComponent::getState`, which is how a
+    /// VST3 hands over everything it wants remembered (its parameters, and
+    /// whatever else it keeps) in a format only it understands.
+    ///
+    /// This is the general mechanism, and the only one a third-party plugin
+    /// has. LeSynth's harmonic grid travels separately, over
+    /// [`Self::export_state`], because the host itself has to read and write
+    /// that one.
+    pub fn component_state(&self) -> Result<Vec<u8>> {
+        unsafe {
+            let stream = MemoryStream::new();
+            let stream_ptr = stream
+                .to_com_ptr::<IBStream>()
+                .context("Failed to create a state stream")?;
+            let hr = self.component.as_com_ref().getState(stream_ptr.as_ptr());
+            anyhow::ensure!(hr == kResultOk, "'{}' would not save its state ({hr:#X})", self.name);
+            Ok(stream.bytes())
+        }
+    }
+
+    /// Put a state from [`Self::component_state`] back into this instance.
+    ///
+    /// The controller is told as well: the processor is what plays, but the
+    /// editor is what the user sees, and a plugin whose two halves disagree
+    /// opens showing values it is not using.
+    pub fn set_component_state(&self, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(!bytes.is_empty(), "empty plugin state");
+        unsafe {
+            let stream = MemoryStream::from_bytes(bytes);
+            let stream_ptr = stream
+                .to_com_ptr::<IBStream>()
+                .context("Failed to create a state stream")?;
+            let hr = self.component.as_com_ref().setState(stream_ptr.as_ptr());
+            anyhow::ensure!(
+                hr == kResultOk,
+                "'{}' would not load the saved state ({hr:#X})",
+                self.name
+            );
+            stream.rewind();
+            let hr = self
+                .controller
+                .as_com_ref()
+                .setComponentState(stream_ptr.as_ptr());
+            if hr != kResultOk {
+                log::debug!(
+                    "'{}' controller declined the state ({hr:#X}); its editor may \
+                     show stale values",
+                    self.name
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Create plugin editor view (returns raw pointer for window embedding).
     /// Returns None if the plugin has no editor.
     pub fn create_view(&self) -> Option<ComPtr<vst3::Steinberg::IPlugView>> {
@@ -1357,4 +1411,76 @@ pub mod class_ids {
     pub const FOURIER_SYNTH: [i8; 16] = [
         76, 101, 83, 121, 110, 116, 104, 70, 111, 117, 114, 105, 101, 114, 48, 49,
     ];
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vst3::Steinberg::Vst::ParameterInfo;
+
+    /// The embedded plugin, which every checkout has.
+    fn internal_plugin() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("internal_plugins")
+            .join("liblesynth_fourier.so")
+    }
+
+    /// `(id, normalized value)` of the plugin's first parameter.
+    fn first_parameter(plugin: &PluginInstance) -> Option<(u32, f64)> {
+        unsafe {
+            let ctrl = plugin.controller.as_com_ref();
+            let mut info: ParameterInfo = zeroed();
+            if ctrl.getParameterCount() < 1 || ctrl.getParameterInfo(0, &mut info) != kResultOk {
+                return None;
+            }
+            Some((info.id, ctrl.getParamNormalized(info.id)))
+        }
+    }
+
+    /// A plugin's own state is how the host carries the knobs a user set —
+    /// out of an editor's instance and into the one the Composer plays, and into
+    /// a project file. Anything less and a custom VST3 always plays its defaults.
+    ///
+    /// This is the general path: it goes through `IComponent::getState`, which
+    /// every VST3 has, rather than LeSynth's grid ABI, which only ours does.
+    #[test]
+    fn a_plugins_own_state_carries_its_parameters_to_another_instance() {
+        let path = internal_plugin();
+        let Ok(edited) = PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) else {
+            println!("no internal plugin at {} — nothing to test", path.display());
+            return;
+        };
+        let Some((id, original)) = first_parameter(&edited) else {
+            println!("the plugin exposes no parameters — nothing to test");
+            return;
+        };
+
+        // Something unmistakably different from where it started.
+        let changed = if original > 0.5 { 0.125 } else { 0.875 };
+        unsafe {
+            edited.controller.as_com_ref().setParamNormalized(id, changed);
+        }
+        let state = edited.component_state().expect("save state");
+        assert!(!state.is_empty(), "the plugin saved an empty state");
+
+        // A second instance starts where the first one did, not where it ended.
+        let fresh = PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None)
+            .expect("load a second instance");
+        let (_, before) = first_parameter(&fresh).expect("parameters");
+        assert!(
+            (before - original).abs() < 1e-6,
+            "a fresh instance should start at {original}, not {before}"
+        );
+
+        fresh.set_component_state(&state).expect("restore state");
+        let (_, after) = first_parameter(&fresh).expect("parameters");
+        assert!(
+            (after - changed).abs() < 1e-6,
+            "the restored instance is at {after}, not the {changed} that was saved"
+        );
+
+        // And it can hand the same state on again, which is what a project save
+        // after a load has to do.
+        let again = fresh.component_state().expect("save state again");
+        assert_eq!(again, state, "the state did not survive a round trip");
+    }
 }

@@ -162,6 +162,10 @@ struct PluginTrack {
     /// A saved grid to push into the instance when its editor is opened (set for
     /// tracks created via "Load LeSynth Fourier Track").
     import_state: Option<TrackState>,
+    /// The same for a custom VST3: its own `IComponent` state, which is where it
+    /// keeps the knobs the user set. Captured when the editor closes and restored
+    /// when it opens, so the sound survives the window and reaches the Composer.
+    vst_state: Option<Vec<u8>>,
     editor: Option<EditorInstance>,
 }
 
@@ -182,6 +186,15 @@ impl PluginTrack {
             self.class_id.as_ref(),
             token,
         )?);
+
+        // A custom VST3's own state goes in before activation, as the spec has
+        // it — and before the window opens, so the editor draws the knobs the
+        // user left rather than the plugin's defaults.
+        if let Some(bytes) = &self.vst_state {
+            if let Err(e) = inst.set_component_state(bytes) {
+                log::warn!("Track state restore failed: {e:#}");
+            }
+        }
 
         let (sr, block) = AudioEngine::query_device_config()
             .map(|c| (c.sample_rate, c.max_buffer_size as i32))
@@ -204,9 +217,39 @@ impl PluginTrack {
         self.kind == TrackKind::LeSynth && self.editor.is_some()
     }
 
-    /// Drop the editor if its window was closed directly, freeing the instance.
-    fn reap_editor(&mut self) {
+    /// Take what the open editor is playing and keep it on the track, so closing
+    /// the window does not throw the user's edits away.
+    ///
+    /// Without this the Composer would fall back to the state the track was
+    /// registered with the moment an editor closed — the plugin's defaults, for
+    /// a custom VST3 whose knobs had just been set by hand.
+    fn capture_editor_state(&mut self, registry: &TrackRegistry) {
+        let Some(editor) = &self.editor else { return };
+        match self.kind {
+            TrackKind::LeSynth => {
+                // An instance in plain synth mode has no grid to export; that is
+                // not a failure, it is a track with nothing to remember.
+                if let Ok(state) = editor.export_state() {
+                    registry.set_state(self.registry_id, Some(state.clone()));
+                    self.import_state = Some(state);
+                }
+            }
+            TrackKind::CustomVst => match editor.plugin().component_state() {
+                Ok(bytes) if !bytes.is_empty() => {
+                    registry.set_vst_state(self.registry_id, Some(bytes.clone()));
+                    self.vst_state = Some(bytes);
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("'{}' state capture failed: {e:#}", self.name),
+            },
+        }
+    }
+
+    /// Drop the editor if its window was closed directly, freeing the instance —
+    /// keeping what it was playing first.
+    fn reap_editor(&mut self, registry: &TrackRegistry) {
         if self.editor.as_ref().is_some_and(EditorInstance::is_closed) {
+            self.capture_editor_state(registry);
             self.editor = None;
         }
     }
@@ -366,6 +409,7 @@ impl TracksPanel {
             plugin_path: path,
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: None,
+            vst_state: None,
             editor: None,
         });
         self.status = "Created LeSynth Fourier track.".to_string();
@@ -397,6 +441,7 @@ impl TracksPanel {
             plugin_path: path,
             class_id: None,
             import_state: None,
+            vst_state: None,
             editor: None,
         });
         self.status = format!("Created custom VST track '{name}'.");
@@ -534,23 +579,28 @@ impl TracksPanel {
             plugin_path: path,
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: state,
+            vst_state: None,
             editor: None,
         });
         Ok(registry_id)
     }
 
     /// Adopt a custom VST3 track by path — the other half of loading a project.
+    /// `vst_state` is the plugin's own saved state from the project, restored
+    /// into every instance the track loads.
     pub fn adopt_vst(
         &mut self,
         name: &str,
         path: PathBuf,
         class_id: Option<[i8; 16]>,
+        vst_state: Option<Vec<u8>>,
     ) -> Result<u64> {
         if !path.exists() {
             anyhow::bail!("plugin not found at {}", path.display());
         }
         let id = self.take_id();
         let registry_id = self.registry.add(name, path.clone(), class_id, false, None);
+        self.registry.set_vst_state(registry_id, vst_state.clone());
         self.tracks.push(PluginTrack {
             id,
             registry_id,
@@ -559,6 +609,7 @@ impl TracksPanel {
             plugin_path: path,
             class_id,
             import_state: None,
+            vst_state,
             editor: None,
         });
         Ok(registry_id)
@@ -620,6 +671,7 @@ impl TracksPanel {
             plugin_path,
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: Some(state),
+            vst_state: None,
             editor: None,
         });
         self.status = "Loaded LeSynth track — open its editor to view.".to_string();
@@ -701,7 +753,7 @@ impl TracksPanel {
         // in step with them — that is what lets the Composer play a grid the
         // user is editing right now.
         for track in &mut self.tracks {
-            track.reap_editor();
+            track.reap_editor(&self.registry);
             self.registry.set_live(
                 track.registry_id,
                 track.editor.as_ref().map(|e| Arc::downgrade(e.plugin())),
@@ -784,12 +836,15 @@ impl TracksPanel {
             }
             Some(Action::Close(idx)) => {
                 if let Some(track) = self.tracks.get_mut(idx) {
+                    track.capture_editor_state(&self.registry);
                     track.editor = None;
                 }
             }
             Some(Action::Export(idx)) => self.export_track(idx),
             Some(Action::Remove(idx)) => {
                 if idx < self.tracks.len() {
+                    // Nothing to capture: the track is going, and with it the
+                    // registry entry any state would have been kept in.
                     let removed = self.tracks.remove(idx);
                     // Composer rows pointing here fall back to another track on
                     // their next frame.

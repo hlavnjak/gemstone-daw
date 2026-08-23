@@ -77,6 +77,11 @@ rows may share the same one.
 - **Load Internal plugin** — loads the embedded LeSynth Fourier VST3
   (`internal_plugins/liblesynth_fourier.so`, committed precompiled) by its class
   ID. No separate plugin install required.
+- **Custom VST3 sounds are kept.** What a plugin is playing — the knobs set in
+  its own editor — is taken from the instance when its editor closes, handed to
+  the Composer's instances, and written into the project folder as a
+  `.vststate` beside the manifest. It travels over `IComponent::getState`, the
+  mechanism every VST3 has, rather than LeSynth's grid ABI, which only ours does.
 - **External VST3 plugins** — "Create Custom VST Track" lists the plugins
   installed in the standard locations (`VST3_PATH`, `~/.vst3`, `/usr/lib/vst3`,
   `/usr/local/lib/vst3`) and can browse for a `.vst3` bundle or a plugin library

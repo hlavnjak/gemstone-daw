@@ -69,6 +69,7 @@ fn lesynth_source() -> PlaybackSource {
         class_id: Some(class_ids::FOURIER_SYNTH),
         is_lesynth: true,
         state: Some(grid()),
+        vst_state: None,
     }
 }
 

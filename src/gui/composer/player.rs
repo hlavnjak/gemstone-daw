@@ -446,6 +446,14 @@ fn prepare_voices(
                 continue;
             }
         };
+        // Before activation, as the spec has it: a plugin sizes its buffers for
+        // the state it is given. This is where a third-party VST3's knobs come
+        // back — what the user set in its editor, or what the project saved.
+        if let Some(bytes) = &plan.source.vst_state {
+            if let Err(e) = inst.set_component_state(bytes) {
+                log::warn!("Composer: '{}' state restore failed: {e:#}", plan.source.name);
+            }
+        }
         let _ = inst.initialize_audio(sample_rate, max_block);
         if let Some(state) = &plan.source.state {
             if let Err(e) = inst.import_state(state) {

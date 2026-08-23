@@ -346,6 +346,22 @@ impl MemoryStream {
         ComWrapper::new(MemoryStream::default())
     }
 
+    /// A stream already holding `bytes`, positioned at the start — what a plugin
+    /// reads its saved state out of.
+    pub fn from_bytes(bytes: &[u8]) -> ComWrapper<MemoryStream> {
+        ComWrapper::new(MemoryStream {
+            inner: Mutex::new(StreamInner {
+                data: bytes.to_vec(),
+                pos: 0,
+            }),
+        })
+    }
+
+    /// Everything written to the stream so far.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.inner.lock().unwrap().data.clone()
+    }
+
     /// Rewind to the start — what the host does between writing a component's
     /// state and handing the same stream to the controller.
     pub fn rewind(&self) {
