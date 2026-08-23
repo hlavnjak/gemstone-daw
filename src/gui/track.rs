@@ -37,7 +37,8 @@ use super::registry::TrackRegistry;
 use crate::audio::AudioEngine;
 use crate::midi::MidiEventQueue;
 use crate::track_format::TrackState;
-use crate::vst::{class_ids, next_instance_token, validate_module, PluginInstance};
+use crate::midi::plays_a_drum_kit;
+use crate::vst::{class_ids, next_instance_token, scan_classes, validate_module, PluginInstance};
 
 /// A live plugin editor: the loaded instance, its editor-window thread and an
 /// audio stream driving `process()` so the plugin's in-GUI piano is audible.
@@ -313,6 +314,30 @@ impl PluginBrowser {
     }
 }
 
+/// Whether this plugin plays a drum kit, so the Composer can name its notes.
+///
+/// Asks the plugin first — its VST3 subcategories are the precise answer — and
+/// falls back to the name, which is what catches the many that declare
+/// themselves a plain instrument. The scan opens the module and closes it again;
+/// if that fails the track is still perfectly usable, so the name alone decides.
+fn is_a_drum_kit(path: &std::path::Path, name: &str) -> bool {
+    match scan_classes(path) {
+        Ok(classes) => {
+            let audio = classes
+                .iter()
+                .find(|c| c.category == "Audio Module Class")
+                .or_else(|| classes.first());
+            let by_class = audio
+                .is_some_and(|c| plays_a_drum_kit(&c.name, &c.subcategories));
+            by_class || plays_a_drum_kit(name, "")
+        }
+        Err(e) => {
+            log::debug!("cannot scan {} for its category ({e:#})", path.display());
+            plays_a_drum_kit(name, "")
+        }
+    }
+}
+
 /// The directories a VST3 is installed into, most specific first. `VST3_PATH`
 /// overrides nothing — it adds to the list, as it does for other hosts.
 pub fn vst3_search_paths() -> Vec<PathBuf> {
@@ -432,6 +457,8 @@ impl TracksPanel {
         // Take the first audio-module class in the factory — we don't know the
         // plugin's own class id, and a bundle may hold several classes.
         let registry_id = self.registry.add(&name, path.clone(), None, false, None);
+        self.registry
+            .set_percussion(registry_id, is_a_drum_kit(&path, &name));
         let id = self.take_id();
         self.tracks.push(PluginTrack {
             id,
@@ -601,6 +628,8 @@ impl TracksPanel {
         let id = self.take_id();
         let registry_id = self.registry.add(name, path.clone(), class_id, false, None);
         self.registry.set_vst_state(registry_id, vst_state.clone());
+        self.registry
+            .set_percussion(registry_id, is_a_drum_kit(&path, name));
         self.tracks.push(PluginTrack {
             id,
             registry_id,

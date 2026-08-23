@@ -39,6 +39,12 @@ rows may share the same one.
 - **A row is a sequence of frames**, laid left to right and simply played one
   after another: nothing is positioned by hand, nothing is dragged, and nothing
   can overlap. Deleting a frame pulls everything behind it forward.
+- **Drum tracks name their notes.** On a row playing a plugin recognised as a
+  drum kit, the pitch box reads `C2 · Bass Drum (Kick)` rather than `C2`, and a
+  new note starts on the kick instead of middle C. The names are General MIDI's,
+  which is the map nearly every kit follows; they are added to the pitch, never
+  swapped for it, so a kit laid out some other way still shows what is sent. The
+  map and the rule that spots a drum plugin are in `src/midi/drums.rs`.
 - **Notes and spaces.** "➕ Add Note" appends two frames: a **note** frame
   (blue), and behind it a **space** frame (amber) which is the silence that
   follows. A note frame carries three select boxes — pitch (`C0`–`B8`), the

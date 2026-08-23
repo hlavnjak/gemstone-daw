@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+pub mod drums;
 pub mod input;
 
+pub use drums::{gm_percussion_name, plays_a_drum_kit};
 pub use input::{MidiEventQueue, spawn_midi_thread, new_midi_queue, list_usb_midi_keyboards};

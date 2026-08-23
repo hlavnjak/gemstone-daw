@@ -45,6 +45,9 @@ pub struct TrackEntry {
     pub class_id: Option<[i8; 16]>,
     /// LeSynth tracks can carry a grid and be tagged for state import/export.
     pub is_lesynth: bool,
+    /// This track plays a drum kit, so its notes are named after what they hit
+    /// rather than left as pitches. See [`crate::midi::plays_a_drum_kit`].
+    pub percussion: bool,
     /// Grid to import into a freshly loaded instance. `None` = the plugin's own
     /// default state (a plain synth-mode LeSynth, or any custom VST).
     pub state: Option<TrackState>,
@@ -107,11 +110,30 @@ impl TrackRegistry {
             plugin_path,
             class_id,
             is_lesynth,
+            percussion: false,
             state,
             vst_state: None,
             live: None,
         });
         id
+    }
+
+    /// Record that this track plays a drum kit, which is what puts drum names in
+    /// the Composer's note pickers.
+    pub fn set_percussion(&self, id: u64, percussion: bool) {
+        if let Some(e) = self.0.borrow_mut().entries.iter_mut().find(|e| e.id == id) {
+            e.percussion = percussion;
+        }
+    }
+
+    /// Whether this track plays a drum kit. `false` for a track that is gone.
+    pub fn is_percussion(&self, id: u64) -> bool {
+        self.0
+            .borrow()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .is_some_and(|e| e.percussion)
     }
 
     /// Remember a plugin's own state for this track — what a freshly loaded

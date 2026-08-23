@@ -44,6 +44,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 use self::player::{CompositionPlayer, PlannedNote, RowEdit, RowPlan};
+use crate::midi::gm_percussion_name;
 use super::registry::TrackRegistry;
 
 /// Time resolution: a whole note is this many units. 256 makes every fraction in
@@ -69,6 +70,9 @@ const PITCH_MIN: u8 = 12;
 const PITCH_MAX: u8 = 119;
 /// A new note starts at middle C.
 const DEFAULT_PITCH: u8 = 60;
+/// …unless the row plays a drum kit, where middle C is a bongo and the note
+/// anyone wants first is the kick.
+const DEFAULT_DRUM_PITCH: u8 = 36;
 /// Largest whole-note count a length may carry.
 const MAX_WHOLES: u8 = 16;
 
@@ -168,6 +172,19 @@ fn pitch_name(pitch: u8) -> String {
     format!("{}{}", NAMES[(pitch % 12) as usize], pitch as i32 / 12 - 1)
 }
 
+/// What a note is called on a row, which depends on what the row plays: a pitch
+/// on an instrument, and the drum it hits on a kit.
+///
+/// The drum name is a General MIDI one, and it is shown *beside* the pitch, not
+/// instead of it: on a kit whose pads are not GM the note still plays whatever
+/// is on the pad, and the pitch — the thing actually sent — stays visible.
+fn note_label(pitch: u8, percussion: bool) -> String {
+    match percussion.then(|| gm_percussion_name(pitch)).flatten() {
+        Some(drum) => format!("{} · {drum}", pitch_name(pitch)),
+        None => pitch_name(pitch),
+    }
+}
+
 /// A note and the space tied behind it — two frames on screen, one thing in the
 /// model. They are stored together rather than as two entries in the row
 /// because the space is not independently removable: it exists only as the
@@ -257,12 +274,12 @@ impl Row {
 
     /// Append a note and, tied behind it, the space that separates it from
     /// whatever comes next.
-    fn add_note(&mut self) {
+    fn add_note(&mut self, pitch: u8) {
         let id = self.next_item_id;
         self.next_item_id += 1;
         self.items.push(Item {
             id,
-            pitch: DEFAULT_PITCH,
+            pitch,
             dur: Duration::new(0, Fraction::Quarter),
             space: Duration::new(0, Fraction::Eighth),
         });
@@ -872,6 +889,13 @@ impl ComposerPanel {
     fn lanes_ui(&mut self, ui: &mut egui::Ui, tracks: &[(u64, String)]) {
         let mut remove_row: Option<usize> = None;
         let playhead = self.playhead_units();
+        // Resolved before the loop: `self.rows` is borrowed mutably inside it,
+        // and the registry is what knows a drum track from an instrument.
+        let percussion: Vec<bool> = self
+            .rows
+            .iter()
+            .map(|r| r.track_id.is_some_and(|id| self.registry.is_percussion(id)))
+            .collect();
 
         for (idx, row) in self.rows.iter_mut().enumerate() {
             let row_id = row.id;
@@ -951,7 +975,11 @@ impl ComposerPanel {
                                             )
                                             .clicked()
                                         {
-                                            row.add_note();
+                                            row.add_note(if percussion[idx] {
+                                                DEFAULT_DRUM_PITCH
+                                            } else {
+                                                DEFAULT_PITCH
+                                            });
                                         }
                                         ui.label("Gain");
                                         ui.spacing_mut().slider_width = 76.0;
@@ -981,7 +1009,7 @@ impl ComposerPanel {
                                 // them, which would otherwise clip the cards.
                                 .max_height(ROW_H + 12.0)
                                 .show(ui, |ui| {
-                                    Self::chain_ui(ui, row, playhead);
+                                    Self::chain_ui(ui, row, playhead, percussion[idx]);
                                 });
                         });
                     });
@@ -1002,7 +1030,7 @@ impl ComposerPanel {
     /// frame's length or pitch is immediate; everything after it simply shifts,
     /// because a frame's position is nothing but the sum of the lengths before
     /// it.
-    fn chain_ui(ui: &mut egui::Ui, row: &mut Row, playhead: Option<f64>) {
+    fn chain_ui(ui: &mut egui::Ui, row: &mut Row, playhead: Option<f64>, percussion: bool) {
         // Deferred: removing a frame rewrites the list this loop walks.
         let mut pending_delete: Option<usize> = None;
         // Taken before the frames are drawn, so an edit made in one frame moves
@@ -1022,7 +1050,7 @@ impl ComposerPanel {
             // so it stays put when that note is deleted and leads the next one
             // instead. Drawn only when there is a note for it to lead.
             if !row.items.is_empty() {
-                Self::frame_ui(ui, row_id, LEAD_SPACE_ID, None, &mut row.lead, false);
+                Self::frame_ui(ui, row_id, LEAD_SPACE_ID, None, &mut row.lead, false, percussion);
             }
             for (idx, (item, start)) in row.items.iter_mut().zip(starts).enumerate() {
                 let sounding = playhead
@@ -1034,12 +1062,13 @@ impl ComposerPanel {
                     Some(&mut item.pitch),
                     &mut item.dur,
                     sounding,
+                    percussion,
                 ) {
                     pending_delete = Some(idx);
                 }
                 // The space tied to it, drawn right behind it and carrying no
                 // delete button of its own: it leaves only with its note.
-                Self::frame_ui(ui, row_id, item.id, None, &mut item.space, false);
+                Self::frame_ui(ui, row_id, item.id, None, &mut item.space, false, percussion);
             }
         });
 
@@ -1054,6 +1083,8 @@ impl ComposerPanel {
     /// (pitch, two length boxes, delete); `None` the amber space frame, which has
     /// *no delete button* — a space leaves only with its note, and the row's lead
     /// space never leaves at all.
+    ///
+    /// `percussion` names the notes after what they hit on a drum kit.
     fn frame_ui(
         ui: &mut egui::Ui,
         row_id: u64,
@@ -1061,6 +1092,7 @@ impl ComposerPanel {
         pitch: Option<&mut u8>,
         dur: &mut Duration,
         sounding: bool,
+        percussion: bool,
     ) -> bool {
         let space = pitch.is_none();
         let (fill, stroke, header) = match (space, sounding) {
@@ -1121,7 +1153,7 @@ impl ComposerPanel {
                                     // one space that is not the silence after
                                     // some note and does not leave with one.
                                     let title = match &pitch {
-                                        Some(p) => format!("{} · {}", pitch_name(**p), dur.label()),
+                                        Some(p) => format!("{} · {}", note_label(**p, percussion), dur.label()),
                                         None if id == LEAD_SPACE_ID => {
                                             format!("lead · {}", dur.label())
                                         }
@@ -1138,17 +1170,27 @@ impl ComposerPanel {
                         });
 
                         if let Some(pitch) = pitch {
-                            egui::ComboBox::from_id_salt(("pitch", row_id, id))
+                            // The popup measures itself once per id and keeps
+                            // that width forever, so the id carries `percussion`
+                            // — a row moved from a synth to a drum kit gets a
+                            // fresh popup instead of one sized for bare pitches.
+                            egui::ComboBox::from_id_salt(("pitch", row_id, id, percussion))
                                 .width(inner_w)
                                 .height(260.0)
-                                .selected_text(pitch_name(*pitch))
+                                .selected_text(note_label(*pitch, percussion))
                                 .show_ui(ui, |ui| {
                                     for p in PITCH_MIN..=PITCH_MAX {
-                                        ui.selectable_value(pitch, p, pitch_name(p));
+                                        ui.selectable_value(pitch, p, note_label(p, percussion));
                                     }
                                 })
                                 .response
-                                .on_hover_text("Pitch");
+                                .on_hover_text(if percussion {
+                                    "Which drum to hit. The name is General MIDI's, \
+                                     which is the map nearly every kit follows; the \
+                                     note is what is actually sent."
+                                } else {
+                                    "Pitch"
+                                });
                         }
 
                         // Both boxes reach zero, and for a space that is the
@@ -1328,6 +1370,21 @@ mod tests {
         panel
     }
 
+    /// A drum track names its notes after what they hit; an instrument track
+    /// leaves them as pitches. The name is *added* to the pitch, never swapped
+    /// for it — a kit that is not General MIDI still shows what is being sent.
+    #[test]
+    fn a_drum_row_labels_its_notes_with_the_drum() {
+        assert_eq!(note_label(36, false), "C2");
+        assert_eq!(note_label(36, true), "C2 · Bass Drum (Kick)");
+        assert_eq!(note_label(42, true), "F#2 · Closed Hi-Hat");
+        // Outside the General MIDI percussion range there is nothing to add.
+        assert_eq!(note_label(100, true), "E7");
+        // And the first note on a drum row is the kick, not middle C's bongo.
+        assert_eq!(gm_percussion_name(DEFAULT_DRUM_PITCH), Some("Bass Drum (Kick)"));
+        assert_eq!(gm_percussion_name(DEFAULT_PITCH), Some("Hi Bongo"));
+    }
+
     /// What a live edit may and may not change, which is what decides whether the
     /// looping transport can take it or the user has to press Play again.
     ///
@@ -1428,7 +1485,7 @@ mod tests {
         assert!(row.items.is_empty());
         assert_eq!(row.lead, frac(Fraction::Eighth));
         assert_eq!(row.end_units(), 0, "an empty row has nothing to wait for");
-        row.add_note();
+        row.add_note(DEFAULT_PITCH);
         assert_eq!(row.starts(), vec![EIGHTH]);
     }
 
@@ -1437,13 +1494,13 @@ mod tests {
     #[test]
     fn adding_a_note_appends_the_note_and_a_space_behind_it() {
         let mut row = row_with(&[]);
-        row.add_note();
+        row.add_note(DEFAULT_PITCH);
         assert_eq!(row.items.len(), 1);
         assert_eq!(row.items[0].pitch, DEFAULT_PITCH);
         assert!(row.items[0].dur.units() > 0);
         assert!(row.items[0].space.units() > 0);
 
-        row.add_note();
+        row.add_note(DEFAULT_PITCH);
         assert_eq!(row.items.len(), 2);
         // Ids stay unique, so two items never share a widget id.
         assert_ne!(row.items[0].id, row.items[1].id);
@@ -1671,8 +1728,8 @@ mod tests {
         panel.add_row();
         frame(&mut panel); // a row with no frames yet
 
-        panel.rows[0].add_note();
-        panel.rows[0].add_note();
+        panel.rows[0].add_note(DEFAULT_PITCH);
+        panel.rows[0].add_note(DEFAULT_PITCH);
         frame(&mut panel);
 
         // The lead space is drawn too, and must lay out at a real length as
@@ -1684,7 +1741,7 @@ mod tests {
         // the boxes can name, and a zero-length placeholder space, are the two
         // extremes a frame has to lay out at.
         panel.add_row();
-        panel.rows[1].add_note();
+        panel.rows[1].add_note(DEFAULT_PITCH);
         panel.rows[1].items[0].dur = Duration::new(MAX_WHOLES, Fraction::TwoHundredFiftySixth);
         panel.rows[1].items[0].space = Duration::new(0, Fraction::None);
         frame(&mut panel);

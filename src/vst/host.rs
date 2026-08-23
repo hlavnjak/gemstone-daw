@@ -23,8 +23,7 @@ use libloading::Library;
 use crate::track_format::TrackState;
 
 use vst3::Steinberg::{
-    kResultOk, FUnknown, IBStream, IPluginFactory, IPluginFactoryTrait, IPluginBaseTrait,
-    PClassInfo, TUID,
+    kResultOk, FUnknown, IBStream, IPluginFactory, IPluginFactoryTrait, IPluginBaseTrait, TUID,
 };
 use vst3::Steinberg::Vst::{
     BusDirections_, BusInfo, IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait,
@@ -36,7 +35,7 @@ use vst3::{ComPtr, ComRef, ComWrapper, Interface};
 
 use super::handler::ParamChangeHandler;
 use super::host_context::{HostApplication, MemoryStream};
-use super::module::Vst3Module;
+use super::module::{classes, Vst3Module};
 
 // LeSynth Fourier's host-facing analysis C ABI (see lesynth-fourier/src/lib.rs).
 // `contour` (ptr,len) is the per-position fundamental in Hz, uniformly resampled
@@ -1258,36 +1257,31 @@ fn select_class(
     class_id: Option<&[i8; 16]>,
 ) -> Result<([i8; 16], String)> {
     const AUDIO_MODULE_CLASS: &str = "Audio Module Class";
-    unsafe {
-        let count = factory.countClasses();
-        let mut fallback: Option<([i8; 16], String)> = None;
-        for idx in 0..count {
-            let mut info: PClassInfo = zeroed();
-            if factory.getClassInfo(idx, &mut info) != kResultOk {
-                continue;
+    let mut fallback: Option<([i8; 16], String)> = None;
+    for (idx, class) in classes(factory).into_iter().enumerate() {
+        log::info!(
+            "  class {idx}: '{}' [{}] {}",
+            class.name,
+            class.category,
+            class.subcategories
+        );
+        if let Some(target) = class_id {
+            if class.cid == *target {
+                return Ok((class.cid, class.name));
             }
-            let name = c_array_to_string(&info.name);
-            let category = c_array_to_string(&info.category);
-            log::info!("  class {idx}: '{name}' [{category}]");
-
-            if let Some(target) = class_id {
-                if info.cid == *target {
-                    return Ok((info.cid, name));
-                }
-                continue;
-            }
-            if category == AUDIO_MODULE_CLASS {
-                return Ok((info.cid, name));
-            }
-            fallback.get_or_insert((info.cid, name));
+            continue;
         }
-        if class_id.is_some() {
-            bail!("the requested plugin class is not in this factory");
+        if class.category == AUDIO_MODULE_CLASS {
+            return Ok((class.cid, class.name));
         }
-        // No class called itself an audio module: take whatever there was, so a
-        // plugin with an unusual category is still worth a try.
-        fallback.context("the plugin's factory offers no classes at all")
+        fallback.get_or_insert((class.cid, class.name));
     }
+    if class_id.is_some() {
+        bail!("the requested plugin class is not in this factory");
+    }
+    // No class called itself an audio module: take whatever there was, so a
+    // plugin with an unusual category is still worth a try.
+    fallback.context("the plugin's factory offers no classes at all")
 }
 
 /// Create the edit controller a component names, for plugins whose two halves are
@@ -1399,11 +1393,6 @@ fn speaker_arrangement(channels: usize) -> u64 {
     }
 }
 
-/// A NUL-terminated `char8` array from class info as a Rust string.
-fn c_array_to_string(bytes: &[i8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end].iter().map(|&b| b as u8).collect::<Vec<u8>>()).into_owned()
-}
 
 /// Well-known class IDs
 pub mod class_ids {

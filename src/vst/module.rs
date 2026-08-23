@@ -32,8 +32,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
-use vst3::ComPtr;
-use vst3::Steinberg::IPluginFactory;
+use vst3::Steinberg::{
+    kResultOk, IPluginFactory, IPluginFactory2, IPluginFactory2Trait, IPluginFactoryTrait,
+    PClassInfo, PClassInfo2,
+};
+use vst3::{ComPtr, ComRef};
 
 type GetPluginFactoryProc = unsafe extern "C" fn() -> *mut IPluginFactory;
 /// `bool ModuleEntry(void* sharedLibraryHandle)` — Linux; the handle is the
@@ -150,6 +153,70 @@ pub fn validate_module(path: &Path) -> Result<PathBuf> {
         }
         Err(not_a_vst3(&library, &resolved))
     }
+}
+
+/// What a factory says about one of its classes.
+#[derive(Clone, Debug, Default)]
+pub struct ModuleClass {
+    pub cid: [i8; 16],
+    /// The plugin's own display name.
+    pub name: String,
+    /// `Audio Module Class` for something that makes sound.
+    pub category: String,
+    /// `Instrument|Drum`, `Fx|Delay`, … — the plugin's declaration of what it
+    /// *is*, and the only precise way to know a drum kit from a synth. Empty
+    /// when the factory is too old to be asked (`IPluginFactory2`).
+    pub subcategories: String,
+}
+
+/// Ask a plugin what it is, without creating an instance of it.
+///
+/// This is a scan, not a load: the module is opened, its factory read, and the
+/// module closed again. It costs one `dlopen` and the plugin's `ModuleEntry`,
+/// which is what any host's plugin scan costs.
+pub fn scan_classes(path: &Path) -> Result<Vec<ModuleClass>> {
+    let module = Vst3Module::open(path)?;
+    let factory = module.factory()?;
+    Ok(classes(factory.as_com_ref()))
+}
+
+/// Every class in a factory, with the richer `getClassInfo2` fields where the
+/// factory supports them.
+pub fn classes(factory: ComRef<'_, IPluginFactory>) -> Vec<ModuleClass> {
+    unsafe {
+        let factory2 = factory.cast::<IPluginFactory2>();
+        (0..factory.countClasses())
+            .filter_map(|idx| {
+                if let Some(f2) = &factory2 {
+                    let mut info: PClassInfo2 = std::mem::zeroed();
+                    if f2.as_com_ref().getClassInfo2(idx, &mut info) == kResultOk {
+                        return Some(ModuleClass {
+                            cid: info.cid,
+                            name: c_string(&info.name),
+                            category: c_string(&info.category),
+                            subcategories: c_string(&info.subCategories),
+                        });
+                    }
+                }
+                let mut info: PClassInfo = std::mem::zeroed();
+                if factory.getClassInfo(idx, &mut info) == kResultOk {
+                    return Some(ModuleClass {
+                        cid: info.cid,
+                        name: c_string(&info.name),
+                        category: c_string(&info.category),
+                        subcategories: String::new(),
+                    });
+                }
+                None
+            })
+            .collect()
+    }
+}
+
+/// A NUL-terminated `char8` array from class info as a Rust string.
+fn c_string(bytes: &[i8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    bytes[..end].iter().map(|&b| b as u8 as char).collect()
 }
 
 /// A loaded VST3 module: the library, kept alive, plus the `ModuleEntry` /

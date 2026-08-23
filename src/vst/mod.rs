@@ -18,5 +18,5 @@ pub mod host_context;
 pub mod module;
 
 pub use host::{class_ids, next_instance_token, AnalysisGrid, PluginInstance, PluginIo};
-pub use module::{resolve_module_path, validate_module, Vst3Module};
+pub use module::{resolve_module_path, scan_classes, validate_module, ModuleClass, Vst3Module};
 pub use event_list::EventList;
