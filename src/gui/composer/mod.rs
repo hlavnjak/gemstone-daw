@@ -37,6 +37,7 @@ pub mod player;
 pub mod project;
 
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use eframe::egui;
 
@@ -335,6 +336,10 @@ pub struct ComposerPanel {
     request: Option<ProjectRequest>,
     status: String,
     player: Option<CompositionPlayer>,
+    /// A running WAV export, which renders on its own thread and sends back the
+    /// line to show when it is done. The GUI must not block on it: a long
+    /// composition takes seconds, and a frozen window looks like a crash.
+    export: Option<Receiver<String>>,
 }
 
 impl ComposerPanel {
@@ -349,6 +354,7 @@ impl ComposerPanel {
             request: None,
             status: "Add a track row to start composing.".to_string(),
             player: None,
+            export: None,
         }
     }
 
@@ -393,7 +399,9 @@ impl ComposerPanel {
         self.rows.iter().map(Row::end_units).max().unwrap_or(0)
     }
 
-    fn start_playback(&mut self) {
+    /// Every row that has something to play, resolved to seconds. A row with no
+    /// notes, or with no track behind it, simply is not in the composition.
+    fn build_plans(&self) -> Vec<RowPlan> {
         let spu = self.secs_per_unit();
         let mut plans = Vec::new();
         for row in &self.rows {
@@ -410,6 +418,11 @@ impl ComposerPanel {
                 notes,
             });
         }
+        plans
+    }
+
+    fn start_playback(&mut self) {
+        let plans = self.build_plans();
         if plans.is_empty() {
             self.status = "Nothing to play — add a note to a row first.".to_string();
             return;
@@ -428,6 +441,67 @@ impl ComposerPanel {
             }
             Err(e) => self.status = format!("Playback failed: {e}"),
         }
+    }
+
+    /// Render the whole composition offline and write it as a `.wav`.
+    ///
+    /// The render runs on its own thread — it loads its own plugin instances and
+    /// works faster than real time, but "faster than real time" is still seconds
+    /// for a long piece, and the panel stays usable meanwhile. The path is asked
+    /// for first: a file dialog belongs on the GUI thread.
+    fn export_wav(&mut self) {
+        let plans = self.build_plans();
+        if plans.is_empty() {
+            self.status = "Nothing to export — add a note to a row first.".to_string();
+            return;
+        }
+        let stem = project::sanitize_name(&self.project_name);
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export the track composition as WAV")
+            .add_filter("WAV audio", &["wav"])
+            .set_file_name(format!("{stem}.wav"));
+        if let Some(dir) = &self.project_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else { return };
+
+        let (sample_rate, channels) = player::default_export_format();
+        let shown = path.display().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let msg = match player::render_offline(plans, sample_rate, channels) {
+                Ok((samples, loaded, total)) => {
+                    let secs = samples.len() as f64 / (sample_rate * channels as f64).max(1.0);
+                    match crate::audio::write_wav_i16(
+                        &path,
+                        &samples,
+                        channels as u16,
+                        sample_rate as u32,
+                    ) {
+                        Ok(()) if loaded == total => format!(
+                            "Exported {:.1} s to {} ({} row(s), {:.0} Hz).",
+                            secs,
+                            path.display(),
+                            loaded,
+                            sample_rate
+                        ),
+                        // Say which rows are missing from the file rather than
+                        // let a silent instrument be discovered on playback.
+                        Ok(()) => format!(
+                            "Exported {:.1} s to {} — only {loaded} of {total} row(s) \
+                             loaded, the rest are missing from the file.",
+                            secs,
+                            path.display()
+                        ),
+                        Err(e) => format!("Export failed: {e}"),
+                    }
+                }
+                Err(e) => format!("Export failed: {e}"),
+            };
+            let _ = tx.send(msg);
+        });
+        self.status = format!("Exporting to {shown}… (rendering offline)");
+        self.export = Some(rx);
     }
 
     fn stop_playback(&mut self) {
@@ -450,6 +524,21 @@ impl ComposerPanel {
         if self.player.as_ref().is_some_and(CompositionPlayer::is_finished) {
             self.player = None;
             self.status = "Finished.".to_string();
+        }
+        // A finished export reports itself. A dropped sender means the render
+        // thread died without a word, which is still an answer the user needs.
+        if let Some(rx) = &self.export {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.status = msg;
+                    self.export = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "Export failed: the render stopped unexpectedly.".to_string();
+                    self.export = None;
+                }
+            }
         }
 
         let tracks = self.registry.list();
@@ -1013,6 +1102,19 @@ impl ComposerPanel {
             {
                 self.stop_playback();
             }
+            let exporting = self.export.is_some();
+            if ui
+                .add_enabled(!exporting, egui::Button::new("🎵 Export WAV…"))
+                .on_hover_text(
+                    "Render the whole composition offline and write it as a \
+                     16-bit .wav — every row, mixed exactly as the transport \
+                     plays it.\n\nThe render runs in the background; the panel \
+                     stays usable.",
+                )
+                .clicked()
+            {
+                self.export_wav();
+            }
             ui.add_space(12.0);
             ui.label("Tempo");
             ui.add(
@@ -1043,10 +1145,15 @@ impl ComposerPanel {
         ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_gray(170)));
 
         // While playing, repaint fast enough for the sounding frame to light up
-        // on time; otherwise stay idle like the rest of the app.
+        // on time; otherwise stay idle like the rest of the app. An export has
+        // nothing to animate but must not sit finished on screen unnoticed, so
+        // it only asks for the occasional frame.
         if self.player.is_some() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(16));
+        } else if self.export.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
 }

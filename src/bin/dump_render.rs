@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use gemstone_daw::analysis;
-use gemstone_daw::audio::decode_audio_file;
+use gemstone_daw::audio::{decode_audio_file, write_wav_f32};
 use gemstone_daw::vst::{class_ids, AnalysisGrid, PluginInstance};
 
 const USAGE: &str = "\
@@ -220,7 +220,7 @@ fn main() -> Result<()> {
 
     // 3) The reference: the analysed samples themselves.
     let src_path = out_dir.join("source.wav");
-    write_wav_f32(&src_path, samples, audio.sample_rate)?;
+    write_wav_f32(&src_path, samples, 1, audio.sample_rate as u32)?;
     println!("\nwrote {}  ({} samples)", src_path.display(), samples.len());
 
     // 4) The exact inverse. At the analysis rate this is the bit-exact case; a
@@ -231,7 +231,7 @@ fn main() -> Result<()> {
         .resynthesize_exact(&grid, true, out_rate)
         .context("resynthesize_exact")?;
     let exact_path = out_dir.join("exact.wav");
-    write_wav_f32(&exact_path, &exact, out_rate)?;
+    write_wav_f32(&exact_path, &exact, 1, out_rate as u32)?;
     println!(
         "wrote {}   ({} samples @ {:.0} Hz){}",
         exact_path.display(),
@@ -287,7 +287,7 @@ fn main() -> Result<()> {
             )
             .context("resynthesize_key")?;
         let key_path = out_dir.join(format!("key_{note:.0}hz.wav"));
-        write_wav_f32(&key_path, &key, grid.sample_rate)?;
+        write_wav_f32(&key_path, &key, 1, grid.sample_rate as u32)?;
         println!(
             "wrote {}  ({} samples, base_period {:.3})",
             key_path.display(),
@@ -312,7 +312,7 @@ fn main() -> Result<()> {
         ) {
             Ok((live, used_grid)) => {
                 let live_path = out_dir.join(format!("live_key{key_index}_{key_hz:.0}hz.wav"));
-                write_wav_f32(&live_path, &live, grid.sample_rate)?;
+                write_wav_f32(&live_path, &live, 1, grid.sample_rate as u32)?;
                 println!(
                     "wrote {}  ({} samples, live engine, key {} = {:.1} Hz)",
                     live_path.display(),
@@ -336,7 +336,7 @@ fn main() -> Result<()> {
             .resynthesize(&grid, base_period, 0, samples.len(), true)
             .context("resynthesize")?;
         let play_path = out_dir.join(format!("contour_{note:.0}hz.wav"));
-        write_wav_f32(&play_path, &play, grid.sample_rate)?;
+        write_wav_f32(&play_path, &play, 1, grid.sample_rate as u32)?;
         println!(
             "wrote {}  ({} samples, the host-bridge contour path)",
             play_path.display(),
@@ -409,30 +409,3 @@ fn report_diff(a: &[f32], b: &[f32]) {
     );
 }
 
-/// 32-bit float mono WAV. Float so the dump adds no quantisation of its own —
-/// a 16-bit dump would put a ±0.00003 floor under every measurement made on it.
-fn write_wav_f32(path: &Path, samples: &[f32], sample_rate: f32) -> Result<()> {
-    let f = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut w = BufWriter::new(f);
-    let rate = sample_rate.max(1.0) as u32;
-    let data_len = (samples.len() * 4) as u32;
-    let byte_rate = rate * 4;
-
-    w.write_all(b"RIFF")?;
-    w.write_all(&(36 + data_len).to_le_bytes())?;
-    w.write_all(b"WAVEfmt ")?;
-    w.write_all(&16u32.to_le_bytes())?; // fmt chunk size
-    w.write_all(&3u16.to_le_bytes())?; // WAVE_FORMAT_IEEE_FLOAT
-    w.write_all(&1u16.to_le_bytes())?; // mono
-    w.write_all(&rate.to_le_bytes())?;
-    w.write_all(&byte_rate.to_le_bytes())?;
-    w.write_all(&4u16.to_le_bytes())?; // block align
-    w.write_all(&32u16.to_le_bytes())?; // bits per sample
-    w.write_all(b"data")?;
-    w.write_all(&data_len.to_le_bytes())?;
-    for s in samples {
-        w.write_all(&s.to_le_bytes())?;
-    }
-    w.flush()?;
-    Ok(())
-}

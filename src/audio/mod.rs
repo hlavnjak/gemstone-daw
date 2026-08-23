@@ -13,6 +13,8 @@
 // limitations under the License.
 pub mod decode;
 pub mod engine;
+pub mod wav;
 
 pub use decode::{decode_audio_file, DecodedAudio};
 pub use engine::{AudioEngine, AudioConfig, midi_to_vst3_event};
+pub use wav::{write_wav_f32, write_wav_i16};

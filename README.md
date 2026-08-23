@@ -57,6 +57,10 @@ rows may share the same one.
   stream, one plugin instance per row, mixed with each row's own gain. The
   Composer loads its own instances, so a composition plays whether or not the
   tracks' editors are open — and when one is open, its live grid is what plays.
+- **Export WAV** writes the whole composition to a 16-bit `.wav` at the output
+  device's rate and channel count. It renders offline, through the same voices,
+  schedule and mix the transport uses, so the file is what Play sounds like; the
+  render runs in the background and the panel stays usable while it works.
 
 ## Other features
 
