@@ -37,7 +37,9 @@ pub mod player;
 pub mod project;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 
 use eframe::egui;
 
@@ -336,6 +338,9 @@ pub struct ComposerPanel {
     request: Option<ProjectRequest>,
     status: String,
     player: Option<CompositionPlayer>,
+    /// Loop the composition instead of stopping at the end. Shared with the
+    /// transport's audio callback, so the checkbox works on a running player.
+    repeat: Arc<AtomicBool>,
     /// A running WAV export, which renders on its own thread and sends back the
     /// line to show when it is done. The GUI must not block on it: a long
     /// composition takes seconds, and a frozen window looks like a crash.
@@ -354,6 +359,7 @@ impl ComposerPanel {
             request: None,
             status: "Add a track row to start composing.".to_string(),
             player: None,
+            repeat: Arc::new(AtomicBool::new(false)),
             export: None,
         }
     }
@@ -427,7 +433,11 @@ impl ComposerPanel {
             self.status = "Nothing to play — add a note to a row first.".to_string();
             return;
         }
-        match CompositionPlayer::start(plans) {
+        // The written length — the longest row, trailing silence and all — is
+        // what a repeat loops on, not where a one-shot play stops (that is the
+        // last note plus its release).
+        let loop_secs = self.end_units() as f64 * self.secs_per_unit();
+        match CompositionPlayer::start(plans, loop_secs, self.repeat.clone()) {
             Ok(player) => {
                 self.status = if player.loaded_rows == player.total_rows {
                     format!("Playing {} row(s).", player.loaded_rows)
@@ -1102,6 +1112,21 @@ impl ComposerPanel {
             {
                 self.stop_playback();
             }
+            // Live: ticking this mid-play loops from the next pass (or straight
+            // away, if the composition is already into its release tail).
+            let mut repeat = self.repeat.load(Ordering::Relaxed);
+            if ui
+                .checkbox(&mut repeat, "🔁 Repeat")
+                .on_hover_text(
+                    "Play the composition over and over, looping on its written \
+                     length. Releases ring on across the loop, and it can be \
+                     switched on and off while it plays — untick it and the \
+                     current pass is the last one.",
+                )
+                .changed()
+            {
+                self.repeat.store(repeat, Ordering::Relaxed);
+            }
             let exporting = self.export.is_some();
             if ui
                 .add_enabled(!exporting, egui::Button::new("🎵 Export WAV…"))
@@ -1127,6 +1152,16 @@ impl ComposerPanel {
             ui.add_space(12.0);
             let length_secs = self.end_units() as f64 * self.secs_per_unit();
             match &self.player {
+                // While looping, the length that means anything is the loop's,
+                // not "last note plus release".
+                Some(p) if self.repeat.load(Ordering::Relaxed) => ui.label(
+                    egui::RichText::new(format!(
+                        "🔁 {:.1} s / {:.1} s",
+                        p.position_secs(),
+                        p.loop_secs
+                    ))
+                    .color(PLAYHEAD),
+                ),
                 Some(p) => ui.label(
                     egui::RichText::new(format!(
                         "▶ {:.1} s / {:.1} s",

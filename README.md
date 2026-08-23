@@ -52,6 +52,11 @@ rows may share the same one.
 - **Time**: every row starts at zero, so two rows sound together exactly when the
   lengths in front of their frames add up the same — that is what makes a chord.
   The tempo control (BPM) sets what a beat is worth — a beat is a quarter note.
+- **Repeat** loops the arrangement for as long as it is ticked, on the written
+  length — the longest row, trailing silence included — rather than on the last
+  note, so the bar structure survives the wrap and releases ring on across it.
+  It can be switched on and off while the transport runs; unticking it makes the
+  pass in flight the last one.
 - **Play / Stop** at the foot of the section renders the whole arrangement in
   real time, lighting up the frame each row is sounding as it goes: one output
   stream, one plugin instance per row, mixed with each row's own gain. The

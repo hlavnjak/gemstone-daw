@@ -27,6 +27,11 @@
 //! The schedule is resolved to sample times up front, so the callback only walks
 //! a sorted per-row cursor — no allocation or locking of its own.
 //!
+//! **Repeat** loops on the composition's *written* length — the longest row,
+//! trailing silence included — not on the last note plus its release. The wrap is
+//! cut at the exact sample, inside the device block if need be, so a loop does
+//! not drift by up to a buffer every pass.
+//!
 //! **Export renders through the same voices** ([`render_offline`]): the loading,
 //! the schedule and the per-block mix are shared with playback, so a `.wav` is
 //! what the transport plays rather than a second implementation of it that can
@@ -118,6 +123,8 @@ pub struct CompositionPlayer {
     pub total_rows: usize,
     /// End of the composition, tail included.
     pub total_secs: f64,
+    /// The length a repeat loops on: the composition as written.
+    pub loop_secs: f64,
 }
 
 impl CompositionPlayer {
@@ -126,7 +133,11 @@ impl CompositionPlayer {
     /// A row whose plugin fails to load is logged and skipped rather than
     /// aborting the transport — the rest of the composition still plays, and the
     /// caller reports the shortfall through [`Self::loaded_rows`].
-    pub fn start(plans: Vec<RowPlan>) -> Result<Self> {
+    /// `loop_secs` is the composition's written length — what a repeat loops on,
+    /// which is not the same as where playback ends when it does not (that is the
+    /// last note-off plus [`TAIL_SECS`]). `repeat` is read every block, so the
+    /// checkbox takes effect on a running transport.
+    pub fn start(plans: Vec<RowPlan>, loop_secs: f64, repeat: Arc<AtomicBool>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -146,10 +157,14 @@ impl CompositionPlayer {
         let position = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
 
+        // Where a repeat wraps. Never before the last event: a length that
+        // rounds down a hair must not cut the note it lands on.
+        let last_event = end_sample.saturating_sub((TAIL_SECS * sample_rate).round() as u64);
+        let loop_sample = ((loop_secs * sample_rate).round().max(1.0) as u64).max(last_event);
+
         let cb_position = position.clone();
         let cb_finished = finished.clone();
-        // Scratch for one row's output, reused every block: the callback mixes
-        // each row in as soon as it is processed, so one buffer serves them all.
+        let cb_repeat = repeat;
 
         let stream = device.build_output_stream(
             &stream_cfg,
@@ -158,12 +173,52 @@ impl CompositionPlayer {
                 if frames == 0 {
                     return;
                 }
-                let block_start = cb_position.load(Ordering::Relaxed);
-                let block_end = block_start + frames as u64;
-                mix_block(&mut voices, out, channels, block_start, frames);
-                cb_position.store(block_end, Ordering::Relaxed);
-                if block_end >= end_sample {
-                    cb_finished.store(true, Ordering::Relaxed);
+                // One pass per chunk of the device block. Without a repeat there
+                // is exactly one; with one, the block is split at the loop point
+                // so the wrap lands on the right sample.
+                let mut done = 0usize;
+                while done < frames {
+                    let pos = cb_position.load(Ordering::Relaxed);
+                    let repeat = cb_repeat.load(Ordering::Relaxed);
+
+                    // Ticking Repeat on during the release tail: the loop point
+                    // is already behind us and will not come round again, so go
+                    // back now rather than play on to the end.
+                    if repeat && pos >= loop_sample {
+                        rewind(&mut voices, &cb_position);
+                        continue;
+                    }
+
+                    let remaining = frames - done;
+                    let n = if repeat {
+                        remaining.min((loop_sample - pos) as usize)
+                    } else {
+                        remaining
+                    };
+                    // The last chunk of a pass takes every event still in hand.
+                    // A note ending exactly on the loop point would otherwise
+                    // have its note-off skipped and sound forever.
+                    let wraps = repeat && pos + n as u64 >= loop_sample;
+                    mix_block(
+                        &mut voices,
+                        &mut out[done * channels..(done + n) * channels],
+                        channels,
+                        pos,
+                        n,
+                        wraps,
+                    );
+
+                    let new_pos = pos + n as u64;
+                    cb_position.store(new_pos, Ordering::Relaxed);
+                    done += n;
+
+                    if wraps {
+                        // Straight into the next pass: nothing is reset on the
+                        // plugins, so releases ring on over the loop.
+                        rewind(&mut voices, &cb_position);
+                    } else if !repeat && new_pos >= end_sample {
+                        cb_finished.store(true, Ordering::Relaxed);
+                    }
                 }
             },
             |e| log::error!("Composer audio error: {}", e),
@@ -186,6 +241,7 @@ impl CompositionPlayer {
             loaded_rows,
             total_rows,
             total_secs: end_sample as f64 / sample_rate,
+            loop_secs: loop_sample as f64 / sample_rate,
         })
     }
 
@@ -198,6 +254,16 @@ impl CompositionPlayer {
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Relaxed)
     }
+}
+
+/// Back to the top of the composition: every row plays its schedule again from
+/// the first event. The plugins are left alone — a note still releasing carries
+/// over into the next pass, which is what makes a loop sound like a loop.
+fn rewind(voices: &mut [Voice], position: &AtomicU64) {
+    for voice in voices.iter_mut() {
+        voice.cursor = 0;
+    }
+    position.store(0, Ordering::Relaxed);
 }
 
 /// Load an instance per row, import its grid and resolve its notes to sample
@@ -312,6 +378,7 @@ fn mix_block(
     channels: usize,
     block_start: u64,
     frames: usize,
+    flush_events: bool,
 ) {
     let block_end = block_start + frames as u64;
     out.fill(0.0);
@@ -322,7 +389,10 @@ fn mix_block(
             let mut events = voice.event_impl.events.write().unwrap();
             events.clear();
             while let Some(&(at, pitch, on)) = voice.schedule.get(voice.cursor) {
-                if at >= block_end {
+                // `flush_events` empties the schedule into this block: the caller
+                // is about to rewind, and anything left behind is a note-off that
+                // would never be sent.
+                if at >= block_end && !flush_events {
                     break;
                 }
                 let status = if on { 0x90 } else { 0x80 };
@@ -422,7 +492,7 @@ pub fn render_offline(
     while pos < end_sample {
         let frames = BLOCK.min((end_sample - pos) as usize);
         let buf = &mut block[..frames * channels];
-        mix_block(&mut voices, buf, channels, pos, frames);
+        mix_block(&mut voices, buf, channels, pos, frames, false);
         out.extend_from_slice(buf);
         pos += frames as u64;
     }
