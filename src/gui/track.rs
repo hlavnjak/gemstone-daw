@@ -48,14 +48,16 @@ use crate::vst::{class_ids, next_instance_token, validate_module, PluginInstance
 /// `closed`; the owner polls [`EditorInstance::is_closed`] each frame and drops
 /// this to reclaim the resources.
 pub struct EditorInstance {
-    // Field order matters for `Drop`: after `drop()` joins the window thread,
-    // fields drop top-to-bottom, so `_plugin` (which unloads the shared library
-    // the thread's view lives in) must come *after* `handle`.
+    // Teardown order is everything here, and `Drop` below does it explicitly
+    // rather than leaning on the order these fields happen to be declared in:
+    // the audio stream and the editor window both hold pointers into the plugin,
+    // so both must be gone before `_plugin` terminates it and unloads its
+    // library.
     handle: Option<JoinHandle<()>>,
+    engine: Option<AudioEngine>,
     _plugin: Arc<PluginInstance>,
     close_flag: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
-    engine: Option<AudioEngine>,
 }
 
 impl EditorInstance {
@@ -70,7 +72,7 @@ impl EditorInstance {
             closed,
         } = open_editor_in_thread(&plugin)?;
 
-        let engine = match AudioEngine::start(plugin.processor.clone(), plugin.io(), midi_queue) {
+        let engine = match AudioEngine::start(plugin.clone(), midi_queue) {
             Ok(e) => Some(e),
             Err(e) => {
                 log::warn!("Track audio start failed: {e:#}");
@@ -80,10 +82,10 @@ impl EditorInstance {
 
         Ok(EditorInstance {
             handle: Some(handle),
+            engine,
             _plugin: plugin,
             close_flag,
             closed,
-            engine,
         })
     }
 
@@ -114,15 +116,24 @@ impl EditorInstance {
 
 impl Drop for EditorInstance {
     fn drop(&mut self) {
-        // Ask the window thread to exit, then wait for it: it detaches the plugin
-        // view (`view.removed()`) as it unwinds, which must happen before the
-        // `_plugin` Arc below unloads the library the view points into. If the
-        // user already closed the window, the thread has finished and this joins
-        // instantly.
+        // 1) Stop the audio stream. Dropping it stops and joins the device
+        //    callback, and the callback calls `process()` on this very plugin —
+        //    so anything that tears the plugin down while the stream is alive is
+        //    a crash on the audio thread, not a leak.
+        self.engine = None;
+
+        // 2) Ask the window thread to exit, then wait for it: it detaches the
+        //    plugin view (`view.removed()`) as it unwinds, which must happen
+        //    before the `_plugin` Arc unloads the library the view points into.
+        //    If the user already closed the window, the thread has finished and
+        //    this joins instantly.
         self.close_flag.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+
+        // 3) `_plugin` now drops with nothing else pointing into it, terminating
+        //    the plugin and unloading its library.
     }
 }
 

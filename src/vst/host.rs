@@ -280,6 +280,11 @@ pub struct PluginIo {
     pub inputs: Vec<usize>,
     /// Channel count of each activated audio output bus, in bus order.
     pub outputs: Vec<usize>,
+    /// The largest block the plugin was set up for, in frames — a promise it
+    /// sizes its own buffers to. Handing it a bigger one writes past them, and
+    /// the corruption surfaces later as a crash somewhere else entirely, so
+    /// whoever drives `process()` clamps to this. Zero before initialisation.
+    pub max_block: usize,
 }
 
 impl PluginIo {
@@ -705,7 +710,10 @@ impl PluginInstance {
             //    plugin entirely — silence out of the audio buses, and no notes
             //    at all through the event bus, which is how a hosted synth ends
             //    up looking like it "opened but does nothing".
-            let mut io = PluginIo::default();
+            let mut io = PluginIo {
+                max_block: max_block_size.max(0) as usize,
+                ..PluginIo::default()
+            };
             for (idx, _) in inputs.iter().enumerate() {
                 comp_ref.activateBus(MediaTypes_::kAudio as i32, BusDirections_::kInput as i32, idx as i32, 1);
             }

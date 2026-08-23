@@ -22,6 +22,10 @@
 
 use std::path::PathBuf;
 
+use std::sync::atomic::Ordering;
+
+use gemstone_daw::audio::AudioEngine;
+use gemstone_daw::gui::editor_window::open_editor_in_thread;
 use gemstone_daw::gui::track::EditorInstance;
 use gemstone_daw::midi::new_midi_queue;
 use gemstone_daw::vst::{resolve_module_path, PluginInstance};
@@ -50,11 +54,20 @@ fn main() {
     };
     println!("loaded:   '{}'", plugin.name());
 
-    if let Err(e) = plugin.initialize_audio(48_000.0, 512) {
+    // The device's own format, exactly as the Tracks panel does it: a plugin set
+    // up for a smaller block than the stream later hands it writes past the
+    // buffers it sized, which looks like a crash in the host.
+    let (rate, block) = AudioEngine::query_device_config()
+        .map(|c| (c.sample_rate, c.max_buffer_size as i32))
+        .unwrap_or((48_000.0, 512));
+    if let Err(e) = plugin.initialize_audio(rate, block) {
         println!("audio:    FAILED — {e:#}");
     } else {
         let io = plugin.io();
-        println!("audio:    inputs {:?}, outputs {:?}", io.inputs, io.outputs);
+        println!(
+            "audio:    {rate} Hz, up to {block} frames, inputs {:?}, outputs {:?}",
+            io.inputs, io.outputs
+        );
     }
 
     match plugin.create_view() {
@@ -64,21 +77,49 @@ fn main() {
 
     // `--editor [seconds]`: open the real window, so an editor that attaches but
     // never draws (the classic missing-run-loop symptom) is visible here too.
+    // `--window` and `--audio` open only half of that, which is how a crash in
+    // teardown is narrowed down to one of them.
     let mut args = std::env::args().skip(2);
-    if args.next().as_deref() == Some("--editor") {
-        let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
-        let plugin = std::sync::Arc::new(plugin);
-        match EditorInstance::open(plugin, new_midi_queue()) {
-            Ok(editor) => {
-                println!("window:   open for {secs}s (audible: {})", editor.is_audible());
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-                while std::time::Instant::now() < deadline && !editor.is_closed() {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mode = args.next().unwrap_or_default();
+    let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let hold = |what: &str, closed: &dyn Fn() -> bool| {
+        println!("{what}: holding for {secs}s");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline && !closed() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        println!("{what}: tearing down");
+    };
+
+    match mode.as_str() {
+        "--editor" => {
+            let plugin = std::sync::Arc::new(plugin);
+            match EditorInstance::open(plugin, new_midi_queue()) {
+                Ok(editor) => {
+                    println!("window:   open (audible: {})", editor.is_audible());
+                    hold("window", &|| editor.is_closed());
                 }
-                println!("window:   closing");
+                Err(e) => println!("window:   FAILED — {e:#}"),
+            }
+        }
+        // Editor window, no audio stream.
+        "--window" => match open_editor_in_thread(&plugin) {
+            Ok(handle) => {
+                hold("window", &|| handle.closed.load(Ordering::Relaxed));
+                handle.close_flag.store(true, Ordering::Relaxed);
+                let _ = handle.handle.join();
             }
             Err(e) => println!("window:   FAILED — {e:#}"),
-        }
+        },
+        // Audio stream, no editor window.
+        "--audio" => match AudioEngine::start(std::sync::Arc::new(plugin), new_midi_queue()) {
+            Ok(engine) => {
+                hold("audio", &|| false);
+                drop(engine);
+            }
+            Err(e) => println!("audio:    FAILED — {e:#}"),
+        },
+        _ => {}
     }
 }
 

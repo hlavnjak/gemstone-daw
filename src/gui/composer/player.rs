@@ -40,14 +40,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use vst3::Steinberg::Vst::{
-    IAudioProcessor, IAudioProcessorTrait, IEventList,
+    AudioBusBuffers, IAudioProcessorTrait, IEventList,
     ProcessData, SymbolicSampleSizes_,
 };
 use vst3::{ComPtr, ComWrapper};
 
 use crate::audio::midi_to_vst3_event;
 use crate::gui::registry::PlaybackSource;
-use crate::audio::engine::bus_buffers;
+use crate::audio::engine::{bus_buffers, AudioScratch};
 use crate::vst::{next_instance_token, EventList, PluginInstance};
 
 /// Velocity every composed note is played at. The Composer has no velocity
@@ -77,22 +77,30 @@ pub struct RowPlan {
 
 /// A row's live instance plus its event schedule, as the callback sees it.
 struct Voice {
-    processor: ComPtr<IAudioProcessor>,
+    /// The instance this voice plays. Held here, not just in the player, so the
+    /// plugin cannot be terminated or its library unloaded while the callback
+    /// that calls `process()` on it still exists.
+    plugin: Arc<PluginInstance>,
     event_impl: Arc<EventList>,
     event_list: ComPtr<IEventList>,
     gain: f32,
     /// `(sample time, pitch, note-on)`, sorted by time.
     schedule: Vec<(u64, u8, bool)>,
     cursor: usize,
-    /// Channels per audio input bus, as this plugin negotiated them. A plugin
-    /// with an input bus reads it whether or not the composition has anything to
-    /// send, so the buffers have to be there.
-    in_buses: Vec<usize>,
-    /// Channels per audio output bus; the first is the one that is mixed down.
-    out_buses: Vec<usize>,
-    /// Per-channel scratch (inputs then outputs), owned so the mix allocates
-    /// nothing per block and one voice's layout cannot disturb another's.
-    scratch: Vec<Vec<f32>>,
+    /// Total channels across this plugin's audio input buses, which is where its
+    /// output channels start in `scratch`.
+    in_channels: usize,
+    /// Channels on the main output bus — the ones that are mixed down.
+    main_out: usize,
+    /// The block size this instance was set up for; it must never be handed more.
+    max_block: usize,
+    /// Per-channel buffers (inputs then outputs) and the pointer table
+    /// `process()` reads them through, owned so the mix allocates nothing per
+    /// block and one voice's layout cannot disturb another's.
+    scratch: AudioScratch,
+    /// The bus descriptors, laid out over `scratch` once.
+    in_buses: Vec<AudioBusBuffers>,
+    out_buses: Vec<AudioBusBuffers>,
 }
 
 /// A running composition. Dropping it stops playback: the stream field is
@@ -251,25 +259,38 @@ fn prepare_voices(
         // that declares no output bus still needs somewhere to write, so it gets
         // a stereo one; anything else is taken as declared.
         let io = inst.io();
-        let out_buses = if io.outputs.is_empty() {
+        let out_channels_per_bus = if io.outputs.is_empty() {
             vec![2usize]
         } else {
             io.outputs.clone()
         };
-        let total_channels: usize =
-            io.inputs.iter().sum::<usize>() + out_buses.iter().sum::<usize>();
-        let scratch = vec![vec![0.0f32; max_block.max(0) as usize]; total_channels.max(1)];
+        let in_channels: usize = io.inputs.iter().sum();
+        let out_channels: usize = out_channels_per_bus.iter().sum();
+        let voice_max_block = if io.max_block > 0 {
+            io.max_block
+        } else {
+            max_block.max(0) as usize
+        };
+        let mut scratch = AudioScratch::new(in_channels + out_channels, voice_max_block);
+        let in_buses = bus_buffers(&io.inputs, &mut scratch.ptrs_mut()[..in_channels]);
+        let out_buses = bus_buffers(
+            &out_channels_per_bus,
+            &mut scratch.ptrs_mut()[in_channels..],
+        );
 
         voices.push(Voice {
-            processor: inst.processor.clone(),
+            plugin: inst.clone(),
             event_impl,
             event_list,
             gain: plan.gain,
             schedule,
             cursor: 0,
-            in_buses: io.inputs.clone(),
-            out_buses,
+            in_channels,
+            main_out: out_channels_per_bus[0],
+            max_block: voice_max_block,
             scratch,
+            in_buses,
+            out_buses,
         });
         plugins.push(inst);
     }
@@ -317,25 +338,19 @@ fn mix_block(
             }
         }
 
-        for ch in voice.scratch.iter_mut() {
-            ch.clear();
-            ch.resize(frames, 0.0);
-        }
-        let n_in: usize = voice.in_buses.iter().sum();
-        let mut ptrs: Vec<*mut f32> = voice.scratch.iter_mut().map(|v| v.as_mut_ptr()).collect();
-        let (in_ptrs, out_ptrs) = ptrs.split_at_mut(n_in);
-        let mut in_buses = bus_buffers(&voice.in_buses, in_ptrs);
-        let mut out_buses = bus_buffers(&voice.out_buses, out_ptrs);
+        // Never more than this instance was set up for (see `PluginIo::max_block`).
+        let frames = frames.min(voice.max_block);
+        voice.scratch.reset(frames);
 
         let mut data = ProcessData {
-            numInputs: in_buses.len() as i32,
-            inputs: if in_buses.is_empty() {
+            numInputs: voice.in_buses.len() as i32,
+            inputs: if voice.in_buses.is_empty() {
                 std::ptr::null_mut()
             } else {
-                in_buses.as_mut_ptr()
+                voice.in_buses.as_mut_ptr()
             },
-            numOutputs: out_buses.len() as i32,
-            outputs: out_buses.as_mut_ptr(),
+            numOutputs: voice.out_buses.len() as i32,
+            outputs: voice.out_buses.as_mut_ptr(),
             numSamples: frames as i32,
             processMode: 0,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
@@ -344,18 +359,17 @@ fn mix_block(
         data.inputEvents = voice.event_list.as_ptr() as *mut _;
 
         unsafe {
-            voice.processor.as_com_ref().process(&mut data as *mut _);
+            voice.plugin.processor.as_com_ref().process(&mut data as *mut _);
         }
         voice.event_impl.events.write().unwrap().clear();
 
         // Main output bus into the mix. Its channel count is the plugin's, not
         // the device's: a mono plugin repeats, a wider one has the extra dropped.
-        let main_out = voice.out_buses[0];
-        if main_out > 0 {
+        if voice.main_out > 0 {
             for frame in 0..frames {
                 for ch in 0..channels {
-                    let src = n_in + ch.min(main_out - 1);
-                    out[frame * channels + ch] += voice.scratch[src][frame] * voice.gain;
+                    let src = voice.in_channels + ch.min(voice.main_out - 1);
+                    out[frame * channels + ch] += voice.scratch.channel(src)[frame] * voice.gain;
                 }
             }
         }

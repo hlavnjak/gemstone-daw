@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -21,10 +22,9 @@ use vst3::Steinberg::Vst::{
     IEventList, ProcessData, SymbolicSampleSizes_,
 };
 use vst3::Steinberg::Vst::Event_::EventTypes_;
-use vst3::{ComPtr, ComWrapper};
-use vst3::Steinberg::Vst::IAudioProcessor;
+use vst3::ComWrapper;
 
-use crate::vst::{EventList, PluginIo};
+use crate::vst::{EventList, PluginInstance};
 use crate::midi::MidiEventQueue;
 
 /// Audio engine configuration derived from the system audio device.
@@ -72,19 +72,22 @@ impl AudioEngine {
         })
     }
 
-    /// Start audio processing with the given VST3 processor and MIDI event queue.
+    /// Start audio processing for `plugin`, fed by `midi_events`.
     ///
-    /// `io` is the bus layout the plugin negotiated in
+    /// The whole instance is taken, not just its processor, and the callback
+    /// holds it: while a stream exists the plugin cannot be terminated and its
+    /// library cannot be unloaded, whatever order its owner drops things in. That
+    /// is not defensive — tearing the plugin down under a running stream is a
+    /// crash on the audio thread, and it was one.
+    ///
+    /// The bus layout comes from the plugin's own negotiation in
     /// [`crate::vst::PluginInstance::initialize_audio`]. It is not decoration:
     /// `process()` reads `numInputs` buses' worth of channel pointers whether or
     /// not the host meant to send any, so an effect (or any plugin with a
-    /// side-chain) handed the old hard-coded "no inputs, one stereo output"
+    /// side-chain) handed a hard-coded "no inputs, one stereo output"
     /// dereferences pointers that were never provided.
-    pub fn start(
-        processor: ComPtr<IAudioProcessor>,
-        io: PluginIo,
-        midi_events: MidiEventQueue,
-    ) -> Result<Self> {
+    pub fn start(plugin: Arc<PluginInstance>, midi_events: MidiEventQueue) -> Result<Self> {
+        let io = plugin.io();
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -115,34 +118,50 @@ impl AudioEngine {
         let in_bus_channels: Vec<usize> = io.inputs.clone();
         let main_out = out_bus_channels[0];
 
+        // Every buffer the plugin will be handed, allocated once: the audio
+        // callback must not allocate, and the channel pointers below have to stay
+        // put for the life of the stream. Input channels come first, then output.
+        // What the plugin was actually set up for. The device is asked for its
+        // format twice — once to initialise the plugin, once here — and if those
+        // two answers ever differ, the plugin is the one that gets a block it
+        // never sized for. Its own promise wins.
+        let plugin_max_block = if io.max_block > 0 {
+            io.max_block
+        } else {
+            max_buffer_size as usize
+        };
+
+        let in_channels: usize = in_bus_channels.iter().sum();
+        let out_channels: usize = out_bus_channels.iter().sum();
+        let mut scratch =
+            AudioScratch::new(in_channels + out_channels, plugin_max_block);
+        // The bus descriptors point into the scratch's pointer table, whose
+        // allocation does not move when the scratch is moved into the closure.
+        let mut in_buses = bus_buffers(&in_bus_channels, &mut scratch.ptrs_mut()[..in_channels]);
+        let mut out_buses =
+            bus_buffers(&out_bus_channels, &mut scratch.ptrs_mut()[in_channels..]);
+
+        static WARNED_SHORT: AtomicBool = AtomicBool::new(false);
+        WARNED_SHORT.store(false, AtomicOrdering::Relaxed);
+
         let stream = device.build_output_stream(
             &stream_cfg,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 // Never ask a plugin for more than the block size it was set up
-                // for; anything past it would run off the buffers it sized then.
-                // Devices do not do this in practice — the guard is here because
-                // the cost of being wrong is a write past a plugin's own memory.
-                let frames = (out.len() / channels).min(max_buffer_size as usize);
+                // for. A device callback bigger than that is not expected; the
+                // tail is left silent rather than written past the plugin's own
+                // buffers, which is what a mismatch here actually costs.
+                let frames = (out.len() / channels).min(plugin_max_block);
+                if frames * channels < out.len() && !WARNED_SHORT.swap(true, AtomicOrdering::Relaxed)
+                {
+                    log::warn!(
+                        "device asked for {} frames but the plugin was set up for {plugin_max_block}; \
+                         the rest of each block is silence",
+                        out.len() / channels
+                    );
+                }
 
-                // One planar buffer per channel of every bus, input buses first.
-                // Inputs stay silent — nothing in this host feeds an effect yet —
-                // but they must exist, because the plugin will read them.
-                let mut in_planar: Vec<Vec<f32>> = in_bus_channels
-                    .iter()
-                    .flat_map(|&n| (0..n).map(|_| vec![0.0f32; frames]))
-                    .collect();
-                let mut out_planar: Vec<Vec<f32>> = out_bus_channels
-                    .iter()
-                    .flat_map(|&n| (0..n).map(|_| vec![0.0f32; frames]))
-                    .collect();
-
-                let mut in_ptrs: Vec<*mut f32> =
-                    in_planar.iter_mut().map(|v| v.as_mut_ptr()).collect();
-                let mut out_ptrs: Vec<*mut f32> =
-                    out_planar.iter_mut().map(|v| v.as_mut_ptr()).collect();
-
-                let mut in_buses = bus_buffers(&in_bus_channels, &mut in_ptrs);
-                let mut out_buses = bus_buffers(&out_bus_channels, &mut out_ptrs);
+                scratch.reset(frames);
 
                 let mut data = ProcessData {
                     numInputs: in_buses.len() as i32,
@@ -173,7 +192,7 @@ impl AudioEngine {
                 data.inputEvents = event_list_ptr.as_ptr() as *mut _;
 
                 unsafe {
-                    processor.as_com_ref().process(&mut data as *mut _);
+                    plugin.processor.as_com_ref().process(&mut data as *mut _);
                 }
 
                 // Consume events after processing
@@ -193,8 +212,8 @@ impl AudioEngine {
                 } else {
                     for frame in 0..frames {
                         for ch in 0..channels {
-                            let src = ch.min(main_out - 1);
-                            out[frame * channels + ch] = out_planar[src][frame];
+                            let src = in_channels + ch.min(main_out - 1);
+                            out[frame * channels + ch] = scratch.channel(src)[frame];
                         }
                     }
                 }
@@ -216,6 +235,63 @@ impl AudioEngine {
         })
     }
 }
+
+/// The buffers a plugin's `process()` writes through, and the pointer table it
+/// reads them from.
+///
+/// Allocated once per stream and owned by whoever drives `process()` — the audio
+/// callback must not allocate, and the pointer table the bus descriptors read
+/// must not move. Raw pointers are not `Send` on their own; this whole set is,
+/// because nothing but its owner ever touches it.
+pub(crate) struct AudioScratch {
+    planar: Vec<Vec<f32>>,
+    ptrs: Vec<*mut f32>,
+}
+
+unsafe impl Send for AudioScratch {}
+
+impl AudioScratch {
+    /// `channels` buffers of `frames` samples each, plus the overrun pad.
+    pub(crate) fn new(channels: usize, frames: usize) -> Self {
+        let mut planar: Vec<Vec<f32>> = (0..channels.max(1))
+            .map(|_| vec![0.0f32; frames + PROCESS_OVERRUN_PAD])
+            .collect();
+        let ptrs = planar.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        AudioScratch { planar, ptrs }
+    }
+
+    /// Silence `frames` samples (and the pad) on every channel, ready for a
+    /// block: input buses have nothing to carry, and a plugin may add into its
+    /// output rather than overwrite it. Also re-takes the channel pointers, which
+    /// never change but must be derived afresh to stay valid to use.
+    pub(crate) fn reset(&mut self, frames: usize) {
+        for (slot, channel) in self.ptrs.iter_mut().zip(self.planar.iter_mut()) {
+            channel[..frames + PROCESS_OVERRUN_PAD].fill(0.0);
+            *slot = channel.as_mut_ptr();
+        }
+    }
+
+    /// The pointer table, to lay out as bus descriptors.
+    pub(crate) fn ptrs_mut(&mut self) -> &mut [*mut f32] {
+        &mut self.ptrs
+    }
+
+    /// One channel's samples, after a block has been processed.
+    pub(crate) fn channel(&self, index: usize) -> &[f32] {
+        &self.planar[index]
+    }
+}
+
+/// Slack allocated past `numSamples` on every channel buffer handed to a plugin.
+///
+/// Plenty of plugins process in a fixed internal block and round the host's
+/// block *up* to it: Dexed works in 16 samples, Surge XT in 32. Ask either for
+/// 4410 frames — which is exactly what this machine's device asks us for — and
+/// the last internal block runs past the end of a buffer sized to the letter,
+/// corrupting the heap. Hosts get away with tight buffers only because their
+/// block sizes are powers of two; this pad is what makes any block size safe,
+/// and it is far larger than any plausible internal block.
+pub(crate) const PROCESS_OVERRUN_PAD: usize = 1024;
 
 /// Lay a flat list of channel pointers out as the per-bus `AudioBusBuffers` the
 /// VST3 `ProcessData` wants.
