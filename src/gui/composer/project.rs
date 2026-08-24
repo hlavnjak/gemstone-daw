@@ -99,7 +99,7 @@ impl TrackSource {
     pub fn describe(&self) -> String {
         match self {
             Self::LeSynth { file } => file.clone(),
-            Self::Vst { path, .. } => path.display().to_string(),
+            Self::Vst { path, .. } => crate::file_label(path),
             Self::LeSynthDefault => "LeSynth Fourier".to_string(),
             Self::None => "no track".to_string(),
         }
@@ -218,13 +218,13 @@ impl Project {
 
     pub fn write(&self, path: &Path) -> Result<()> {
         std::fs::write(path, self.to_text())
-            .with_context(|| format!("write {}", path.display()))
+            .with_context(|| format!("write {}", crate::file_label(path)))
     }
 
     pub fn read(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("in {}", path.display()))
+            .with_context(|| format!("read {}", crate::file_label(path)))?;
+        Self::parse(&text).with_context(|| format!("in {}", crate::file_label(path)))
     }
 }
 

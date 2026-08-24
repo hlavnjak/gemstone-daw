@@ -291,14 +291,15 @@ impl TrackState {
     /// Write the track to `path` (creating/truncating it).
     pub fn write(&self, path: &Path) -> Result<()> {
         fs::write(path, self.to_bytes())
-            .with_context(|| format!("writing track to {}", path.display()))
+            .with_context(|| format!("writing track to {}", crate::file_label(path)))
     }
 
     /// Read a track from `path`.
     pub fn read(path: &Path) -> Result<Self> {
         let bytes =
-            fs::read(path).with_context(|| format!("reading track from {}", path.display()))?;
-        Self::from_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))
+            fs::read(path)
+                .with_context(|| format!("reading track from {}", crate::file_label(path)))?;
+        Self::from_bytes(&bytes).with_context(|| format!("parsing {}", crate::file_label(path)))
     }
 
     /// Basic shape check: the grids match the declared dimensions. Used before

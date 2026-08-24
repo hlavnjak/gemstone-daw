@@ -287,7 +287,7 @@ impl DawApp {
             ProjectRequest::Save { dir, name } => match self.save_project(&dir, &name) {
                 Ok(n) => {
                     self.composer.set_project_dir(dir.clone(), name);
-                    format!("Saved to {} ({n} grid file(s)).", dir.display())
+                    format!("Saved to {} ({n} grid file(s)).", crate::file_label(&dir))
                 }
                 Err(e) => format!("Save failed: {e:#}"),
             },
@@ -311,7 +311,7 @@ impl DawApp {
     /// instead.
     fn save_project(&mut self, dir: &std::path::Path, name: &str) -> anyhow::Result<usize> {
         std::fs::create_dir_all(dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+            .with_context(|| format!("create the folder {}", crate::file_label(dir)))?;
 
         let autosave: Vec<u64> = self.composer.autosave_track_ids();
         let mut sources: std::collections::HashMap<u64, TrackSource> = Default::default();
@@ -338,7 +338,7 @@ impl DawApp {
                     // means "keep what is pinned".
                     if autosave.contains(&id) || !full.exists() {
                         std::fs::write(&full, bytes)
-                            .with_context(|| format!("write {}", full.display()))?;
+                            .with_context(|| format!("write {}", crate::file_label(&full)))?;
                         written += 1;
                     }
                     taken.push(file.clone());
@@ -366,7 +366,7 @@ impl DawApp {
             if autosave.contains(&id) || !full.exists() {
                 state
                     .write(&full)
-                    .with_context(|| format!("write {}", full.display()))?;
+                    .with_context(|| format!("write {}", crate::file_label(&full)))?;
                 written += 1;
             }
             taken.push(file.clone());

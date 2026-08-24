@@ -310,7 +310,7 @@ impl PluginBrowser {
                 let name = path
                     .file_stem()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
+                    .unwrap_or_else(|| crate::file_label(&path));
                 found.push((name, path));
             }
         }
@@ -321,8 +321,11 @@ impl PluginBrowser {
         let names: Vec<String> = found.iter().map(|(n, _)| n.clone()).collect();
         for (idx, entry) in found.iter_mut().enumerate() {
             if names.iter().enumerate().any(|(i, n)| i != idx && *n == entry.0) {
+                // Named by the folder they sit in rather than by the whole path:
+                // "Dexed — vst3" and "Dexed — VST3" tell them apart, and the
+                // whole path would be most of the window.
                 if let Some(dir) = entry.1.parent() {
-                    entry.0 = format!("{}  —  {}", entry.0, dir.display());
+                    entry.0 = format!("{}  —  {}", entry.0, crate::file_label(dir));
                 }
             }
         }
@@ -439,7 +442,7 @@ impl TracksPanel {
             return;
         };
         if !path.exists() {
-            self.status = format!("Internal plugin not found at {}", path.display());
+            self.status = format!("Internal plugin {} not found.", crate::file_label(&path));
             return;
         }
         let id = self.take_id();
@@ -476,7 +479,7 @@ impl TracksPanel {
             .file_stem()
             .or_else(|| resolved.file_stem())
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+            .unwrap_or_else(|| crate::file_label(&path));
         // Take the first audio-module class in the factory — we don't know the
         // plugin's own class id, and a bundle may hold several classes.
         let registry_id = self.registry.add(&name, path.clone(), None, false, None);
@@ -519,7 +522,7 @@ impl TracksPanel {
                     ui.label("No VST3 plugins found in:");
                     for dir in &browser.searched {
                         ui.label(
-                            egui::RichText::new(format!("  {}", dir.display()))
+                            egui::RichText::new(format!("  {}", crate::file_label(dir)))
                                 .color(egui::Color32::from_gray(160)),
                         );
                     }
@@ -541,7 +544,7 @@ impl TracksPanel {
                                         chosen = Some(path.clone());
                                     }
                                     ui.label(egui::RichText::new(name).strong())
-                                        .on_hover_text(path.display().to_string());
+                                        .on_hover_text(crate::file_label(path));
                                 });
                             }
                         });
@@ -650,7 +653,7 @@ impl TracksPanel {
         vst_state: Option<Vec<u8>>,
     ) -> Result<u64> {
         if !path.exists() {
-            anyhow::bail!("plugin not found at {}", path.display());
+            anyhow::bail!("plugin {} not found", crate::file_label(&path));
         }
         let id = self.take_id();
         let registry_id = self.registry.add(name, path.clone(), class_id, false, None);
@@ -704,7 +707,7 @@ impl TracksPanel {
             return;
         };
         if !plugin_path.exists() {
-            self.status = format!("Internal plugin not found at {}", plugin_path.display());
+            self.status = format!("Internal plugin {} not found.", crate::file_label(&plugin_path));
             return;
         }
         let name = unique_track_name(

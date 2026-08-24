@@ -367,7 +367,7 @@ impl PluginInstance {
             let factory = module.factory()?;
             let factory_ref = factory.as_com_ref();
             let (cid, name) = select_class(factory_ref, class_id)
-                .with_context(|| format!("in {}", module.path().display()))?;
+                .with_context(|| format!("in {}", crate::file_label(module.path())))?;
 
             // Instantiate audio component
             let mut comp_ptr: *mut c_void = std::ptr::null_mut();

@@ -835,7 +835,7 @@ impl ComposerPanel {
         let Some(path) = dialog.save_file() else { return };
 
         let (sample_rate, channels) = player::default_export_format();
-        let shown = path.display().to_string();
+        let shown = crate::file_label(&path);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let msg = match player::render_offline(plans, sample_rate, channels) {
@@ -850,7 +850,7 @@ impl ComposerPanel {
                         Ok(()) if loaded == total => format!(
                             "Exported {:.1} s to {} ({} row(s), {:.0} Hz).",
                             secs,
-                            path.display(),
+                            crate::file_label(&path),
                             loaded,
                             sample_rate
                         ),
@@ -860,7 +860,7 @@ impl ComposerPanel {
                             "Exported {:.1} s to {} — only {loaded} of {total} row(s) \
                              loaded, the rest are missing from the file.",
                             secs,
-                            path.display()
+                            crate::file_label(&path)
                         ),
                         Err(e) => format!("Export failed: {e}"),
                     }
@@ -1122,7 +1122,7 @@ impl ComposerPanel {
             }
             if let Some(dir) = &self.project_dir {
                 ui.label(
-                    egui::RichText::new(dir.display().to_string())
+                    egui::RichText::new(crate::file_label(dir))
                         .small()
                         .color(egui::Color32::from_gray(130)),
                 );

@@ -78,7 +78,7 @@ pub fn resolve_module_path(path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
     if !path.exists() {
-        bail!("no such file or directory: {}", path.display());
+        bail!("no such file or directory: {}", crate::file_label(path));
     }
 
     // A bundle, or something inside one. Walk down as far as we recognise.
@@ -102,7 +102,7 @@ pub fn resolve_module_path(path: &Path) -> Result<PathBuf> {
 
     bail!(
         "{} is not a VST3 bundle — expected {}/Contents/{}/*.{} inside it",
-        path.display(),
+        crate::file_label(path),
         path.file_name().unwrap_or_default().to_string_lossy(),
         ARCH_DIRS.first().copied().unwrap_or("<arch>"),
         MODULE_EXTS.first().copied().unwrap_or("so"),
@@ -141,7 +141,7 @@ fn pick_module_in(dir: &Path, bundle: &Path) -> Option<PathBuf> {
 pub fn validate_module(path: &Path) -> Result<PathBuf> {
     let resolved = resolve_module_path(path)?;
     let (library, _handle) = open_library(&resolved)
-        .with_context(|| format!("Failed to open {}", resolved.display()))?;
+        .with_context(|| format!("Failed to open {}", crate::file_label(&resolved)))?;
     // Deliberately no `ModuleEntry`: this only asks whether the entry point is
     // there, so nothing of the plugin actually runs.
     unsafe {
@@ -242,13 +242,13 @@ impl Vst3Module {
     /// point.
     pub fn open(path: &Path) -> Result<Self> {
         let resolved = resolve_module_path(path)
-            .with_context(|| format!("Cannot load {}", path.display()))?;
+            .with_context(|| format!("Cannot load {}", crate::file_label(path)))?;
 
         // Match the reference host: RTLD_LAZY | RTLD_LOCAL. Binding lazily keeps
         // a plugin that carries unresolved host-API symbols (several JUCE builds
         // do) loadable, and LOCAL stops its symbols leaking into ours.
         let (library, handle) = open_library(&resolved)
-            .with_context(|| format!("Failed to open {}", resolved.display()))?;
+            .with_context(|| format!("Failed to open {}", crate::file_label(&resolved)))?;
 
         let mut module = Vst3Module {
             library,
@@ -349,7 +349,7 @@ unsafe fn not_a_vst3(library: &Library, path: &Path) -> anyhow::Error {
         || library.get::<*mut c_void>(b"main_plugin\0").is_ok();
     anyhow!(
         "{} is not a VST3 plugin — it has no GetPluginFactory entry point{}",
-        path.display(),
+        crate::file_label(path),
         if vst2 {
             " (it exports VSTPluginMain, so it is a VST2 plugin, which this host cannot load)"
         } else {

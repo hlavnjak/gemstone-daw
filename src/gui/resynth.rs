@@ -452,7 +452,7 @@ impl ResynthPanel {
             return;
         };
         self.status = match state.write(&path) {
-            Ok(()) => format!("Exported subtrack {} to {}.", sub_idx + 1, path.display()),
+            Ok(()) => format!("Exported subtrack {} to {}.", sub_idx + 1, crate::file_label(&path)),
             Err(e) => format!("Export failed: {}", e),
         };
     }

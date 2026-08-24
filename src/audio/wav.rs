@@ -89,7 +89,7 @@ fn header(
     let block_align = channels * (bits / 8);
     let data_len = data_len as u32;
 
-    let f = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let f = File::create(path).with_context(|| format!("create {}", crate::file_label(path)))?;
     let mut w = BufWriter::new(f);
     w.write_all(b"RIFF")?;
     w.write_all(&(HEADER_LEN + data_len).to_le_bytes())?;
