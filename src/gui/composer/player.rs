@@ -46,8 +46,11 @@
 //! synchronously when its buffer is not ready, so no note can come out silent
 //! for being asked for early.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -59,8 +62,8 @@ use vst3::{ComPtr, ComWrapper};
 
 use crate::audio::midi_to_vst3_event;
 use crate::gui::registry::PlaybackSource;
-use crate::audio::engine::{bus_buffers, AudioScratch};
-use crate::vst::{next_instance_token, EventList, PluginInstance};
+use crate::audio::engine::{bus_buffers, declared_block_size, AudioScratch};
+use crate::vst::{next_instance_token, EventList, PluginInstance, Vst3Module};
 
 /// Velocity every composed note is played at. The Composer has no velocity
 /// control, and a mid-scale value keeps VSTs that map velocity to level audible
@@ -161,12 +164,39 @@ pub struct CompositionPlayer {
     /// An edit waiting for the next loop point. The callback only ever
     /// `try_lock`s it, so a busy GUI thread cannot stall the audio thread.
     live: Arc<Mutex<Option<LiveUpdate>>>,
+    /// When the first block was produced. Set by the callback rather than by
+    /// `start_prepared`, because `stream.play()` returning is not the same
+    /// moment as the device asking for audio — and a recording is lined up
+    /// against this.
+    started: Arc<OnceLock<Instant>>,
+    /// How far the callback runs ahead of the ear, in microseconds: the device's
+    /// own output latency, as it reports it.
+    latency_us: Arc<AtomicU64>,
     sample_rate: f64,
     /// Rows that actually loaded, and rows asked for.
     pub loaded_rows: usize,
     pub total_rows: usize,
     /// End of the composition, tail included.
     pub total_secs: f64,
+}
+
+/// A composition with its plugins loaded and its schedules resolved, waiting for
+/// a stream. Built by [`CompositionPlayer::prepare`], off the GUI thread.
+pub struct PreparedComposition {
+    voices: Vec<Voice>,
+    plugins: Vec<Arc<PluginInstance>>,
+    end_sample: u64,
+    sample_rate: f64,
+    channels: usize,
+    stream_cfg: cpal::StreamConfig,
+    total_rows: usize,
+}
+
+impl PreparedComposition {
+    /// Rows that loaded, and rows asked for.
+    pub fn loaded_rows(&self) -> (usize, usize) {
+        (self.plugins.len(), self.total_rows)
+    }
 }
 
 impl CompositionPlayer {
@@ -180,21 +210,67 @@ impl CompositionPlayer {
     /// last note-off plus [`TAIL_SECS`]). `repeat` is read every block, so the
     /// checkbox takes effect on a running transport.
     pub fn start(plans: Vec<RowPlan>, loop_secs: f64, repeat: Arc<AtomicBool>) -> Result<Self> {
+        Self::start_prepared(Self::prepare(plans)?, loop_secs, repeat)
+    }
+
+    /// Load every row's plugin and resolve its schedule — the slow half of
+    /// starting, and the reason it is a step of its own.
+    ///
+    /// A plugin instance costs real time to create (jdrummer ~80 ms, a big
+    /// synth a second) and the Composer needs one *per row*, so a six-row
+    /// composition is half a second before a sound. Doing that on the GUI thread
+    /// freezes the window, which is what makes a Play button feel broken; the
+    /// result is `Send`, so the caller can do this on a thread of its own and
+    /// hand it to [`Self::start_prepared`] when it lands.
+    pub fn prepare(plans: Vec<RowPlan>) -> Result<PreparedComposition> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .context("No audio output device found")?;
         let cfg = device.default_output_config()?;
         let sample_rate = cfg.sample_rate().0 as f64;
-        let max_block = match cfg.buffer_size() {
-            cpal::SupportedBufferSize::Range { max, .. } => *max,
-            _ => 512,
-        };
+        // Not the device's raw maximum: see `declared_block_size`. Setting a
+        // plugin up for millions of frames makes it — and the scratch below —
+        // reserve memory by the hundreds of megabytes, per row.
+        let max_block = declared_block_size(cfg.buffer_size());
         let channels = cfg.channels() as usize;
         let stream_cfg: cpal::StreamConfig = cfg.into();
 
         let total_rows = plans.len();
         let (voices, plugins, end_sample) = prepare_voices(plans, sample_rate, max_block as i32)?;
+        Ok(PreparedComposition {
+            voices,
+            plugins,
+            end_sample,
+            sample_rate,
+            channels,
+            stream_cfg,
+            total_rows,
+        })
+    }
+
+    /// Open the output stream for an already-prepared composition. Cheap — a
+    /// couple of milliseconds — so this half belongs on the GUI thread, where
+    /// `cpal::Stream` has to live anyway.
+    pub fn start_prepared(
+        prepared: PreparedComposition,
+        loop_secs: f64,
+        repeat: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let PreparedComposition {
+            voices,
+            plugins,
+            end_sample,
+            sample_rate,
+            channels,
+            stream_cfg,
+            total_rows,
+        } = prepared;
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .context("No audio output device found")?;
+
         let mut voices = voices;
         let position = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
@@ -212,13 +288,32 @@ impl CompositionPlayer {
         let cb_loop = loop_sample.clone();
         let cb_live = live.clone();
         let cb_repeat = repeat;
+        let started = Arc::new(OnceLock::new());
+        let latency_us = Arc::new(AtomicU64::new(0));
+        let cb_started = started.clone();
+        let cb_latency = latency_us.clone();
 
         let stream = device.build_output_stream(
             &stream_cfg,
-            move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 let frames = out.len() / channels;
                 if frames == 0 {
                     return;
+                }
+                // Where this pass sits on the wall clock, for anything lining
+                // itself up against the transport. The device says when this
+                // block will actually be *heard*, which is a device buffer
+                // ahead of when it is asked for — 100 ms on this machine, most
+                // of a 1/16 note, and a recording placed without it lands a
+                // grid step late all the way through.
+                if cb_started.get().is_none() {
+                    let _ = cb_started.set(Instant::now());
+                    let stamp = info.timestamp();
+                    let latency = stamp
+                        .playback
+                        .duration_since(&stamp.callback)
+                        .map_or(0, |d| d.as_micros() as u64);
+                    cb_latency.store(latency, Ordering::Relaxed);
                 }
                 // One pass per chunk of the device block. Without a repeat there
                 // is exactly one; with one, the block is split at the loop point
@@ -291,6 +386,8 @@ impl CompositionPlayer {
             finished,
             loop_sample,
             live,
+            started,
+            latency_us,
             sample_rate,
             loaded_rows,
             total_rows,
@@ -336,6 +433,29 @@ impl CompositionPlayer {
         if let Ok(mut slot) = self.live.lock() {
             *slot = Some(update);
         }
+    }
+
+    /// Where the composition was *heard* to be at wall-clock instant `t`, in
+    /// seconds from its start — what a note played then lines up with.
+    ///
+    /// Not simply `t` minus the moment Play was pressed: the callback produces
+    /// audio a device buffer before it is heard, so the ear is that far behind
+    /// the transport and a player answering what they hear is that far "late".
+    /// Subtracting the device's own reported latency puts the take where the
+    /// user meant it.
+    ///
+    /// `None` until the device has asked for its first block (there is no
+    /// clock to place anything on yet), and negative for an instant before it.
+    pub fn heard_secs_at(&self, t: Instant) -> Option<f64> {
+        let started = *self.started.get()?;
+        // Signed: an instant from before the first block is a negative time,
+        // which is how the caller tells a keystroke that beat the transport
+        // from one that followed it.
+        let since = match t.checked_duration_since(started) {
+            Some(d) => d.as_secs_f64(),
+            None => -started.saturating_duration_since(t).as_secs_f64(),
+        };
+        Some(since - self.latency_us.load(Ordering::Relaxed) as f64 / 1e6)
     }
 
     /// Seconds played so far.
@@ -422,44 +542,115 @@ fn rewind(voices: &mut [Voice], position: &AtomicU64) {
 /// A row whose plugin fails to load is logged and skipped: one broken track must
 /// not take the rest of the composition with it. `plugins.len()` is how many
 /// actually loaded.
+/// One ready instance per plan, `None` where the row could not be loaded — a
+/// broken row is logged and skipped rather than taking the composition with it.
+///
+/// **One at a time, deliberately.** Loading six rows takes six times as long as
+/// one, and doing them on six threads would take about one — but a plugin's
+/// instances are not independent enough for that. jdrummer livelocks on it: two
+/// threads inside its construction spin forever, about one run in three. Making
+/// the first instance alone (a plugin's one-time global setup) and the rest
+/// together only lowered that to one in ten. A DAW that freezes for good one
+/// time in ten is worse than one that takes three seconds, so this stays
+/// sequential; the loading is off the GUI thread instead, where waiting for it
+/// costs the user a message rather than a dead window.
+fn load_instances(
+    plans: &[RowPlan],
+    sample_rate: f64,
+    max_block: i32,
+) -> Vec<Option<Arc<PluginInstance>>> {
+    // One module per distinct library rather than one per row: that is what a
+    // VST3 module is for, and it saves a `dlopen` and a `ModuleEntry` per row.
+    let mut modules: HashMap<PathBuf, Option<Arc<Vst3Module>>> = HashMap::new();
+    for plan in plans {
+        modules
+            .entry(plan.source.plugin_path.clone())
+            .or_insert_with(|| match Vst3Module::open(&plan.source.plugin_path) {
+                Ok(m) => Some(Arc::new(m)),
+                Err(e) => {
+                    log::warn!("Composer: '{}' failed to load: {e:#}", plan.source.name);
+                    None
+                }
+            });
+    }
+
+    plans
+        .iter()
+        .map(|plan| {
+            let module = modules.get(&plan.source.plugin_path).cloned().flatten();
+            load_one(module, plan, sample_rate, max_block)
+        })
+        .collect()
+}
+
+/// One instance, ready to play: created, given the state the project saved, and
+/// set up for audio.
+fn load_one(
+    module: Option<Arc<Vst3Module>>,
+    plan: &RowPlan,
+    sample_rate: f64,
+    max_block: i32,
+) -> Option<Arc<PluginInstance>> {
+    let module = module?;
+    // Only LeSynth exposes the state ABI, and only a tagged instance can be
+    // addressed by it.
+    let token = plan.source.is_lesynth.then(next_instance_token);
+    let inst = match PluginInstance::from_module(module, plan.source.class_id.as_ref(), token) {
+        Ok(i) => Arc::new(i),
+        Err(e) => {
+            log::warn!("Composer: '{}' failed to load: {e:#}", plan.source.name);
+            return None;
+        }
+    };
+
+    // Before activation, as the spec has it: a plugin sizes its buffers for the
+    // state it is given. This is where a third-party VST3's knobs come back —
+    // what the user set in its editor, or what the project saved.
+    if let Some(bytes) = &plan.source.vst_state {
+        // Only if it would change something. A fresh instance is often already
+        // in the saved state (the project was saved from one), and restoring
+        // anyway is not free: jdrummer reloads its whole SoundFont on
+        // `setState` whether the kit changed or not — 430 ms a row, against a
+        // fraction of a millisecond to ask what state it is in.
+        let unchanged = inst
+            .component_state()
+            .is_ok_and(|current| current == *bytes);
+        if !unchanged {
+            if let Err(e) = inst.set_component_state(bytes) {
+                log::warn!("Composer: '{}' state restore failed: {e:#}", plan.source.name);
+            }
+        }
+    }
+    let _ = inst.initialize_audio(sample_rate, max_block);
+    if let Some(state) = &plan.source.state {
+        if let Err(e) = inst.import_state(state) {
+            log::warn!("Composer: '{}' grid import failed: {e:#}", plan.source.name);
+        }
+    }
+    Some(inst)
+}
+
 fn prepare_voices(
     plans: Vec<RowPlan>,
     sample_rate: f64,
     max_block: i32,
 ) -> Result<(Vec<Voice>, Vec<Arc<PluginInstance>>, u64)> {
+    // Load the plugins first, and load them **at the same time**. Each instance
+    // is hundreds of milliseconds of its own work — a sampler reads its samples,
+    // and restoring a saved state can make it read them again — and rows do not
+    // interact while they load. Six rows of the same drum plugin took 2.8 s in a
+    // row and take about one of them together.
+    //
+    // The module is opened once per library rather than once per row: that is
+    // what a VST3 module is for, and `ModuleEntry` is not a thing to race.
+    let instances = load_instances(&plans, sample_rate, max_block);
+
     let mut voices: Vec<Voice> = Vec::new();
     let mut plugins: Vec<Arc<PluginInstance>> = Vec::new();
     let mut last_event = 0u64;
 
-    for plan in plans {
-        // Only LeSynth exposes the state ABI, and only a tagged instance can
-        // be addressed by it.
-        let token = plan.source.is_lesynth.then(next_instance_token);
-        let inst = match PluginInstance::load(
-            &plan.source.plugin_path,
-            plan.source.class_id.as_ref(),
-            token,
-        ) {
-            Ok(i) => Arc::new(i),
-            Err(e) => {
-                log::warn!("Composer: '{}' failed to load: {e}", plan.source.name);
-                continue;
-            }
-        };
-        // Before activation, as the spec has it: a plugin sizes its buffers for
-        // the state it is given. This is where a third-party VST3's knobs come
-        // back — what the user set in its editor, or what the project saved.
-        if let Some(bytes) = &plan.source.vst_state {
-            if let Err(e) = inst.set_component_state(bytes) {
-                log::warn!("Composer: '{}' state restore failed: {e:#}", plan.source.name);
-            }
-        }
-        let _ = inst.initialize_audio(sample_rate, max_block);
-        if let Some(state) = &plan.source.state {
-            if let Err(e) = inst.import_state(state) {
-                log::warn!("Composer: '{}' grid import failed: {e}", plan.source.name);
-            }
-        }
+    for (plan, inst) in plans.into_iter().zip(instances) {
+        let Some(inst) = inst else { continue };
 
         let (schedule, row_last_event) = schedule_from(&plan.notes, sample_rate);
         last_event = last_event.max(row_last_event);

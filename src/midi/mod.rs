@@ -15,4 +15,7 @@ pub mod drums;
 pub mod input;
 
 pub use drums::{gm_percussion_name, plays_a_drum_kit};
-pub use input::{MidiEventQueue, spawn_midi_thread, new_midi_queue, list_usb_midi_keyboards};
+pub use input::{
+    add_midi_tap, list_usb_midi_keyboards, new_midi_queue, new_midi_taps, spawn_midi_thread,
+    MidiEventQueue, MidiTap, MidiTaps,
+};

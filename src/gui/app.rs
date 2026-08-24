@@ -14,7 +14,7 @@
 use anyhow::Context;
 use eframe::egui;
 
-use crate::midi::{self, MidiEventQueue};
+use crate::midi::{self, MidiEventQueue, MidiTaps};
 
 use super::composer::project::{self, Project, TrackSource};
 use super::composer::{ComposerPanel, ProjectRequest};
@@ -31,6 +31,9 @@ pub struct DawApp {
 
     // Runtime state
     midi_queue: MidiEventQueue,
+    /// Listeners that get a stamped copy of the keyboard alongside the queue —
+    /// how the Composer records without taking events away from an open editor.
+    midi_taps: MidiTaps,
     _midi_connection: Option<midir::MidiInputConnection<()>>,
 
     // Instrument tracks (LeSynth Fourier / custom VST), each with its own editor.
@@ -48,6 +51,7 @@ pub struct DawApp {
 impl Default for DawApp {
     fn default() -> Self {
         let midi_queue = midi::new_midi_queue();
+        let midi_taps = midi::new_midi_taps();
         // The one track list the panels share: Tracks and Resynthesis publish
         // into it, the Composer builds its rows from it.
         let registry = TrackRegistry::default();
@@ -58,8 +62,9 @@ impl Default for DawApp {
             usb_keyboards: Vec::new(),
             selected_usb_keyboard: None,
             tracks: TracksPanel::new(midi_queue.clone(), registry.clone()),
-            composer: ComposerPanel::new(registry.clone()),
+            composer: ComposerPanel::new(registry.clone(), midi_taps.clone()),
             midi_queue,
+            midi_taps,
             _midi_connection: None,
             resynth: ResynthPanel::new(registry.clone()),
             registry,
@@ -149,7 +154,11 @@ impl DawApp {
             .selected_usb_keyboard
             .clone()
             .or_else(|| self.selected_midi_port.clone());
-        match midi::spawn_midi_thread(self.midi_queue.clone(), port_filter.as_deref()) {
+        match midi::spawn_midi_thread(
+            self.midi_queue.clone(),
+            self.midi_taps.clone(),
+            port_filter.as_deref(),
+        ) {
             Ok(conn) => {
                 self.midi_status = format!(
                     "Connected: {}",

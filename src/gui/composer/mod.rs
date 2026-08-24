@@ -32,19 +32,26 @@
 //! **Length is two select boxes**: whole notes plus a fraction down to 1/256.
 //! Time is counted in [`UNITS_PER_WHOLE`]ths, so every length is a whole number
 //! of units and the arithmetic stays exact. Playback lives in [`player`].
+//!
+//! **Rows can also be played in rather than written.** "Record & Play Once"
+//! plays the composition through once and captures a MIDI keyboard against it,
+//! rounding what was played onto a chosen note value and appending it as new
+//! rows — see [`record`].
 
 pub mod player;
 pub mod project;
+pub mod record;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
+use std::time::Instant;
 
 use eframe::egui;
 
-use self::player::{CompositionPlayer, PlannedNote, RowEdit, RowPlan};
-use crate::midi::gm_percussion_name;
+use self::player::{CompositionPlayer, PlannedNote, PreparedComposition, RowEdit, RowPlan};
+use crate::midi::{add_midi_tap, gm_percussion_name, MidiTap, MidiTaps};
 use super::registry::TrackRegistry;
 
 /// Time resolution: a whole note is this many units. 256 makes every fraction in
@@ -360,6 +367,26 @@ struct LiveSnapshot {
     shape_warned: bool,
 }
 
+/// A take in progress: where the keyboard's messages are piling up, and what
+/// they are timed against.
+///
+/// Nothing is written into the composition until it ends. A row is a chain of
+/// lengths, so a note's frame cannot be built before the note after it is known
+/// — and half a note appearing in a row while the user is still playing would
+/// be a distraction, not feedback.
+struct Recording {
+    /// This take's own copy of the keyboard, stamped as it arrived. A copy, not
+    /// the queue itself: an open editor drains that one destructively, and
+    /// recording must not take notes away from the instrument the user is
+    /// listening to while they play.
+    tap: MidiTap,
+    /// The clock for a take with no transport behind it (an empty composition
+    /// has nothing to play, so there is no stream to ask). With one, the
+    /// transport's own [`CompositionPlayer::heard_secs_at`] is used instead, so
+    /// what was played lines up with what was heard.
+    origin: Instant,
+}
+
 /// The Composer panel.
 pub struct ComposerPanel {
     registry: TrackRegistry,
@@ -376,6 +403,9 @@ pub struct ComposerPanel {
     request: Option<ProjectRequest>,
     status: String,
     player: Option<CompositionPlayer>,
+    /// A Play that has been pressed but has not made a sound yet: the rows are
+    /// loading their plugins on a thread of their own.
+    preparing: Option<Receiver<Result<PreparedComposition, String>>>,
     /// Loop the composition instead of stopping at the end. Shared with the
     /// transport's audio callback, so the checkbox works on a running player.
     repeat: Arc<AtomicBool>,
@@ -386,10 +416,19 @@ pub struct ComposerPanel {
     /// line to show when it is done. The GUI must not block on it: a long
     /// composition takes seconds, and a frozen window looks like a crash.
     export: Option<Receiver<String>>,
+    /// Where a recording gets its own copy of the keyboard from.
+    midi_taps: MidiTaps,
+    /// The take being played in, if any.
+    recording: Option<Recording>,
+    /// The note value a take is rounded onto, in units.
+    round_units: i64,
+    /// The track a recorded row plays. `None` falls back to the first track
+    /// there is, which is what an empty registry and a fresh panel both mean.
+    record_track: Option<u64>,
 }
 
 impl ComposerPanel {
-    pub fn new(registry: TrackRegistry) -> Self {
+    pub fn new(registry: TrackRegistry, midi_taps: MidiTaps) -> Self {
         Self {
             registry,
             rows: Vec::new(),
@@ -400,9 +439,14 @@ impl ComposerPanel {
             request: None,
             status: "Add a track row to start composing.".to_string(),
             player: None,
+            preparing: None,
             repeat: Arc::new(AtomicBool::new(false)),
             live_sent: None,
             export: None,
+            midi_taps,
+            recording: None,
+            round_units: record::DEFAULT_ROUND_UNITS,
+            record_track: None,
         }
     }
 
@@ -440,6 +484,9 @@ impl ComposerPanel {
                 row.track_id = first;
             }
         }
+        if !self.record_track.is_some_and(|id| self.registry.contains(id)) {
+            self.record_track = first;
+        }
     }
 
     /// End of the composition in units — the longest row.
@@ -468,6 +515,16 @@ impl ComposerPanel {
             });
         }
         plans
+    }
+
+    /// Whether anything would play — without asking the registry for a playback
+    /// source, which exports a LeSynth's live grid and is far too much work for
+    /// a question this cheap to answer.
+    fn has_playable_rows(&self) -> bool {
+        let spu = self.secs_per_unit();
+        self.rows
+            .iter()
+            .any(|row| row.track_id.is_some() && !row.planned_notes(spu).is_empty())
     }
 
     /// The composition as the transport would need it *now*. Cheap by design:
@@ -535,31 +592,190 @@ impl ComposerPanel {
         self.live_sent = Some(snapshot);
     }
 
-    fn start_playback(&mut self) {
+    /// Press Play: load the rows on a thread, and start the transport when they
+    /// land ([`Self::poll_preparation`]).
+    ///
+    /// Loading is not quick — one plugin instance per row, and a plugin can take
+    /// a second — so doing it here would freeze the window for as long as it
+    /// takes, which is what makes a transport feel broken. The composition is
+    /// snapshotted now, so what plays is what was on screen when the button went
+    /// down, however long the loading takes.
+    fn start_playback(&mut self, ctx: &egui::Context) {
+        if self.preparing.is_some() {
+            return;
+        }
         let plans = self.build_plans();
         if plans.is_empty() {
             self.status = "Nothing to play — add a note to a row first.".to_string();
             return;
         }
-        // The written length — the longest row, trailing silence and all — is
-        // what a repeat loops on, not where a one-shot play stops (that is the
-        // last note plus its release).
+        let rows = plans.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The context, so the rows can wake the window the moment they are
+        // ready. Without it the transport waits for whenever the GUI next
+        // happens to paint, which is a quarter of a second of silence for
+        // nothing.
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(CompositionPlayer::prepare(plans).map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.preparing = Some(rx);
+        self.live_sent = Some(self.live_snapshot());
+        self.status = format!("Loading {rows} row(s)…");
+    }
+
+    /// Start the transport once the rows have finished loading. Opening the
+    /// stream is a couple of milliseconds, so that half stays here.
+    fn poll_preparation(&mut self) {
+        let Some(rx) = &self.preparing else { return };
+        let ready = match rx.try_recv() {
+            Ok(ready) => ready,
+            Err(TryRecvError::Empty) => return,
+            // The loading thread died without a word, which is still an answer.
+            Err(TryRecvError::Disconnected) => Err("the rows stopped loading".to_string()),
+        };
+        self.preparing = None;
+
+        let prepared = match ready {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("Playback failed: {e}");
+                self.live_sent = None;
+                // A take with no backing track and no clock to place it on is
+                // not a take. Abandoning it here is better than recording
+                // against a silence the user was not expecting.
+                self.recording = None;
+                return;
+            }
+        };
+        let (loaded, total) = prepared.loaded_rows();
+        // The length may have been edited while the rows were loading; the loop
+        // follows what is on screen now, as a live edit would.
         let loop_secs = self.end_units() as f64 * self.secs_per_unit();
-        match CompositionPlayer::start(plans, loop_secs, self.repeat.clone()) {
+        match CompositionPlayer::start_prepared(prepared, loop_secs, self.repeat.clone()) {
             Ok(player) => {
-                self.status = if player.loaded_rows == player.total_rows {
-                    format!("Playing {} row(s).", player.loaded_rows)
+                self.status = if loaded == total {
+                    format!("Playing {loaded} row(s).")
                 } else {
-                    format!(
-                        "Playing {} of {} row(s) — the rest failed to load.",
-                        player.loaded_rows, player.total_rows
-                    )
+                    format!("Playing {loaded} of {total} row(s) — the rest failed to load.")
                 };
-                self.live_sent = Some(self.live_snapshot());
+                if let Some(rec) = &self.recording {
+                    // The take starts where the sound does. Loading the rows
+                    // took as long as it took, and anything played into the tap
+                    // meanwhile was played against nothing — the transport's own
+                    // clock ([`CompositionPlayer::heard_secs_at`]) takes over
+                    // from here, and it starts at this moment.
+                    if let Ok(mut tapped) = rec.tap.lock() {
+                        tapped.clear();
+                    }
+                    self.status = format!("⏺ Recording over {loaded} row(s) — play your keyboard.");
+                }
                 self.player = Some(player);
             }
-            Err(e) => self.status = format!("Playback failed: {e}"),
+            Err(e) => {
+                self.status = format!("Playback failed: {e:#}");
+                self.live_sent = None;
+                self.recording = None;
+            }
         }
+    }
+
+    /// Press Record: play the composition through exactly once, and keep
+    /// everything the MIDI keyboard sends while it does.
+    ///
+    /// Nothing is written into the composition until the pass ends
+    /// ([`Self::finish_recording`]). A composition with nothing in it yet still
+    /// records — there is simply no transport behind the take, and it runs from
+    /// the button press until Stop.
+    fn start_recording(&mut self, ctx: &egui::Context) {
+        if self.recording.is_some() || self.player.is_some() || self.preparing.is_some() {
+            return;
+        }
+        // Exactly once, as the button says: a loop would have the second pass
+        // recorded over the first.
+        self.repeat.store(false, Ordering::Relaxed);
+        self.recording = Some(Recording {
+            tap: add_midi_tap(&self.midi_taps),
+            origin: Instant::now(),
+        });
+        if self.has_playable_rows() {
+            self.start_playback(ctx);
+            // `start_playback` says how many rows are loading; the take is only
+            // armed once they are (see `poll_preparation`).
+            self.status = format!("⏺ {}", self.status);
+        } else {
+            self.status = "⏺ Recording — nothing to play along to, so it runs from now \
+                           until you press Stop."
+                .to_string();
+        }
+    }
+
+    /// End a take and append what was played to the composition, rounded onto
+    /// the chosen note value.
+    ///
+    /// Returns the line to show, which the caller puts up *after* whatever
+    /// stopping the transport had to say — "Stopped." is not the news here.
+    /// Must be called while the player is still in hand: the transport is the
+    /// clock the take is placed on.
+    fn finish_recording(&mut self) -> Option<String> {
+        let rec = self.recording.take()?;
+        let messages = match rec.tap.lock() {
+            Ok(mut tapped) => std::mem::take(&mut *tapped),
+            // The tap is only ever locked for a push and for this; a poisoned
+            // one means a MIDI callback panicked, and the take is gone with it.
+            Err(_) => return Some("Recording failed: the keyboard tap was lost.".to_string()),
+        };
+
+        let notes = {
+            let player = self.player.as_ref();
+            let clock = |t: Instant| match player {
+                Some(p) => p.heard_secs_at(t),
+                None => Some(t.saturating_duration_since(rec.origin).as_secs_f64()),
+            };
+            let end_secs = clock(Instant::now()).unwrap_or(0.0);
+            record::notes_from(&messages, clock, end_secs)
+        };
+        if notes.is_empty() {
+            return Some(
+                "Recorded nothing — no notes arrived. Connect a keyboard under MIDI \
+                 and press Connect."
+                    .to_string(),
+            );
+        }
+
+        let grid = self.round_units;
+        let quantized = record::quantize(&notes, self.secs_per_unit(), grid);
+        let voices = record::split_voices(&quantized);
+        let track = self.record_track.or_else(|| self.registry.first_id());
+        for voice in &voices {
+            let id = self.next_row_id;
+            self.next_row_id += 1;
+            let mut row = Row::new(id, track);
+            let (lead, items) = record::voice_items(voice, &mut row.next_item_id);
+            row.lead = lead;
+            row.items = items;
+            self.rows.push(row);
+        }
+
+        let played = notes.len();
+        let rows = voices.len();
+        let grid = record::round_label(grid);
+        Some(match (track, rows) {
+            // A take with no track behind it is still worth keeping: the rows
+            // are there, and the select box on each is how they get a sound.
+            (None, _) => format!(
+                "Recorded {played} note(s) into {rows} new row(s), rounded to {grid} — \
+                 no tracks exist yet, so pick one on each row."
+            ),
+            (Some(_), 1) => format!("Recorded {played} note(s) into a new row, rounded to {grid}."),
+            // More rows than one means notes overlapped: a row plays one note at
+            // a time, so a chord has to be spread across several.
+            (Some(_), _) => format!(
+                "Recorded {played} note(s), rounded to {grid} — spread over {rows} new rows, \
+                 because notes overlapped."
+            ),
+        })
     }
 
     /// Render the whole composition offline and write it as a `.wav`.
@@ -624,9 +840,20 @@ impl ComposerPanel {
     }
 
     fn stop_playback(&mut self) {
+        // The take is closed first: the transport is the clock it is placed on,
+        // so it cannot be read after the player has gone.
+        let recorded = self.finish_recording();
         self.live_sent = None;
-        if self.player.take().is_some() {
+        // Dropping the receiver abandons a Play that is still loading: the
+        // thread finishes on its own and drops the instances it made, which is
+        // exactly where that work belongs — not here.
+        let was_preparing = self.preparing.take().is_some();
+        if self.player.take().is_some() || was_preparing {
             self.status = "Stopped.".to_string();
+        }
+        // What was recorded is the news, not that the transport stopped.
+        if let Some(msg) = recorded {
+            self.status = msg;
         }
     }
 
@@ -641,10 +868,16 @@ impl ComposerPanel {
         self.reconcile_tracks();
         // A finished composition stops itself, so the transport does not sit on
         // "playing" over silence.
+        // A Play whose rows have finished loading starts here, so the button
+        // press and the first sound are separate frames and the window never
+        // stops painting between them.
+        self.poll_preparation();
         if self.player.as_ref().is_some_and(CompositionPlayer::is_finished) {
+            // Before the player goes: a take is placed on the transport's clock.
+            let recorded = self.finish_recording();
             self.player = None;
             self.live_sent = None;
-            self.status = "Finished.".to_string();
+            self.status = recorded.unwrap_or_else(|| "Finished.".to_string());
         }
         // Anything the user changed while a repeat is running goes in at the
         // next loop point.
@@ -1238,29 +1471,57 @@ impl ComposerPanel {
     fn transport_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let playing = self.player.is_some();
+            let loading = self.preparing.is_some();
+            let recording = self.recording.is_some();
             if ui
-                .add_enabled(!playing, egui::Button::new("▶ Play"))
+                .add_enabled(!playing && !loading, egui::Button::new("▶ Play"))
                 .on_hover_text("Play every row from the start")
                 .clicked()
             {
-                self.start_playback();
+                self.start_playback(ui.ctx());
             }
             if ui
-                .add_enabled(playing, egui::Button::new("■ Stop"))
+                .add_enabled(
+                    !playing && !loading && !recording,
+                    egui::Button::new(
+                        egui::RichText::new("⏺ Record & Play Once").color(RECORD),
+                    ),
+                )
+                .on_hover_text(
+                    "Play the composition through exactly once and record your MIDI \
+                     keyboard over it.\n\nWhat you play is appended as new rows when the \
+                     pass ends (or when you press Stop), with every note and every \
+                     silence rounded onto the note value in “Round”. Notes that \
+                     overlap go into a row each — a row plays one note at a time — so \
+                     a chord comes out as a row per voice.\n\nTo hear yourself while \
+                     you play, open the track's editor: the keyboard feeds it as usual, \
+                     and recording takes a copy rather than the events themselves.",
+                )
+                .clicked()
+            {
+                self.start_recording(ui.ctx());
+            }
+            // Stop also abandons a Play still loading its rows, and ends a take.
+            if ui
+                .add_enabled(playing || loading || recording, egui::Button::new("■ Stop"))
                 .clicked()
             {
                 self.stop_playback();
             }
             // Live: ticking this mid-play loops from the next pass (or straight
             // away, if the composition is already into its release tail).
+            // Not during a take: "once" is the whole of what Record promises,
+            // and a second pass would be recorded over the first.
             let mut repeat = self.repeat.load(Ordering::Relaxed);
             if ui
-                .checkbox(&mut repeat, "🔁 Repeat")
+                .add_enabled_ui(!recording, |ui| ui.checkbox(&mut repeat, "🔁 Repeat"))
+                .inner
                 .on_hover_text(
                     "Play the composition over and over, looping on its written \
                      length. Releases ring on across the loop, and it can be \
                      switched on and off while it plays — untick it and the \
-                     current pass is the last one.",
+                     current pass is the last one.\n\nUnavailable while recording: \
+                     a take is one pass.",
                 )
                 .changed()
             {
@@ -1288,8 +1549,68 @@ impl ComposerPanel {
                     .suffix(" BPM"),
             )
             .on_hover_text("A beat is a quarter note; every note length scales with this.");
+
+            // What a take is rounded onto, and where it lands. Both belong here
+            // rather than in a dialog: they are read the moment a take ends, so
+            // the rounding can still be reconsidered while the rows load.
+            ui.add_space(12.0);
+            ui.label("Round");
+            egui::ComboBox::from_id_salt("record_round")
+                .width(72.0)
+                .selected_text(record::round_label(self.round_units))
+                .show_ui(ui, |ui| {
+                    for (label, units) in record::ROUND_CHOICES {
+                        ui.selectable_value(&mut self.round_units, units, label);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "The note value a recorded take is rounded onto — every note \
+                     start, every note length and every silence snaps to the nearest \
+                     multiple of it.\n\nA position is rounded exactly: a silence that \
+                     no single length can express is carried on placeholder frames \
+                     behind the space, so nothing after it drifts. A note's *length* \
+                     takes the nearest length the two select boxes can express, which \
+                     is the one thing that can come out a fraction short.",
+                );
+            ui.label("into");
+            let record_label = self
+                .record_track
+                .and_then(|id| self.registry.name_of(id))
+                .unwrap_or_else(|| "— no track —".to_string());
+            egui::ComboBox::from_id_salt(("record_track", self.registry.list().len()))
+                .width(150.0)
+                .selected_text(record_label)
+                .show_ui(ui, |ui| {
+                    if self.registry.list().is_empty() {
+                        ui.label("— no track —");
+                    }
+                    for (id, name) in self.registry.list() {
+                        ui.selectable_value(&mut self.record_track, Some(id), name);
+                    }
+                })
+                .response
+                .on_hover_text("The track the recorded rows will play.");
+
             ui.add_space(12.0);
             let length_secs = self.end_units() as f64 * self.secs_per_unit();
+            if loading {
+                ui.label(
+                    egui::RichText::new("⏳ loading rows…").color(PLAYHEAD),
+                );
+            }
+            // A take says how much of it there is so far. Counting note-ons in
+            // the tap rather than draining it keeps the one conversion of a take
+            // in one place — where it ends.
+            if let Some(rec) = &self.recording {
+                let notes = rec
+                    .tap
+                    .lock()
+                    .map_or(0, |t| t.iter().filter(|(_, m)| is_note_on(*m)).count());
+                ui.label(
+                    egui::RichText::new(format!("⏺ {notes} note(s)")).color(RECORD),
+                );
+            }
             match &self.player {
                 // While looping, the length that means anything is the loop's,
                 // not "last note plus release".
@@ -1322,7 +1643,7 @@ impl ComposerPanel {
         // on time; otherwise stay idle like the rest of the app. An export has
         // nothing to animate but must not sit finished on screen unnoticed, so
         // it only asks for the occasional frame.
-        if self.player.is_some() {
+        if self.player.is_some() || self.preparing.is_some() || self.recording.is_some() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(16));
         } else if self.export.is_some() {
@@ -1339,6 +1660,15 @@ const LEAD_SPACE_ID: u64 = u64::MAX;
 /// Colour of the transport's position readout, and of the frame sounding under
 /// it.
 const PLAYHEAD: egui::Color32 = egui::Color32::from_rgb(240, 120, 110);
+
+/// Colour of the record button and of a take's note count.
+const RECORD: egui::Color32 = egui::Color32::from_rgb(235, 90, 90);
+
+/// Whether a MIDI message starts a note. The zero-velocity note-on most
+/// keyboards send instead of a note-off does not.
+fn is_note_on(msg: [u8; 3]) -> bool {
+    msg[0] & 0xF0 == 0x90 && msg[2] > 0
+}
 
 #[cfg(test)]
 mod tests {
@@ -1370,7 +1700,7 @@ mod tests {
 
     /// A panel with one row of `items`, playing track `track`.
     fn panel_with(items: &[(u8, Duration, Duration)], track: Option<u64>) -> ComposerPanel {
-        let mut panel = ComposerPanel::new(TrackRegistry::default());
+        let mut panel = ComposerPanel::new(TrackRegistry::default(), crate::midi::new_midi_taps());
         let mut row = row_with(items);
         row.track_id = track;
         panel.rows.push(row);
@@ -1403,6 +1733,70 @@ mod tests {
         row.items.clear();
         row.add_note(DEFAULT_PITCH);
         assert_eq!(row.items[0].pitch, DEFAULT_PITCH);
+    }
+
+    /// Pressing Play must not wait for the plugins.
+    ///
+    /// The Composer loads one instance per row, and that is hundreds of
+    /// milliseconds — seconds, for a big synth or a long composition. Doing it
+    /// in the button's own call freezes the window until the first sound, which
+    /// is what "the transport lags" means. So Play hands the loading to a thread
+    /// and returns: the test is that it comes back with no transport yet, and
+    /// that one turns up on a later frame.
+    #[test]
+    fn pressing_play_hands_the_loading_to_a_thread() {
+        let registry = TrackRegistry::default();
+        let plugin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("internal_plugins")
+            .join("liblesynth_fourier.so");
+        if !plugin.exists() {
+            println!("no internal plugin — nothing to load");
+            return;
+        }
+        let id = registry.add(
+            "LeSynth",
+            plugin,
+            Some(crate::vst::class_ids::FOURIER_SYNTH),
+            true,
+            None,
+        );
+        let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
+        let mut row = row_with(&[(60, frac(Fraction::Quarter), frac(Fraction::Eighth))]);
+        row.track_id = Some(id);
+        panel.rows.push(row);
+
+        let pressed = std::time::Instant::now();
+        panel.start_playback(&egui::Context::default());
+        let button_took = pressed.elapsed();
+        assert!(
+            panel.preparing.is_some(),
+            "Play did not start loading: {}",
+            panel.status
+        );
+        assert!(
+            panel.player.is_none(),
+            "Play waited for the transport instead of handing it off"
+        );
+        assert!(
+            button_took < std::time::Duration::from_millis(100),
+            "the button itself took {button_took:?}"
+        );
+
+        // The transport turns up on a later frame, without the button's help.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while panel.player.is_none() && std::time::Instant::now() < deadline {
+            panel.poll_preparation();
+            if panel.status.starts_with("Playback failed") {
+                println!("nothing to play through ({}) — the rest needs a device", panel.status);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(panel.player.is_some(), "the transport never started: {}", panel.status);
+        assert!(panel.status.starts_with("Playing"), "status reads {:?}", panel.status);
+
+        panel.stop_playback();
+        assert!(panel.player.is_none() && panel.preparing.is_none());
     }
 
     /// A drum track names its notes after what they hit; an instrument track
@@ -1716,7 +2110,7 @@ mod tests {
     #[test]
     fn a_row_follows_the_track_list_as_tracks_come_and_go() {
         let (registry, ids) = registry_with(&["one", "two"]);
-        let mut panel = ComposerPanel::new(registry.clone());
+        let mut panel = ComposerPanel::new(registry.clone(), crate::midi::new_midi_taps());
         panel.add_row();
         assert_eq!(panel.rows[0].track_id, Some(ids[0]));
 
@@ -1750,7 +2144,7 @@ mod tests {
     #[test]
     fn the_panel_lays_out_in_every_state_without_panicking() {
         let (registry, ids) = registry_with(&["one"]);
-        let mut panel = ComposerPanel::new(registry.clone());
+        let mut panel = ComposerPanel::new(registry.clone(), crate::midi::new_midi_taps());
         let ctx = egui::Context::default();
         let frame = |panel: &mut ComposerPanel| {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1759,6 +2153,13 @@ mod tests {
         };
 
         frame(&mut panel); // no rows: just the add button and the transport
+
+        // The transport in its recording state — the note-count readout, the
+        // rounding and target select boxes, and Repeat disabled beneath them.
+        // Started with no rows, so nothing is loading behind it.
+        panel.start_recording(&ctx);
+        frame(&mut panel);
+        let _ = panel.finish_recording();
 
         panel.add_row();
         frame(&mut panel); // a row with no frames yet
@@ -1790,6 +2191,51 @@ mod tests {
         frame(&mut panel);
         assert!(panel.rows.iter().all(|r| r.track_id.is_none()));
     }
+    /// A take with nothing to play against is still a take: it runs from the
+    /// button press, and what was played comes back as rows of the composition —
+    /// rounded, on the track the recorder was pointed at.
+    #[test]
+    fn a_take_becomes_rows_on_the_composition() {
+        let (registry, ids) = registry_with(&["one"]);
+        let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
+        let ctx = egui::Context::default();
+        panel.reconcile_tracks();
+        panel.start_recording(&ctx);
+        // Nothing to play along to, so no transport was started — the take is
+        // timed from the press instead.
+        assert!(panel.player.is_none() && panel.preparing.is_none());
+        let tap = panel.recording.as_ref().expect("a take is running").tap.clone();
+
+        // The keyboard, as the MIDI callback delivers it: two quarter notes at
+        // the default 120 BPM, the second a beat after the first.
+        let now = Instant::now();
+        let at = |ms: u64| now + std::time::Duration::from_millis(ms);
+        tap.lock().unwrap().extend([
+            (at(0), [0x90, 60, 100]),
+            (at(480), [0x80, 60, 0]),
+            (at(500), [0x90, 64, 100]),
+            (at(990), [0x80, 64, 0]),
+        ]);
+
+        let status = panel.finish_recording().expect("the take reports itself");
+        assert!(status.contains("2 note(s)"), "{status}");
+        assert_eq!(panel.rows.len(), 1);
+        assert_eq!(panel.rows[0].track_id, Some(ids[0]));
+        assert_eq!(
+            panel.rows[0].items.iter().map(|i| i.pitch).collect::<Vec<_>>(),
+            vec![60, 64]
+        );
+        // Rounded to 1/16 and back to seconds: a quarter note each, a beat apart.
+        let played = panel.rows[0].planned_notes(panel.secs_per_unit());
+        assert_eq!(played.len(), 2);
+        assert!((played[0].at_secs - 0.0).abs() < 1e-9, "{played:?}");
+        assert!((played[1].at_secs - 0.5).abs() < 1e-9, "{played:?}");
+        assert!((played[0].dur_secs - 0.5).abs() < 1e-9, "{played:?}");
+        // The take is over: the tap is emptied and nothing is left running.
+        assert!(panel.recording.is_none());
+        assert!(tap.lock().unwrap().is_empty());
+    }
+
     /// A row's track select box must offer every track in the registry, not the
     /// ones that happened to exist when the row was added.
     ///
@@ -1804,7 +2250,7 @@ mod tests {
         for n in 1..=2 {
             registry.add(format!("t{n}"), std::path::PathBuf::from("/x"), None, false, None);
         }
-        let mut panel = ComposerPanel::new(registry.clone());
+        let mut panel = ComposerPanel::new(registry.clone(), crate::midi::new_midi_taps());
         let ctx = egui::Context::default();
         // The app's own spacing and text sizes: how tall a popup item is decides
         // how much of the list a stuck popup can still show, so the default
@@ -1965,7 +2411,7 @@ mod tests {
     #[test]
     fn a_missing_source_is_kept_until_the_user_replaces_it() {
         let (registry, ids) = registry_with(&["other"]);
-        let mut panel = ComposerPanel::new(registry.clone());
+        let mut panel = ComposerPanel::new(registry.clone(), crate::midi::new_midi_taps());
         let loaded = project::Project {
             name: "Song".to_string(),
             tempo_bpm: 100.0,
@@ -2021,7 +2467,7 @@ mod tests {
     #[test]
     fn a_loaded_project_restores_every_row_setting() {
         let (registry, ids) = registry_with(&["a", "b"]);
-        let mut panel = ComposerPanel::new(registry);
+        let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
         panel.add_row();
         let loaded = project::Project {
             name: "Two".to_string(),

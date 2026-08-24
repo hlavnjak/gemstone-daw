@@ -41,15 +41,6 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    /// Upper bound on the block size declared to a plugin.
-    ///
-    /// A device's *supported* range can top out in the millions of frames, and
-    /// `setupProcessing` is a promise: a plugin sizes its internal buffers for
-    /// the maximum it is told, so handing it the raw range maximum makes it
-    /// allocate hundreds of megabytes it will never use (some simply refuse).
-    /// Real callbacks are three orders of magnitude below this cap.
-    const MAX_DECLARED_BLOCK: u32 = 16_384;
-
     /// Query the default audio device and return its configuration.
     pub fn query_device_config() -> Result<AudioConfig> {
         let host = cpal::default_host();
@@ -59,10 +50,7 @@ impl AudioEngine {
         let cfg = device.default_output_config()?;
 
         let sample_rate = cfg.sample_rate().0 as f64;
-        let max_buffer_size = match cfg.buffer_size() {
-            cpal::SupportedBufferSize::Range { max, .. } => (*max).min(Self::MAX_DECLARED_BLOCK),
-            _ => 512,
-        };
+        let max_buffer_size = declared_block_size(cfg.buffer_size());
         let channels = cfg.channels() as usize;
 
         Ok(AudioConfig {
@@ -95,10 +83,7 @@ impl AudioEngine {
         let cfg = device.default_output_config()?;
 
         let sample_rate = cfg.sample_rate().0 as f64;
-        let max_buffer_size = match cfg.buffer_size() {
-            cpal::SupportedBufferSize::Range { max, .. } => (*max).min(Self::MAX_DECLARED_BLOCK),
-            _ => 512,
-        };
+        let max_buffer_size = declared_block_size(cfg.buffer_size());
         let channels = cfg.channels() as usize;
         let stream_cfg: cpal::StreamConfig = cfg.into();
 
@@ -233,6 +218,26 @@ impl AudioEngine {
                 channels,
             },
         })
+    }
+}
+
+/// Upper bound on the block size declared to a plugin.
+///
+/// A device's *supported* range can top out in the millions of frames — this
+/// machine's reports 4 194 304 — and `setupProcessing` is a promise: a plugin
+/// sizes its internal buffers for the maximum it is told. Hand over the raw
+/// range maximum and a plugin with seventeen stereo buses reserves half a
+/// gigabyte it will never use, which is seconds of stall on the thread that
+/// asked. Real callbacks are three orders of magnitude below this cap.
+pub(crate) const MAX_DECLARED_BLOCK: u32 = 16_384;
+
+/// The block size to set a plugin up for, given what the device says it can
+/// deliver. Every path that starts a plugin goes through this: the number is a
+/// promise the plugin allocates against, and two copies of it drift.
+pub(crate) fn declared_block_size(buffer_size: &cpal::SupportedBufferSize) -> u32 {
+    match buffer_size {
+        cpal::SupportedBufferSize::Range { max, .. } => (*max).min(MAX_DECLARED_BLOCK),
+        _ => 512,
     }
 }
 

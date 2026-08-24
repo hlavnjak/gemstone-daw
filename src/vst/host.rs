@@ -340,7 +340,14 @@ impl PluginInstance {
         Self::from_module(module, class_id, token)
     }
 
-    fn from_module(
+    /// Create an instance from a module that is already open.
+    ///
+    /// A VST3 module is meant to be loaded once per process, and its
+    /// `ModuleEntry` is not something to race: a caller making several instances
+    /// of the same plugin opens the module once and calls this per instance.
+    /// Note that this being safe to *call* concurrently says nothing about the
+    /// plugin behind it — see `load_instances` in the Composer's player.
+    pub fn from_module(
         module: Arc<Vst3Module>,
         class_id: Option<&[i8; 16]>,
         token: Option<u64>,
