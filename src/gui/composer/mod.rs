@@ -234,6 +234,12 @@ struct Row {
     /// On by default, so a project saved after an edit carries the edit; off
     /// pins whatever `.lsft` is already there.
     autosave: bool,
+    /// Scroll this lane to keep the sounding frame in view while the transport
+    /// runs. On by default: a row of any length is wider than the window, so a
+    /// lane that does not follow shows the first few seconds of the composition
+    /// and nothing of the rest. Off pins the lane where the user left it, which
+    /// is what you want while editing one part of a long row as it plays.
+    autoscroll: bool,
     /// The source a loaded project asked for and the app could not find. Kept
     /// whole, not just as a message, so saving the project again preserves the
     /// reference rather than quietly replacing it with "no track" — a save after
@@ -256,6 +262,7 @@ impl Row {
             gain: 1.0,
             lead: Duration::new(0, Fraction::None),
             autosave: true,
+            autoscroll: true,
             missing: None,
             items: Vec::new(),
             next_item_id: 0,
@@ -977,6 +984,7 @@ impl ComposerPanel {
                     gain: row.gain,
                     lead: row.lead,
                     autosave: row.autosave,
+                    autoscroll: row.autoscroll,
                     items: row.items.clone(),
                 })
                 .collect(),
@@ -1005,6 +1013,7 @@ impl ComposerPanel {
             row.gain = prow.gain;
             row.lead = prow.lead;
             row.autosave = prow.autosave;
+            row.autoscroll = prow.autoscroll;
             // Nothing to bind means the source is gone. Keep what it was so the
             // row can say so and the user knows what to replace.
             row.missing = match (track_id, &prow.source) {
@@ -1252,6 +1261,18 @@ impl ComposerPanel {
                                                  when it was first written.",
                                             );
                                     });
+                                    ui.checkbox(&mut row.autoscroll, "⏵ follow")
+                                        .on_hover_text(
+                                            "While the transport is playing — including \
+                                             a take — keep this lane scrolled to the \
+                                             frame that is sounding, centred.\n\n\
+                                             On by default: a row of any length is wider \
+                                             than the window, so a lane that does not \
+                                             follow shows the first few seconds and \
+                                             nothing of the rest. Turn it off to keep \
+                                             the lane where you put it while you edit \
+                                             one part of a long row as it plays.",
+                                        );
                                 },
                             );
 
@@ -1284,6 +1305,10 @@ impl ComposerPanel {
     /// because a frame's position is nothing but the sum of the lengths before
     /// it.
     fn chain_ui(ui: &mut egui::Ui, row: &mut Row, playhead: Option<f64>, percussion: bool) {
+        // Follow the transport only while there *is* one, and only if this lane
+        // was asked to: scrolling a lane every frame is exactly what stops the
+        // user scrolling it themselves.
+        let follow = row.autoscroll && playhead.is_some();
         // Deferred: removing a frame rewrites the list this loop walks.
         let mut pending_delete: Option<usize> = None;
         // Taken before the frames are drawn, so an edit made in one frame moves
@@ -1304,11 +1329,12 @@ impl ComposerPanel {
             // instead. Drawn only when there is a note for it to lead.
             if !row.items.is_empty() {
                 Self::frame_ui(ui, row_id, LEAD_SPACE_ID, None, &mut row.lead, false, percussion);
+
             }
             for (idx, (item, start)) in row.items.iter_mut().zip(starts).enumerate() {
                 let sounding = playhead
                     .is_some_and(|p| p >= start as f64 && p < (start + item.dur.units()) as f64);
-                if Self::frame_ui(
+                let note = Self::frame_ui(
                     ui,
                     row_id,
                     item.id,
@@ -1316,8 +1342,15 @@ impl ComposerPanel {
                     &mut item.dur,
                     sounding,
                     percussion,
-                ) {
+                );
+                if note.deleted {
                     pending_delete = Some(idx);
+                }
+                // Centred, not merely "into view": a frame scrolled to the edge
+                // is one the next note leaves again immediately, and centring
+                // shows what is coming as well as what is playing.
+                if follow && sounding {
+                    ui.scroll_to_rect(note.rect, Some(egui::Align::Center));
                 }
                 // The space tied to it, drawn right behind it and carrying no
                 // delete button of its own: it leaves only with its note.
@@ -1330,7 +1363,8 @@ impl ComposerPanel {
         }
     }
 
-    /// One frame. Returns `true` when its delete button was pressed.
+    /// One frame. Reports whether its delete button was pressed and where it
+    /// landed, which is what a lane following the transport scrolls to.
     ///
     /// `pitch` decides which frame this is: `Some` draws the blue note frame
     /// (pitch, two length boxes, delete); `None` the amber space frame, which has
@@ -1346,7 +1380,7 @@ impl ComposerPanel {
         dur: &mut Duration,
         sounding: bool,
         percussion: bool,
-    ) -> bool {
+    ) -> FrameOut {
         let space = pitch.is_none();
         let (fill, stroke, header) = match (space, sounding) {
             (true, _) => (
@@ -1367,7 +1401,7 @@ impl ComposerPanel {
         };
 
         let mut deleted = false;
-        ui.allocate_ui_with_layout(
+        let placed = ui.allocate_ui_with_layout(
             egui::vec2(CARD_W, CARD_H),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
@@ -1477,7 +1511,10 @@ impl ComposerPanel {
                     });
             },
         );
-        deleted
+        FrameOut {
+            deleted,
+            rect: placed.response.rect,
+        }
     }
 
     /// Play / stop, tempo, and where the transport currently is.
@@ -1673,6 +1710,15 @@ impl ComposerPanel {
 /// Widget id of a row's lead space frame. Item ids count up from zero and are
 /// handed out one at a time, so this cannot collide with one.
 const LEAD_SPACE_ID: u64 = u64::MAX;
+
+/// What drawing one frame reported back to its lane.
+struct FrameOut {
+    /// Its delete button was pressed.
+    deleted: bool,
+    /// Where it landed, so a lane that follows the transport can scroll the
+    /// sounding frame into the middle of itself.
+    rect: egui::Rect,
+}
 
 /// Colour of the transport's position readout, and of the frame sounding under
 /// it.
@@ -2358,18 +2404,38 @@ mod tests {
             ];
             i
         };
-        // What the popup that opened under `y` is listing: the items sit in the
-        // popup's own left column, below the button that opened it.
+        /// `text@x,y`, as `walk` writes it.
+        fn painted(s: &str) -> Option<(&str, f32, f32)> {
+            let (name, pos) = s.rsplit_once('@')?;
+            let (nx, ny) = pos.split_once(',')?;
+            Some((name, nx.parse().ok()?, ny.parse().ok()?))
+        }
+
+        /// A registry track's name, which is what this test's popups list.
+        fn is_track_name(name: &str) -> bool {
+            name.strip_prefix('t').is_some_and(|n| n.parse::<u32>().is_ok())
+        }
+
+        // Which **tracks** the popup opened under `y` is listing: the items sit
+        // in the popup's own left column, below the button that opened it.
+        //
+        // Track names specifically, not "every string painted there": a popup is
+        // an `Area` and egui does not clip it to itself when it fits, so nothing
+        // in the painted output distinguishes it from the row head behind it —
+        // and the head's controls land at the same x, a pixel away in y. A
+        // filter on position alone silently starts counting whatever control the
+        // head grows next.
         let listed = |texts: &[String], y: f32| -> Vec<String> {
             texts
                 .iter()
                 .filter_map(|s| {
-                    let (name, pos) = s.rsplit_once('@')?;
-                    let (nx, ny) = pos.split_once(',')?;
-                    let (nx, ny): (f32, f32) = (nx.parse().ok()?, ny.parse().ok()?);
+                    let (name, nx, ny) = painted(s)?;
                     // The popup's own column: its frame indents its items past
                     // the row controls behind it.
-                    ((29.0..40.0).contains(&nx) && ny > y + 10.0 && ny < y + 260.0)
+                    (is_track_name(name)
+                        && (29.0..40.0).contains(&nx)
+                        && ny > y + 10.0
+                        && ny < y + 260.0)
                         .then(|| name.to_string())
                 })
                 .collect()
@@ -2382,10 +2448,8 @@ mod tests {
             texts
                 .iter()
                 .filter_map(|s| {
-                    let (name, pos) = s.rsplit_once('@')?;
-                    let (nx, ny) = pos.split_once(',')?;
-                    let (nx, ny): (f32, f32) = (nx.parse().ok()?, ny.parse().ok()?);
-                    (name.starts_with('t') && (20.0..28.0).contains(&nx))
+                    let (name, nx, ny) = painted(s)?;
+                    (is_track_name(name) && (20.0..28.0).contains(&nx))
                         .then(|| egui::pos2(nx + 66.0, ny + 2.0))
                 })
                 .collect()
@@ -2465,6 +2529,7 @@ mod tests {
                 gain: 0.5,
                 lead: Duration::new(0, Fraction::Eighth),
                 autosave: false,
+                autoscroll: true,
                 items: vec![Item {
                     id: 0,
                     pitch: 62,
@@ -2523,6 +2588,7 @@ mod tests {
                     gain: 1.5,
                     lead: Duration::new(1, Fraction::Sixteenth),
                     autosave: true,
+                    autoscroll: true,
                     items: vec![],
                 },
                 project::ProjectRow {
@@ -2531,6 +2597,7 @@ mod tests {
                     gain: 0.25,
                     lead: Duration::new(0, Fraction::None),
                     autosave: false,
+                    autoscroll: true,
                     items: vec![Item {
                         id: 0,
                         pitch: 70,

@@ -117,6 +117,10 @@ pub struct ProjectRow {
     pub lead: Duration,
     /// Re-export this row's grid on every save — see [`super::Row::autosave`].
     pub autosave: bool,
+    /// Follow the transport in this lane — see [`super::Row::autoscroll`]. A
+    /// project written before this existed has no such key, and a row from one
+    /// reads as `true`, which is the default a new row gets.
+    pub autoscroll: bool,
     pub items: Vec<Item>,
 }
 
@@ -143,6 +147,7 @@ impl Project {
             s += &format!("gain = {}\n", num(row.gain));
             s += &format!("lead = {}\n", write_duration(row.lead));
             s += &format!("autosave = {}\n", u8::from(row.autosave));
+            s += &format!("autoscroll = {}\n", u8::from(row.autoscroll));
             for item in &row.items {
                 s += &format!(
                     "note = {} {} {}\n",
@@ -179,6 +184,7 @@ impl Project {
                     gain: 1.0,
                     lead: Duration::new(0, Fraction::None),
                     autosave: true,
+                    autoscroll: true,
                     items: Vec::new(),
                 });
                 continue;
@@ -202,6 +208,7 @@ impl Project {
                 ("gain", Some(row)) => row.gain = value.parse().unwrap_or(1.0),
                 ("lead", Some(row)) => row.lead = read_duration(value)?,
                 ("autosave", Some(row)) => row.autosave = value != "0",
+                ("autoscroll", Some(row)) => row.autoscroll = value != "0",
                 ("note", Some(row)) => row.items.push(read_note(value)?),
                 _ => {}
             }
@@ -405,6 +412,7 @@ mod tests {
                     gain: 0.75,
                     lead: Duration::new(0, Fraction::Eighth),
                     autosave: true,
+                    autoscroll: true,
                     items: vec![
                         Item {
                             id: 0,
@@ -430,6 +438,9 @@ mod tests {
                     gain: 1.0,
                     lead: Duration::new(1, Fraction::Sixteenth),
                     autosave: false,
+                    // Both per-row switches off on this row, so the round trip
+                    // proves each carries rather than that `true` survives.
+                    autoscroll: false,
                     items: vec![],
                 },
             ],
@@ -458,6 +469,18 @@ mod tests {
         p.name = "Song = 2".to_string();
         let back = Project::parse(&p.to_text()).expect("parses");
         assert_eq!(back, p);
+    }
+
+    /// A row saved before a per-row switch existed reads as the default a new
+    /// row gets, not as `false`. The format skips keys it does not know, which
+    /// is exactly how a missing one arrives.
+    #[test]
+    fn a_row_without_the_newer_switches_takes_their_defaults() {
+        let text = "gemstone-project 1\nname = X\n\n\
+                    [row]\nsource = none\ngain = 1\nnote = 60 0 1/4 0 none\n";
+        let p = Project::parse(text).expect("parses");
+        assert!(p.rows[0].autosave, "autosave should default on");
+        assert!(p.rows[0].autoscroll, "a lane should follow the transport by default");
     }
 
     /// A field this build does not know must not stop it loading — that is what
@@ -566,6 +589,7 @@ mod folder_tests {
                 gain: 1.0,
                 lead: Duration::new(0, Fraction::None),
                 autosave: true,
+                autoscroll: true,
                 items: vec![],
             }],
         };
@@ -602,6 +626,7 @@ mod folder_tests {
                 gain: 1.0,
                 lead: Duration::new(0, Fraction::None),
                 autosave: true,
+                autoscroll: true,
                 items: vec![],
             }],
         };
