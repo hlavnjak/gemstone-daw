@@ -36,10 +36,14 @@
 //! That is the trade deliberately: **a note's sounding length may be off by up
 //! to half a grid step, but no note's position ever is.**
 //!
-//! **Chords become rows.** A row is one sequence — it cannot hold two notes at
-//! once — so a take is split into as many rows as the deepest chord in it
-//! ([`split_voices`]), all playing the same track. Playing a triad three times
-//! gives three rows, not three notes fighting over one.
+//! **Chords become rows, a late release does not.** A row is one sequence — it
+//! cannot hold two notes at once — so notes that genuinely sound together are
+//! split across as many rows as the deepest chord in the take
+//! ([`split_voices`]), all playing the same track. Notes that merely run into
+//! each other are *not*: letting go of one key a moment after pressing the next
+//! is how anyone plays a line, and a row each would turn a bass line into a pile
+//! of one-note rows. The earlier note is shortened to where the later one starts
+//! instead.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -196,8 +200,8 @@ fn snap(units: f64, grid: i64) -> i64 {
     ((units / grid as f64).round() as i64).saturating_mul(grid)
 }
 
-/// Split a take into as many rows as it needs: a note joins the first row whose
-/// last note has already ended, and starts a new one when there is none.
+/// Split a take into as many rows as it needs: a note joins the first row that
+/// can still take it ([`shares_a_row`]), and starts a new one when none can.
 ///
 /// A row plays one note at a time, so this is what makes a chord playable at
 /// all. First-fit rather than round-robin keeps the count down to the deepest
@@ -211,13 +215,36 @@ pub fn split_voices(notes: &[GridNote]) -> Vec<Vec<GridNote>> {
     for note in notes {
         match voices
             .iter_mut()
-            .find(|v| v.last().is_none_or(|last| last.end() <= note.at))
+            .find(|v| v.last().is_none_or(|last| shares_a_row(*last, *note)))
         {
             Some(voice) => voice.push(*note),
             None => voices.push(vec![*note]),
         }
     }
     voices
+}
+
+/// Whether `next` can follow `last` in one row — either it starts clear of it,
+/// or it only *runs into* it and the earlier note can be shortened to make room.
+///
+/// Only notes that sound **together** need a row of their own: struck at the
+/// same moment, or the earlier one lasting through the whole of the later. Two
+/// notes that merely overlap at the edges do not. Releasing a key a moment after
+/// pressing the next is how a line is played — more so on a small keyboard, one
+/// hand, reaching — and a row for every one of those would leave a bass line as
+/// a stack of rows with a note each, which is not something anyone would have
+/// written by hand.
+///
+/// The earlier note is not left overlapping: [`voice_items`] fits every note
+/// into the room it has before the next one starts, so keeping the pair in one
+/// row *is* the trim.
+fn shares_a_row(last: GridNote, next: GridNote) -> bool {
+    if last.end() <= next.at {
+        return true;
+    }
+    // Struck together, or swallowed whole — both are sounding for as long as the
+    // shorter of them lasts, which one row cannot do.
+    next.at != last.at && last.end() < next.end()
 }
 
 /// The length the two select boxes express exactly, if they can: whole notes
@@ -525,8 +552,9 @@ mod tests {
         assert_eq!(notes[1].at_secs as i64, EIGHTH);
     }
 
-    /// A row plays one note at a time, so a chord has to become rows. A melody
-    /// must not: first-fit keeps a single-note passage in one row.
+    /// A row plays one note at a time, so notes that sound together have to
+    /// become rows. A melody must not: first-fit keeps a single-note passage in
+    /// one row.
     #[test]
     fn a_chord_becomes_a_row_each_and_a_melody_does_not() {
         let chord = [
@@ -544,6 +572,43 @@ mod tests {
             grid_note(HALF, QUARTER, 64),
         ];
         assert_eq!(split_voices(&melody).len(), 1);
+
+        // A note held under a whole line — it lasts through the notes that
+        // follow, so it really is a second voice.
+        let held = [
+            grid_note(0, WHOLE, 36),
+            grid_note(QUARTER, QUARTER, 60),
+            grid_note(HALF, QUARTER, 62),
+        ];
+        let voices = split_voices(&held);
+        assert_eq!(voices.len(), 2);
+        assert_eq!(voices[0].len(), 1);
+        assert_eq!(voices[1].len(), 2);
+    }
+
+    /// Letting go of a key a moment after pressing the next is a line, not a
+    /// chord: it stays in one row, and the note that was held too long is cut
+    /// back to where the next one starts.
+    #[test]
+    fn a_late_release_stays_in_one_row_and_is_trimmed() {
+        // Three quarter notes, each held a sixteenth into the one after it.
+        let sloppy = [
+            grid_note(0, QUARTER + SIXTEENTH, 40),
+            grid_note(QUARTER, QUARTER + SIXTEENTH, 43),
+            grid_note(HALF, QUARTER, 45),
+        ];
+        let voices = split_voices(&sloppy);
+        assert_eq!(voices.len(), 1, "a late release must not open a row");
+
+        let row = row_from(&voices[0]);
+        let played = row.planned_notes(1.0);
+        assert_eq!(
+            played
+                .iter()
+                .map(|n| (n.at_secs as i64, n.dur_secs as i64))
+                .collect::<Vec<_>>(),
+            vec![(0, QUARTER), (QUARTER, QUARTER), (HALF, QUARTER)]
+        );
     }
 
     /// The keyboard's own timing is what a take is built from: note-off in both

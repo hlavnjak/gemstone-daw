@@ -769,11 +769,12 @@ impl ComposerPanel {
                  no tracks exist yet, so pick one on each row."
             ),
             (Some(_), 1) => format!("Recorded {played} note(s) into a new row, rounded to {grid}."),
-            // More rows than one means notes overlapped: a row plays one note at
-            // a time, so a chord has to be spread across several.
+            // More rows than one means notes sounded together: a row plays one
+            // note at a time, so a chord has to be spread across several. A key
+            // merely let go of late does not land here — that stays one row.
             (Some(_), _) => format!(
                 "Recorded {played} note(s), rounded to {grid} — spread over {rows} new rows, \
-                 because notes overlapped."
+                 because notes sounded together."
             ),
         })
     }
@@ -1491,9 +1492,10 @@ impl ComposerPanel {
                     "Play the composition through exactly once and record your MIDI \
                      keyboard over it.\n\nWhat you play is appended as new rows when the \
                      pass ends (or when you press Stop), with every note and every \
-                     silence rounded onto the note value in “Round”. Notes that \
-                     overlap go into a row each — a row plays one note at a time — so \
-                     a chord comes out as a row per voice.\n\nTo hear yourself while \
+                     silence rounded onto the note value in “Round”. Notes that sound \
+                     *together* go into a row each — a row plays one note at a time — \
+                     so a chord comes out as a row per voice; a key merely let go of \
+                     late stays in the line and is trimmed.\n\nTo hear yourself while \
                      you play, open the track's editor: the keyboard feeds it as usual, \
                      and recording takes a copy rather than the events themselves.",
                 )
