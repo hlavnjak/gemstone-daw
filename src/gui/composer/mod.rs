@@ -282,21 +282,29 @@ impl Row {
     /// Append a note and, tied behind it, the space that separates it from
     /// whatever comes next.
     ///
-    /// The new note carries on from the last one in the row: a row is nearly
-    /// always built by repeating a sound — a run on one note, or the same drum
-    /// over and over — so what was chosen a moment ago is a better guess than
-    /// any fixed default, and saves reaching for the dropdown every time.
-    /// `default_pitch` is what the *first* note of a row starts on.
+    /// The new frame **repeats the last one whole** — its pitch, its note length
+    /// and its space, whole notes and fraction alike. A row is nearly always
+    /// built by repeating something: a run on one note, the same drum over and
+    /// over, a rhythm of one length. What was chosen a moment ago is a far better
+    /// guess than any fixed default, and carrying only *part* of it is the worst
+    /// of both — five select boxes to check every time, three of which have
+    /// silently gone back to a default.
+    ///
+    /// `default_pitch` is what the *first* note of a row starts on; the lengths
+    /// it starts on are a quarter note and an eighth of silence.
     fn add_note(&mut self, default_pitch: u8) {
         let id = self.next_item_id;
         self.next_item_id += 1;
-        let pitch = self.items.last().map_or(default_pitch, |item| item.pitch);
-        self.items.push(Item {
-            id,
-            pitch,
-            dur: Duration::new(0, Fraction::Quarter),
-            space: Duration::new(0, Fraction::Eighth),
-        });
+        let item = match self.items.last() {
+            Some(last) => Item { id, ..*last },
+            None => Item {
+                id,
+                pitch: default_pitch,
+                dur: Duration::new(0, Fraction::Quarter),
+                space: Duration::new(0, Fraction::Eighth),
+            },
+        };
+        self.items.push(item);
     }
 
     /// Delete a note *and* the space tied to it — the only way either of them
@@ -1212,7 +1220,11 @@ impl ComposerPanel {
                                             .button("➕ Add Note")
                                             .on_hover_text(
                                                 "Append a note frame and, behind it, a \
-                                                 space frame for the silence that follows",
+                                                 space frame for the silence that \
+                                                 follows.\n\nThe new frame repeats the \
+                                                 last one in the row — pitch, note \
+                                                 length and space — so a run of the \
+                                                 same thing takes one click each.",
                                             )
                                             .clicked()
                                         {
@@ -1712,32 +1724,59 @@ mod tests {
         panel
     }
 
-    /// Adding a note carries the last one's pitch over. Building a row means
-    /// repeating a sound far more often than changing it — a hi-hat line, a run
-    /// on one drum — so the dropdown should not have to be touched every time.
+    /// Adding a note repeats the frame before it **whole** — pitch, note length
+    /// and space, whole notes and fraction alike. Building a row means repeating
+    /// something far more often than changing it — a hi-hat line, a run on one
+    /// drum, a rhythm of one length — so none of the five select boxes should
+    /// have to be touched again for the next frame.
     #[test]
     fn a_new_note_carries_on_from_the_one_before_it() {
         let mut row = Row::new(0, None);
-        // The first note of a row has nothing to follow, so it takes the default.
+        // The first note of a row has nothing to follow, so it takes the
+        // defaults: middle-of-the-road lengths and the caller's pitch.
         row.add_note(DEFAULT_DRUM_PITCH);
         assert_eq!(row.items[0].pitch, DEFAULT_DRUM_PITCH);
+        assert_eq!(row.items[0].dur, Duration::new(0, Fraction::Quarter));
+        assert_eq!(row.items[0].space, Duration::new(0, Fraction::Eighth));
 
-        // Change it, and everything added after follows.
+        // Change every box of it, and everything added after follows all of them.
         row.items[0].pitch = 42;
+        row.items[0].dur = Duration::new(2, Fraction::Sixteenth);
+        row.items[0].space = Duration::new(1, Fraction::Half);
         row.add_note(DEFAULT_DRUM_PITCH);
         row.add_note(DEFAULT_DRUM_PITCH);
-        assert_eq!(row.items[1].pitch, 42, "the new note ignored the one before it");
-        assert_eq!(row.items[2].pitch, 42);
+        for i in [1, 2] {
+            assert_eq!(row.items[i].pitch, 42, "the pitch was not carried over");
+            assert_eq!(
+                row.items[i].dur,
+                Duration::new(2, Fraction::Sixteenth),
+                "the note length was not carried over"
+            );
+            assert_eq!(
+                row.items[i].space,
+                Duration::new(1, Fraction::Half),
+                "the space was not carried over"
+            );
+        }
 
-        // It follows the *last* note, not the first.
+        // It follows the *last* frame, not the first.
         row.items[2].pitch = 46;
+        row.items[2].dur = Duration::new(0, Fraction::ThirtySecond);
         row.add_note(DEFAULT_DRUM_PITCH);
         assert_eq!(row.items[3].pitch, 46);
+        assert_eq!(row.items[3].dur, Duration::new(0, Fraction::ThirtySecond));
 
-        // A row emptied of notes starts from the default again.
+        // Every frame still gets an id of its own, or two of them would share
+        // their widgets.
+        let ids: std::collections::HashSet<u64> = row.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids.len(), row.items.len(), "two frames share an id");
+
+        // A row emptied of notes starts from the defaults again.
         row.items.clear();
         row.add_note(DEFAULT_PITCH);
         assert_eq!(row.items[0].pitch, DEFAULT_PITCH);
+        assert_eq!(row.items[0].dur, Duration::new(0, Fraction::Quarter));
+        assert_eq!(row.items[0].space, Duration::new(0, Fraction::Eighth));
     }
 
     /// Pressing Play must not wait for the plugins.
