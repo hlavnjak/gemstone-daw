@@ -40,6 +40,7 @@ anyhow = "1.0"
 log = "0.4"
 fern = "0.6"
 chrono = { version = "0.4", features = ["clock"] }
+uuid = { version = "1.25.0", features = ["v4"] }
 
 # Plugin editor window — raw X11 on Linux, raw Win32 on Windows.
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -422,7 +422,7 @@ impl TracksPanel {
             return;
         }
         let id = self.take_id();
-        let name = format!("LeSynth Fourier {}", id + 1);
+        let name = unique_track_name(&format!("LeSynth Fourier {}", id + 1));
         let registry_id =
             self.registry
                 .add(&name, path.clone(), Some(class_ids::FOURIER_SYNTH), true, None);
@@ -678,10 +678,12 @@ impl TracksPanel {
             self.status = format!("Internal plugin not found at {}", plugin_path.display());
             return;
         }
-        let name = file
-            .file_stem()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "LeSynth track".to_string());
+        let name = unique_track_name(
+            &file
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "LeSynth track".to_string()),
+        );
         let id = self.take_id();
         // The saved grid is registered with the track, so the Composer can play
         // it without the editor ever being opened.
@@ -890,5 +892,47 @@ impl TracksPanel {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(250));
         }
+    }
+}
+
+/// A track name nothing else can already be called: the readable part, then a
+/// fresh UUID.
+///
+/// Two LeSynth tracks with the same name are not a cosmetic problem. A saved
+/// project writes one `.lsft` per track named after the track, a row records
+/// which track it plays by that name, and the Composer's select boxes are read
+/// by it — so a duplicate means a grid file quietly overwritten by another
+/// track's, and a row that cannot say which of the two it wanted. The counter in
+/// front of the UUID is what a person reads; the UUID is what makes the
+/// guarantee, including across projects and across machines.
+pub fn unique_track_name(stem: &str) -> String {
+    format!("{stem} · {}", uuid::Uuid::new_v4())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two tracks made the same way must never be called the same thing: a
+    /// saved project names each grid file after its track, so a duplicate is a
+    /// grid overwritten by another track's.
+    #[test]
+    fn a_fresh_track_name_is_never_a_repeat() {
+        let names: std::collections::HashSet<String> =
+            (0..64).map(|_| unique_track_name("LeSynth Fourier 1")).collect();
+        assert_eq!(names.len(), 64);
+        // The readable part still leads, so a select box shows what the track is
+        // before it shows which one it is.
+        assert!(
+            unique_track_name("LeSynth Fourier 1").starts_with("LeSynth Fourier 1 · "),
+            "the name no longer reads as a name"
+        );
+        // And it survives being turned into a file name.
+        let name = unique_track_name("Voice");
+        assert_eq!(
+            crate::gui::composer::project::sanitize_name(&name).matches('-').count(),
+            4,
+            "the UUID did not survive sanitising: {name}"
+        );
     }
 }

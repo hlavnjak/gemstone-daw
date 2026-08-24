@@ -387,8 +387,15 @@ impl ResynthPanel {
                 return;
             }
         };
+        // A fresh UUID, as for every other LeSynth track: analysing the same
+        // file twice must not produce two tracks called the same thing, one of
+        // whose grids would overwrite the other's on the next save.
         let name = match self.files.get(file_idx) {
-            Some(f) => format!("{} · subtrack {}", f.display_name(), sub_idx + 1),
+            Some(f) => crate::gui::track::unique_track_name(&format!(
+                "{} · subtrack {}",
+                f.display_name(),
+                sub_idx + 1
+            )),
             None => return,
         };
         let id = self.registry.add(
