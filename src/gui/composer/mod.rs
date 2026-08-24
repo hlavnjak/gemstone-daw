@@ -1559,6 +1559,9 @@ impl ComposerPanel {
             ui.label("Round");
             egui::ComboBox::from_id_salt("record_round")
                 .width(72.0)
+                // All nine note values at once: the default popup height cuts
+                // the list off at about six and scrolls the rest out of sight.
+                .height(9.0 * 44.0)
                 .selected_text(record::round_label(self.round_units))
                 .show_ui(ui, |ui| {
                     for (label, units) in record::ROUND_CHOICES {

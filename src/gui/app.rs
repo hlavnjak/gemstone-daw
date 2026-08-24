@@ -11,10 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use std::sync::atomic::Ordering;
+
 use anyhow::Context;
 use eframe::egui;
 
-use crate::midi::{self, MidiEventQueue, MidiTaps};
+use crate::midi::{self, MidiEventQueue, MidiTaps, OctaveShift, MAX_OCTAVE_SHIFT};
 
 use super::composer::project::{self, Project, TrackSource};
 use super::composer::{ComposerPanel, ProjectRequest};
@@ -34,6 +36,9 @@ pub struct DawApp {
     /// Listeners that get a stamped copy of the keyboard alongside the queue —
     /// how the Composer records without taking events away from an open editor.
     midi_taps: MidiTaps,
+    /// How far the keyboard is transposed on the way in. Shared with the input
+    /// thread, so the picker moves a connection that is already open.
+    octave_shift: OctaveShift,
     _midi_connection: Option<midir::MidiInputConnection<()>>,
 
     // Instrument tracks (LeSynth Fourier / custom VST), each with its own editor.
@@ -52,6 +57,7 @@ impl Default for DawApp {
     fn default() -> Self {
         let midi_queue = midi::new_midi_queue();
         let midi_taps = midi::new_midi_taps();
+        let octave_shift = midi::new_octave_shift();
         // The one track list the panels share: Tracks and Resynthesis publish
         // into it, the Composer builds its rows from it.
         let registry = TrackRegistry::default();
@@ -65,6 +71,7 @@ impl Default for DawApp {
             composer: ComposerPanel::new(registry.clone(), midi_taps.clone()),
             midi_queue,
             midi_taps,
+            octave_shift,
             _midi_connection: None,
             resynth: ResynthPanel::new(registry.clone()),
             registry,
@@ -157,6 +164,7 @@ impl DawApp {
         match midi::spawn_midi_thread(
             self.midi_queue.clone(),
             self.midi_taps.clone(),
+            self.octave_shift.clone(),
             port_filter.as_deref(),
         ) {
             Ok(conn) => {
@@ -228,6 +236,43 @@ impl DawApp {
                                 );
                             }
                         });
+                    ui.end_row();
+
+                    // Where the keyboard's keys land. A small controller — a
+                    // Keystation Mini 32 starts at C3 — has no low notes on it
+                    // at all, so a bass part has to be played up here and moved
+                    // down. Applied to the incoming MIDI itself, so what the
+                    // editors play and what the Composer records are the same
+                    // note.
+                    ui.label("Octave shift:");
+                    let mut shift = self.octave_shift.load(Ordering::Relaxed);
+                    egui::ComboBox::from_id_salt("midi_octave")
+                        .width(260.0)
+                        // Tall enough for all nine steps at this style's row
+                        // height: the default caps a popup at 200 px and scrolls
+                        // the rest, which hides the very octaves a small
+                        // controller is here to reach.
+                        .height(9.0 * 44.0)
+                        .selected_text(octave_shift_label(shift))
+                        .show_ui(ui, |ui| {
+                            for step in (-MAX_OCTAVE_SHIFT..=MAX_OCTAVE_SHIFT).rev() {
+                                ui.selectable_value(
+                                    &mut shift,
+                                    step,
+                                    octave_shift_label(step),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Move every note the keyboard sends by whole octaves \
+                             before anything plays it.\n\nA key already held keeps \
+                             the shift it was pressed with, so moving this mid-note \
+                             cannot leave one sounding for good; a note that would \
+                             fall off either end of MIDI is not sent.\n\nThe wheel, \
+                             the pedal and everything else pass through untouched.",
+                        );
+                    self.octave_shift.store(shift, Ordering::Relaxed);
                     ui.end_row();
                 });
             ui.add_space(6.0);
@@ -472,5 +517,17 @@ impl eframe::App for DawApp {
                     ui.add_space(10.0);
                 });
         });
+    }
+}
+
+/// How an octave shift reads in its select box: signed, and saying what it does
+/// rather than only how far.
+fn octave_shift_label(shift: i32) -> String {
+    match shift {
+        0 => "none (as played)".to_string(),
+        1 => "+1 octave up".to_string(),
+        -1 => "−1 octave down".to_string(),
+        n if n > 0 => format!("+{n} octaves up"),
+        n => format!("−{} octaves down", -n),
     }
 }

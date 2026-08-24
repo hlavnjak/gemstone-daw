@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
@@ -38,6 +39,25 @@ pub type MidiTap = Arc<Mutex<Vec<TimedMessage>>>;
 /// unregisters itself simply by being dropped, and nothing has to remember to
 /// take it off the list.
 pub type MidiTaps = Arc<Mutex<Vec<Weak<Mutex<Vec<TimedMessage>>>>>>;
+
+/// How many octaves the keyboard is transposed by on the way in, shared with the
+/// input thread so the picker works on a live connection.
+///
+/// A small controller — a Keystation Mini 32 is 32 keys, C3 upwards — simply has
+/// no low notes on it, so a bass line has to be played somewhere else and moved.
+/// Doing it here rather than in each consumer means one implementation for the
+/// track editors, the Composer's recording and anything added later: what is
+/// heard and what is recorded cannot disagree about which note was played.
+pub type OctaveShift = Arc<AtomicI32>;
+
+/// How far the keyboard may be moved, in octaves either way. Four covers a
+/// 32-key controller reaching either end of a piano.
+pub const MAX_OCTAVE_SHIFT: i32 = 4;
+
+/// No shift at all — the keyboard as it is played.
+pub fn new_octave_shift() -> OctaveShift {
+    Arc::new(AtomicI32::new(0))
+}
 
 /// Cap on messages held in one tap. A recording is a few hundred at most; this
 /// only bounds a tap left listening and forgotten. Past it the tap stops
@@ -112,6 +132,7 @@ pub fn list_usb_midi_keyboards() -> Result<Vec<String>> {
 pub fn spawn_midi_thread(
     midi_events: MidiEventQueue,
     taps: MidiTaps,
+    octave_shift: OctaveShift,
     device_filter: Option<&str>,
 ) -> Result<MidiInputConnection<()>> {
     let mut midi_in = MidiInput::new("gemstone-daw-midi-in")?;
@@ -152,13 +173,26 @@ pub fn spawn_midi_thread(
         midi_in.port_name(port)?
     );
 
+    // What each key that is *down* was transposed by. A key takes the shift as
+    // it was when it was struck and keeps it until it is released: moving the
+    // picker with a key held would otherwise send the note-off to a different
+    // note and leave the first one sounding for good.
+    let mut held_shift = [0i8; 128];
     let conn = midi_in
         .connect(
             port,
             "gemstone-daw-midi-conn",
             move |_stamp, message, _| {
                 if message.len() >= 3 {
-                    let msg = [message[0], message[1], message[2]];
+                    let Some(msg) = shift_octaves(
+                        [message[0], message[1], message[2]],
+                        &octave_shift,
+                        &mut held_shift,
+                    ) else {
+                        // Shifted off the end of MIDI — there is no such note to
+                        // play, and its release will be dropped the same way.
+                        return;
+                    };
                     {
                         let mut queue = midi_events.lock().unwrap();
                         if queue.len() >= MAX_QUEUED_EVENTS {
@@ -189,4 +223,103 @@ pub fn spawn_midi_thread(
 
     log::info!("MIDI input connected.");
     Ok(conn)
+}
+
+/// Move a message by the current octave shift, or `None` if that would put it
+/// off the end of MIDI.
+///
+/// Only the messages that name a key are moved — note on, note off, and the
+/// per-key aftertouch that follows them. Everything else (the wheel, the
+/// pedal, program changes) passes through untouched: they are not notes, and
+/// transposing their data bytes would turn a modulation into nonsense.
+fn shift_octaves(
+    mut msg: [u8; 3],
+    octave_shift: &OctaveShift,
+    held_shift: &mut [i8; 128],
+) -> Option<[u8; 3]> {
+    let status = msg[0] & 0xF0;
+    if !matches!(status, 0x80 | 0x90 | 0xA0) {
+        return Some(msg);
+    }
+    let key = (msg[1] & 0x7F) as usize;
+    let semitones = if status == 0x90 && msg[2] > 0 {
+        // A key going down takes the shift as it stands, and is remembered by it.
+        let shift = octave_shift.load(Ordering::Relaxed).clamp(
+            -MAX_OCTAVE_SHIFT,
+            MAX_OCTAVE_SHIFT,
+        ) * 12;
+        held_shift[key] = shift as i8;
+        shift
+    } else {
+        // Its release — and its aftertouch — follow it wherever it went.
+        held_shift[key] as i32
+    };
+    let shifted = key as i32 + semitones;
+    if !(0..=127).contains(&shifted) {
+        return None;
+    }
+    msg[1] = shifted as u8;
+    Some(msg)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shift moves notes by whole octaves, and leaves everything that is
+    /// not a note alone.
+    #[test]
+    fn the_shift_moves_notes_and_nothing_else() {
+        let shift = new_octave_shift();
+        let mut held = [0i8; 128];
+        shift.store(-2, Ordering::Relaxed);
+
+        // Middle C down two octaves.
+        assert_eq!(
+            shift_octaves([0x90, 60, 100], &shift, &mut held),
+            Some([0x90, 36, 100])
+        );
+        // A control change carries a controller number, not a note: moving it
+        // would turn the modulation wheel into some other control.
+        assert_eq!(
+            shift_octaves([0xB0, 60, 100], &shift, &mut held),
+            Some([0xB0, 60, 100])
+        );
+        // Off the bottom of MIDI — there is no such note to play.
+        assert_eq!(shift_octaves([0x90, 12, 100], &shift, &mut held), None);
+    }
+
+    /// The classic stuck note: the picker is moved while a key is held, so the
+    /// release names a different note than the press did. A key keeps the shift
+    /// it was struck with until it comes back up.
+    #[test]
+    fn moving_the_shift_under_a_held_key_does_not_strand_the_note() {
+        let shift = new_octave_shift();
+        let mut held = [0i8; 128];
+
+        shift.store(-1, Ordering::Relaxed);
+        let on = shift_octaves([0x90, 60, 100], &shift, &mut held).unwrap();
+        assert_eq!(on, [0x90, 48, 100]);
+
+        // …and now the user moves the picker, still holding the key.
+        shift.store(2, Ordering::Relaxed);
+        // Both spellings of a release follow the note where it went.
+        assert_eq!(
+            shift_octaves([0x80, 60, 0], &shift, &mut held),
+            Some([0x80, 48, 0])
+        );
+        assert_eq!(
+            shift_octaves([0x90, 60, 0], &shift, &mut held),
+            Some([0x90, 48, 0])
+        );
+        // Aftertouch on the same key goes with it too.
+        assert_eq!(
+            shift_octaves([0xA0, 60, 90], &shift, &mut held),
+            Some([0xA0, 48, 90])
+        );
+        // The next press takes the shift as it stands now.
+        assert_eq!(
+            shift_octaves([0x90, 60, 100], &shift, &mut held),
+            Some([0x90, 84, 100])
+        );
+    }
 }
