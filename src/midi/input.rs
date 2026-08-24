@@ -11,12 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use midir::{MidiInput, MidiInputConnection};
 
 pub type MidiEventQueue = Arc<Mutex<VecDeque<[u8; 3]>>>;
@@ -265,6 +265,90 @@ fn shift_octaves(
 mod tests {
     use super::*;
 
+    /// A router's insides, without a device: the routing is what has behaviour,
+    /// and it is the same whether a real port or this filled the queue.
+    fn router_inner(default_port: Option<&str>) -> RouterInner {
+        RouterInner {
+            default_port: default_port.map(str::to_string),
+            open: HashMap::new(),
+            subs: Vec::new(),
+            next_id: 0,
+        }
+    }
+
+    fn subscribe(inner: &mut RouterInner, want: Option<&str>) -> MidiEventQueue {
+        let queue = new_midi_queue();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.subs.push(Sub {
+            id,
+            want: want.map(str::to_string),
+            queue: Arc::downgrade(&queue),
+        });
+        queue
+    }
+
+    fn drained(queue: &MidiEventQueue) -> Vec<[u8; 3]> {
+        queue.lock().unwrap().drain(..).collect()
+    }
+
+    /// The defect the router exists to fix: two instances open at once each hear
+    /// **everything** their keyboard sends. One shared queue was drained
+    /// destructively, so they split the stream and neither played a tune.
+    #[test]
+    fn two_instances_on_one_keyboard_both_hear_all_of_it() {
+        let mut inner = router_inner(Some("A"));
+        let one = subscribe(&mut inner, None);
+        let two = subscribe(&mut inner, Some("A"));
+
+        inner.deliver("A", [0x90, 60, 100]);
+        inner.deliver("A", [0x80, 60, 0]);
+        assert_eq!(drained(&one), vec![[0x90, 60, 100], [0x80, 60, 0]]);
+        assert_eq!(drained(&two), vec![[0x90, 60, 100], [0x80, 60, 0]]);
+    }
+
+    /// Two keyboards, two instruments: a message goes only to what asked for
+    /// that port.
+    #[test]
+    fn each_instance_hears_only_its_own_keyboard() {
+        let mut inner = router_inner(Some("A"));
+        let follows_default = subscribe(&mut inner, None);
+        let on_a = subscribe(&mut inner, Some("A"));
+        let on_b = subscribe(&mut inner, Some("B"));
+
+        inner.deliver("B", [0x90, 48, 100]);
+        assert!(drained(&follows_default).is_empty());
+        assert!(drained(&on_a).is_empty());
+        assert_eq!(drained(&on_b), vec![[0x90, 48, 100]]);
+
+        // Connecting the panel elsewhere moves everything that follows it, with
+        // nothing re-subscribed.
+        inner.default_port = Some("B".to_string());
+        inner.deliver("B", [0x90, 50, 100]);
+        assert_eq!(drained(&follows_default), vec![[0x90, 50, 100]]);
+        assert_eq!(drained(&on_b), vec![[0x90, 50, 100]]);
+        assert!(drained(&on_a).is_empty());
+    }
+
+    /// An instance that has gone unsubscribes itself, and its keyboard is then
+    /// held by nothing — a device kept open by a closed editor is one no other
+    /// program can have.
+    #[test]
+    fn a_dropped_instance_releases_its_keyboard() {
+        let mut inner = router_inner(Some("A"));
+        let gone = subscribe(&mut inner, Some("B"));
+        assert!(port_is_wanted("B", Some("A"), &inner.subs));
+
+        drop(gone);
+        // Delivering is what notices: the queue's owner is gone, so the
+        // subscription goes with it.
+        inner.deliver("B", [0x90, 60, 100]);
+        assert!(inner.subs.is_empty(), "a dead subscription was kept");
+        assert!(!port_is_wanted("B", Some("A"), &inner.subs));
+        // The panel's own port stays open whether or not a track asked for it.
+        assert!(port_is_wanted("A", Some("A"), &inner.subs));
+    }
+
     /// The shift moves notes by whole octaves, and leaves everything that is
     /// not a note alone.
     #[test]
@@ -321,5 +405,266 @@ mod tests {
             shift_octaves([0x90, 60, 100], &shift, &mut held),
             Some([0x90, 84, 100])
         );
+    }
+}
+
+// ── Routing one keyboard per instance ───────────────────────────────────────
+
+/// Which keyboard feeds one plugin instance.
+///
+/// **Why a router at all.** There used to be one connection and one queue, and
+/// every open editor drained it — destructively, so two editors open at once
+/// each got about half of what was played and neither played a recognisable
+/// note. And a machine with two keyboards on it could only ever use one of
+/// them.
+///
+/// A subscription is a queue of its own plus the port it wants, so:
+///
+/// * two instances open at once each hear **everything**, rather than splitting
+///   the stream between them;
+/// * each can be pointed at a different keyboard;
+/// * a port is opened once however many instances listen to it, and closed
+///   again when the last one goes.
+///
+/// `None` for a wanted port means "whatever the MIDI panel is connected to",
+/// which is what a track uses until it is told otherwise. That is resolved at
+/// delivery, not at subscription, so changing the panel's port moves every
+/// track that follows it without re-subscribing anything.
+#[derive(Clone)]
+pub struct MidiRouter {
+    inner: Arc<Mutex<RouterInner>>,
+    /// Applied once, here, so every subscriber sees the same note — see
+    /// [`shift_octaves`].
+    octave_shift: OctaveShift,
+    /// The Composer's recorders, which listen to every port at once: a take is
+    /// "what was played", not "what one instance heard".
+    taps: MidiTaps,
+}
+
+struct RouterInner {
+    /// The port a subscriber gets when it has not asked for one of its own.
+    default_port: Option<String>,
+    /// Open connections, by port name. Dropping one closes the device.
+    open: HashMap<String, MidiInputConnection<()>>,
+    subs: Vec<Sub>,
+    next_id: u64,
+}
+
+/// One instance's feed.
+struct Sub {
+    id: u64,
+    /// The port it asked for, or `None` to follow the panel's.
+    want: Option<String>,
+    /// Weak, so an instance that goes away unsubscribes by being dropped. The
+    /// queue is kept alive by the track that owns it and the audio engine
+    /// draining it.
+    queue: Weak<Mutex<VecDeque<[u8; 3]>>>,
+}
+
+/// A subscription handed to one instance: the queue its audio engine drains, and
+/// the id its source is changed by.
+pub struct MidiFeed {
+    pub queue: MidiEventQueue,
+    pub id: u64,
+}
+
+impl MidiRouter {
+    pub fn new(octave_shift: OctaveShift, taps: MidiTaps) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RouterInner {
+                default_port: None,
+                open: HashMap::new(),
+                subs: Vec::new(),
+                next_id: 0,
+            })),
+            octave_shift,
+            taps,
+        }
+    }
+
+    /// The port everything that has not chosen one of its own listens to.
+    pub fn default_port(&self) -> Option<String> {
+        self.inner.lock().ok()?.default_port.clone()
+    }
+
+    /// Connect the panel's own port — the default feed. Opening it is what
+    /// "Connect" does; every track following the default moves with it.
+    pub fn set_default_port(&self, port: Option<String>) -> Result<()> {
+        if let Some(name) = &port {
+            self.open_port(name)?;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.default_port = port;
+            inner.close_unused();
+        }
+        Ok(())
+    }
+
+    /// Start feeding a new instance. `want` is the port it should listen to, or
+    /// `None` to follow the panel's.
+    pub fn subscribe(&self, want: Option<String>) -> Result<MidiFeed> {
+        if let Some(name) = &want {
+            self.open_port(name)?;
+        }
+        let queue = new_midi_queue();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the MIDI router was poisoned"))?;
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.subs.retain(|s| s.queue.strong_count() > 0);
+        inner.subs.push(Sub {
+            id,
+            want,
+            queue: Arc::downgrade(&queue),
+        });
+        Ok(MidiFeed { queue, id })
+    }
+
+    /// Point an existing feed at another keyboard. Takes effect on the next
+    /// message: nothing is re-opened on the instance's side, and a note already
+    /// held is released by whichever port sent it (see [`shift_octaves`] for the
+    /// same idea applied to the octave picker).
+    pub fn set_source(&self, feed_id: u64, want: Option<String>) -> Result<()> {
+        if let Some(name) = &want {
+            self.open_port(name)?;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(sub) = inner.subs.iter_mut().find(|s| s.id == feed_id) {
+                sub.want = want;
+            }
+            inner.close_unused();
+        }
+        Ok(())
+    }
+
+    /// Drop the connections nothing is listening to any more — an editor closed,
+    /// a track removed. Cheap, and the only thing that hands a device back.
+    pub fn release_unused(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.subs.retain(|s| s.queue.strong_count() > 0);
+            inner.close_unused();
+        }
+    }
+
+    /// Open `name` if it is not open already, and start delivering from it.
+    fn open_port(&self, name: &str) -> Result<()> {
+        {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("the MIDI router was poisoned"))?;
+            if inner.open.contains_key(name) {
+                return Ok(());
+            }
+        }
+        // Outside the lock: connecting talks to the driver, and the callback it
+        // installs takes the same lock.
+        let conn = self.connect(name)?;
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.open.insert(name.to_string(), conn);
+        }
+        Ok(())
+    }
+
+    /// The connection itself: one callback per port, delivering to whoever wants
+    /// that port when the message arrives.
+    fn connect(&self, name: &str) -> Result<MidiInputConnection<()>> {
+        let mut midi_in = MidiInput::new("gemstone-daw-midi-in")?;
+        midi_in.ignore(midir::Ignore::None);
+        let port = midi_in
+            .ports()
+            .into_iter()
+            .find(|p| midi_in.port_name(p).is_ok_and(|n| n == name))
+            .with_context(|| format!("MIDI port '{name}' is not there any more"))?;
+
+        let inner = self.inner.clone();
+        let octave_shift = self.octave_shift.clone();
+        let taps = self.taps.clone();
+        let port_name = name.to_string();
+        // See `spawn_midi_thread`: a key keeps the shift it was pressed with.
+        let mut held_shift = [0i8; 128];
+        let conn = midi_in
+            .connect(
+                &port,
+                "gemstone-daw-midi-conn",
+                move |_stamp, message, _| {
+                    if message.len() < 3 {
+                        return;
+                    }
+                    let Some(msg) = shift_octaves(
+                        [message[0], message[1], message[2]],
+                        &octave_shift,
+                        &mut held_shift,
+                    ) else {
+                        return;
+                    };
+                    if let Ok(mut inner) = inner.lock() {
+                        inner.deliver(&port_name, msg);
+                    }
+                    tap(&taps, msg);
+                },
+                (),
+            )
+            .map_err(|e| anyhow::anyhow!("could not open MIDI port '{name}': {e}"))?;
+        log::info!("MIDI input connected: {name}");
+        Ok(conn)
+    }
+}
+
+impl RouterInner {
+    /// Push one message to every instance listening to `port`, dropping the
+    /// subscriptions whose owner has gone.
+    fn deliver(&mut self, port: &str, msg: [u8; 3]) {
+        let follows_default = self.default_port.as_deref() == Some(port);
+        self.subs.retain(|sub| {
+            let Some(queue) = sub.queue.upgrade() else {
+                return false;
+            };
+            let wanted = match &sub.want {
+                Some(name) => name == port,
+                None => follows_default,
+            };
+            if wanted {
+                if let Ok(mut q) = queue.lock() {
+                    if q.len() >= MAX_QUEUED_EVENTS {
+                        q.pop_front();
+                    }
+                    q.push_back(msg);
+                }
+            }
+            true
+        });
+    }
+
+    /// Close the ports nothing listens to. A device held open by a closed editor
+    /// is a device another program cannot have.
+    fn close_unused(&mut self) {
+        let default = self.default_port.clone();
+        let subs = std::mem::take(&mut self.subs);
+        self.open
+            .retain(|name, _| port_is_wanted(name, default.as_deref(), &subs));
+        self.subs = subs;
+    }
+}
+
+/// Whether a port has anything listening to it: the panel is connected to it, or
+/// an instance asked for it by name.
+fn port_is_wanted(name: &str, default: Option<&str>, subs: &[Sub]) -> bool {
+    Some(name) == default || subs.iter().any(|s| s.want.as_deref() == Some(name))
+}
+
+/// Copy one message to every listening recorder.
+fn tap(taps: &MidiTaps, msg: [u8; 3]) {
+    let now = Instant::now();
+    if let Ok(list) = taps.lock() {
+        for tap in list.iter().filter_map(Weak::upgrade) {
+            if let Ok(mut events) = tap.lock() {
+                if events.len() < MAX_TAPPED_EVENTS {
+                    events.push((now, msg));
+                }
+            }
+        }
     }
 }

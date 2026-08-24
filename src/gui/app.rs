@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use anyhow::Context;
 use eframe::egui;
 
-use crate::midi::{self, MidiEventQueue, MidiTaps, OctaveShift, MAX_OCTAVE_SHIFT};
+use crate::midi::{self, MidiRouter, OctaveShift, MAX_OCTAVE_SHIFT};
 
 use super::composer::project::{self, Project, TrackSource};
 use super::composer::{ComposerPanel, ProjectRequest};
@@ -32,14 +32,13 @@ pub struct DawApp {
     selected_usb_keyboard: Option<String>,
 
     // Runtime state
-    midi_queue: MidiEventQueue,
-    /// Listeners that get a stamped copy of the keyboard alongside the queue —
-    /// how the Composer records without taking events away from an open editor.
-    midi_taps: MidiTaps,
+    /// One keyboard per plugin instance: which port feeds what, and the
+    /// connections behind them. Replaces the single shared queue every editor
+    /// used to drain — two editors on it each heard half of what was played.
+    midi_router: MidiRouter,
     /// How far the keyboard is transposed on the way in. Shared with the input
     /// thread, so the picker moves a connection that is already open.
     octave_shift: OctaveShift,
-    _midi_connection: Option<midir::MidiInputConnection<()>>,
 
     // Instrument tracks (LeSynth Fourier / custom VST), each with its own editor.
     tracks: TracksPanel,
@@ -55,9 +54,9 @@ pub struct DawApp {
 
 impl Default for DawApp {
     fn default() -> Self {
-        let midi_queue = midi::new_midi_queue();
         let midi_taps = midi::new_midi_taps();
         let octave_shift = midi::new_octave_shift();
+        let midi_router = MidiRouter::new(octave_shift.clone(), midi_taps.clone());
         // The one track list the panels share: Tracks and Resynthesis publish
         // into it, the Composer builds its rows from it.
         let registry = TrackRegistry::default();
@@ -67,12 +66,10 @@ impl Default for DawApp {
             selected_midi_port: None,
             usb_keyboards: Vec::new(),
             selected_usb_keyboard: None,
-            tracks: TracksPanel::new(midi_queue.clone(), registry.clone()),
+            tracks: TracksPanel::new(midi_router.clone(), registry.clone()),
             composer: ComposerPanel::new(registry.clone(), midi_taps.clone()),
-            midi_queue,
-            midi_taps,
+            midi_router,
             octave_shift,
-            _midi_connection: None,
             resynth: ResynthPanel::new(registry.clone()),
             registry,
         }
@@ -161,22 +158,18 @@ impl DawApp {
             .selected_usb_keyboard
             .clone()
             .or_else(|| self.selected_midi_port.clone());
-        match midi::spawn_midi_thread(
-            self.midi_queue.clone(),
-            self.midi_taps.clone(),
-            self.octave_shift.clone(),
-            port_filter.as_deref(),
-        ) {
-            Ok(conn) => {
-                self.midi_status = format!(
-                    "Connected: {}",
-                    port_filter.unwrap_or_else(|| "port 0".into())
-                );
-                self._midi_connection = Some(conn);
+        // The picker offers the ports as the driver names them, so a chosen one
+        // is a name to connect by; with nothing chosen, the first port there is.
+        let port = match port_filter.or_else(|| self.midi_ports.first().cloned()) {
+            Some(p) => p,
+            None => {
+                self.midi_status = "No MIDI input ports found.".to_string();
+                return;
             }
-            Err(e) => {
-                self.midi_status = format!("MIDI error: {}", e);
-            }
+        };
+        match self.midi_router.set_default_port(Some(port.clone())) {
+            Ok(()) => self.midi_status = format!("Connected: {port}"),
+            Err(e) => self.midi_status = format!("MIDI error: {e:#}"),
         }
     }
 

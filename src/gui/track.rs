@@ -35,7 +35,7 @@ use eframe::egui;
 use super::editor_window::{open_editor_in_thread, EditorHandle};
 use super::registry::TrackRegistry;
 use crate::audio::AudioEngine;
-use crate::midi::MidiEventQueue;
+use crate::midi::{MidiEventQueue, MidiFeed, MidiRouter};
 use crate::track_format::TrackState;
 use crate::midi::plays_a_drum_kit;
 use crate::vst::{class_ids, next_instance_token, scan_classes, validate_module, PluginInstance};
@@ -167,6 +167,14 @@ struct PluginTrack {
     /// keeps the knobs the user set. Captured when the editor closes and restored
     /// when it opens, so the sound survives the window and reaches the Composer.
     vst_state: Option<Vec<u8>>,
+    /// Which keyboard plays this track, by port name. `None` follows whatever
+    /// the MIDI panel is connected to, which is what every track does until it
+    /// is pointed somewhere else.
+    midi_source: Option<String>,
+    /// This track's own feed from the router, made when its editor first opens
+    /// and kept afterwards so changing the source does not mean restarting the
+    /// audio engine draining it.
+    feed: Option<MidiFeed>,
     editor: Option<EditorInstance>,
 }
 
@@ -176,7 +184,7 @@ impl PluginTrack {
     /// tracks are tagged with a token (so their grid can be exported), and if the
     /// track carries an `import_state` it is pushed in before the window opens —
     /// otherwise LeSynth stays in its plain synth mode (no `push_analysis`).
-    fn open_editor(&mut self, midi_queue: &MidiEventQueue) -> Result<()> {
+    fn open_editor(&mut self, router: &MidiRouter) -> Result<()> {
         if self.editor.is_some() {
             return Ok(());
         }
@@ -209,7 +217,19 @@ impl PluginTrack {
             }
         }
 
-        self.editor = Some(EditorInstance::open(inst, midi_queue.clone())?);
+        // One feed per track, made once and kept: the engine drains the queue it
+        // was started with, so a track that changes keyboard changes what the
+        // router puts *into* that queue rather than which queue it is.
+        let feed = match &self.feed {
+            Some(feed) => feed.queue.clone(),
+            None => {
+                let feed = router.subscribe(self.midi_source.clone())?;
+                let queue = feed.queue.clone();
+                self.feed = Some(feed);
+                queue
+            }
+        };
+        self.editor = Some(EditorInstance::open(inst, feed)?);
         Ok(())
     }
 
@@ -379,21 +399,22 @@ pub struct TracksPanel {
     status: String,
     /// The custom-VST picker, while it is open.
     browser: Option<PluginBrowser>,
-    /// Shared MIDI queue, so a connected keyboard plays the open track editors.
-    midi_queue: MidiEventQueue,
+    /// Where a track's keyboard feed comes from — one queue per instance, so two
+    /// open editors both hear everything instead of splitting the stream.
+    midi_router: MidiRouter,
     /// The app-wide track list the Composer draws its rows from. Every track
     /// created here is registered, and removed from it when it goes.
     registry: TrackRegistry,
 }
 
 impl TracksPanel {
-    pub fn new(midi_queue: MidiEventQueue, registry: TrackRegistry) -> Self {
+    pub fn new(midi_router: MidiRouter, registry: TrackRegistry) -> Self {
         Self {
             tracks: Vec::new(),
             next_id: 0,
             status: "Add a LeSynth Fourier or custom VST track.".to_string(),
             browser: None,
-            midi_queue,
+            midi_router,
             registry,
         }
     }
@@ -435,6 +456,8 @@ impl TracksPanel {
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: None,
             vst_state: None,
+            midi_source: None,
+            feed: None,
             editor: None,
         });
         self.status = "Created LeSynth Fourier track.".to_string();
@@ -469,6 +492,8 @@ impl TracksPanel {
             class_id: None,
             import_state: None,
             vst_state: None,
+            midi_source: None,
+            feed: None,
             editor: None,
         });
         self.status = format!("Created custom VST track '{name}'.");
@@ -607,6 +632,8 @@ impl TracksPanel {
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: state,
             vst_state: None,
+            midi_source: None,
+            feed: None,
             editor: None,
         });
         Ok(registry_id)
@@ -639,6 +666,8 @@ impl TracksPanel {
             class_id,
             import_state: None,
             vst_state,
+            midi_source: None,
+            feed: None,
             editor: None,
         });
         Ok(registry_id)
@@ -703,6 +732,8 @@ impl TracksPanel {
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: Some(state),
             vst_state: None,
+            midi_source: None,
+            feed: None,
             editor: None,
         });
         self.status = "Loaded LeSynth track — open its editor to view.".to_string();
@@ -800,7 +831,13 @@ impl TracksPanel {
         }
         let mut action: Option<Action> = None;
 
-        for (idx, track) in self.tracks.iter().enumerate() {
+        // The ports on offer, read once for the whole list rather than per row:
+        // asking the driver is not free, and every row offers the same answer.
+        let ports = crate::midi::list_midi_ports().unwrap_or_default();
+        let default_port = self.midi_router.default_port();
+        // Mutable: a row's keyboard picker writes straight into its track.
+        let mut retarget: Option<(usize, Option<String>)> = None;
+        for (idx, track) in self.tracks.iter_mut().enumerate() {
             // Scope widget ids by the stable track id, so buttons keep their
             // identity when tracks above them are removed and indices shift.
             ui.push_id(track.id, |ui| {
@@ -846,16 +883,88 @@ impl TracksPanel {
                                 },
                             );
                         });
+
+                        // Which keyboard plays *this* instance. Each track has a
+                        // feed of its own, so two open editors both hear
+                        // everything their keyboard sends instead of taking
+                        // turns at one queue — and a machine with two keyboards
+                        // on it can play them into two instruments at once.
+                        ui.horizontal(|ui| {
+                            ui.label("MIDI in:");
+                            let mut want = track.midi_source.clone();
+                            let label = match &want {
+                                Some(port) => port.clone(),
+                                None => match &default_port {
+                                    Some(p) => format!("default ({p})"),
+                                    None => "default (not connected)".to_string(),
+                                },
+                            };
+                            egui::ComboBox::from_id_salt(("midi_in", track.id, ports.len()))
+                                .width(300.0)
+                                .height(9.0 * 44.0)
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut want,
+                                        None,
+                                        "— default (the MIDI panel's port) —",
+                                    );
+                                    for port in &ports {
+                                        ui.selectable_value(
+                                            &mut want,
+                                            Some(port.clone()),
+                                            port,
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "The keyboard that plays this track's instance.\n\n\
+                                     Every instance has a feed of its own, so two open \
+                                     editors both hear everything rather than splitting \
+                                     one stream between them, and two keyboards can play \
+                                     two instruments at once.\n\n\
+                                     “Default” follows whatever the MIDI panel is \
+                                     connected to. Takes effect on the next note — \
+                                     nothing is reopened, and the audio keeps running.",
+                                );
+                            if want != track.midi_source {
+                                retarget = Some((idx, want));
+                            }
+                        });
                     });
             });
             ui.add_space(6.0);
         }
 
+        // Applied after the loop: pointing a feed somewhere else talks to the
+        // router, which the rows above are still borrowing.
+        if let Some((idx, want)) = retarget {
+            if let Some(track) = self.tracks.get_mut(idx) {
+                let feed_id = track.feed.as_ref().map(|f| f.id);
+                match feed_id.map_or(Ok(()), |id| self.midi_router.set_source(id, want.clone())) {
+                    Ok(()) => {
+                        track.midi_source = want;
+                        // A track whose editor has never been opened has no feed
+                        // yet; the choice is remembered and used when it is.
+                        self.status = match &track.midi_source {
+                            Some(port) => format!("{} now plays from {port}.", track.name),
+                            None => format!("{} follows the MIDI panel's port.", track.name),
+                        };
+                    }
+                    Err(e) => self.status = format!("Could not switch MIDI source: {e:#}"),
+                }
+            }
+        }
+        // An editor that has been closed since the last frame may have been the
+        // last listener on its keyboard; this is what hands the device back.
+        self.midi_router.release_unused();
+
         match action {
             Some(Action::Open(idx)) => {
-                let queue = self.midi_queue.clone();
+                let router = self.midi_router.clone();
                 if let Some(track) = self.tracks.get_mut(idx) {
-                    if let Err(e) = track.open_editor(&queue) {
+                    if let Err(e) = track.open_editor(&router) {
                         self.status = format!("Open editor failed: {e:#}");
                     } else if track.editor.as_ref().is_some_and(|e| !e.is_audible()) {
                         self.status =
