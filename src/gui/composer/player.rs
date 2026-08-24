@@ -24,6 +24,14 @@
 //! pulled by this one. The grid is snapshotted from the live editor when there
 //! is one, so what plays is what the user is editing.
 //!
+//! **One instance serves as many rows as it can** ([`share_groups`]). An
+//! instrument is polyphonic — the rows of a chord are one instrument playing
+//! three notes, not three instruments — and an instance is not cheap: a LeSynth
+//! grid and its rendered key buffers are tens of megabytes, and a sampler's
+//! whole kit is more. A row therefore only gets an instance of its own when it
+//! *needs* one: a different sound, a different level, or notes that would
+//! collide with another row's on the same instance.
+//!
 //! The schedule is resolved to sample times up front, so the callback only walks
 //! a sorted per-row cursor — no allocation or locking of its own.
 //!
@@ -83,6 +91,17 @@ pub struct PlannedNote {
     pub pitch: u8,
 }
 
+impl PlannedNote {
+    /// Whether this note is sounding at the same time as `other` **on the same
+    /// pitch** — the one thing two rows cannot do on one instance, because a
+    /// note-off names only a pitch and would cut the other row's note.
+    fn collides_with(&self, other: &Self) -> bool {
+        self.pitch == other.pitch
+            && self.at_secs < other.at_secs + other.dur_secs
+            && other.at_secs < self.at_secs + self.dur_secs
+    }
+}
+
 /// One composer row, ready to play.
 pub struct RowPlan {
     /// The panel's row id, which is how a live edit finds the voice again.
@@ -112,16 +131,21 @@ struct LiveUpdate {
 }
 
 struct VoiceEdit {
-    row_id: u64,
+    /// Which voice this is for, by position. The voice list is fixed for the
+    /// life of a player — loading an instance is not something an audio callback
+    /// can do — so an index is a stable name for one, and a voice serving
+    /// several rows has no single row id to be found by.
+    voice: usize,
     gain: f32,
     schedule: Vec<(u64, u8, bool)>,
 }
 
 /// A row's live instance plus its event schedule, as the callback sees it.
 struct Voice {
-    /// The panel's row id: which row of the composition this voice is playing,
-    /// so an edit can be matched to it by identity rather than by position.
-    row_id: u64,
+    /// The panel's row ids: which rows of the composition this one instance is
+    /// playing. Usually one; several when they were found to be shareable (see
+    /// [`share_groups`]).
+    row_ids: Vec<u64>,
     /// The instance this voice plays. Held here, not just in the player, so the
     /// plugin cannot be terminated or its library unloaded while the callback
     /// that calls `process()` on it still exists.
@@ -173,8 +197,17 @@ pub struct CompositionPlayer {
     /// own output latency, as it reports it.
     latency_us: Arc<AtomicU64>,
     sample_rate: f64,
+    /// Which rows each voice is playing, by position — the grouping
+    /// [`share_groups`] settled on, which a live edit has to merge along.
+    voice_rows: Vec<Vec<u64>>,
+    /// Set when a live edit gave two rows sharing an instance different gains.
+    /// One instance has one output and so one level, so the panel has to say
+    /// that the transport cannot do what the sliders now ask for.
+    gains_diverged: Arc<AtomicBool>,
     /// Rows that actually loaded, and rows asked for.
     pub loaded_rows: usize,
+    /// Plugin instances those rows are sharing.
+    pub instances: usize,
     pub total_rows: usize,
     /// End of the composition, tail included.
     pub total_secs: f64,
@@ -190,12 +223,20 @@ pub struct PreparedComposition {
     channels: usize,
     stream_cfg: cpal::StreamConfig,
     total_rows: usize,
+    /// Rows that ended up with an instance behind them — not the same as the
+    /// number of instances, since one can serve several rows.
+    rows_playing: usize,
 }
 
 impl PreparedComposition {
     /// Rows that loaded, and rows asked for.
     pub fn loaded_rows(&self) -> (usize, usize) {
-        (self.plugins.len(), self.total_rows)
+        (self.rows_playing, self.total_rows)
+    }
+
+    /// How many plugin instances those rows are sharing.
+    pub fn instances(&self) -> usize {
+        self.plugins.len()
     }
 }
 
@@ -237,7 +278,12 @@ impl CompositionPlayer {
         let stream_cfg: cpal::StreamConfig = cfg.into();
 
         let total_rows = plans.len();
-        let (voices, plugins, end_sample) = prepare_voices(plans, sample_rate, max_block as i32)?;
+        let PreparedVoices {
+            voices,
+            plugins,
+            end_sample,
+            rows_playing,
+        } = prepare_voices(plans, sample_rate, max_block as i32)?;
         Ok(PreparedComposition {
             voices,
             plugins,
@@ -246,6 +292,7 @@ impl CompositionPlayer {
             channels,
             stream_cfg,
             total_rows,
+            rows_playing,
         })
     }
 
@@ -265,7 +312,12 @@ impl CompositionPlayer {
             channels,
             stream_cfg,
             total_rows,
+            rows_playing,
         } = prepared;
+        // Which rows each voice plays, kept on this side too: a live edit has to
+        // merge the rows of a voice back into one schedule, and the voices
+        // themselves belong to the audio callback from here on.
+        let voice_rows: Vec<Vec<u64>> = voices.iter().map(|v| v.row_ids.clone()).collect();
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -373,9 +425,10 @@ impl CompositionPlayer {
         )?;
         stream.play()?;
 
-        let loaded_rows = plugins.len();
+        let instances = plugins.len();
         log::info!(
-            "Composer playback started: {loaded_rows}/{total_rows} row(s), {:.1}s",
+            "Composer playback started: {rows_playing}/{total_rows} row(s) on \
+             {instances} instance(s), {:.1}s",
             end_sample as f64 / sample_rate
         );
 
@@ -389,7 +442,10 @@ impl CompositionPlayer {
             started,
             latency_us,
             sample_rate,
-            loaded_rows,
+            voice_rows,
+            gains_diverged: Arc::new(AtomicBool::new(false)),
+            loaded_rows: rows_playing,
+            instances,
             total_rows,
             total_secs: end_sample as f64 / sample_rate,
         })
@@ -408,20 +464,38 @@ impl CompositionPlayer {
     /// playing is ignored (it has no plugin loaded, and an audio callback cannot
     /// load one), and a row it *is* playing that no longer appears simply falls
     /// silent. Which track a row plays therefore cannot be changed this way.
+    ///
+    /// Rows sharing an instance are merged back along the grouping the transport
+    /// started with — that cannot be revisited either, for the same reason. If an
+    /// edit gives two of them different gains, the instance keeps the first row's
+    /// and [`Self::gains_diverged`] says so: one output cannot be at two levels.
     pub fn update_live(&self, rows: &[RowEdit], loop_secs: f64) {
         let mut last_event = 0u64;
-        let rows: Vec<VoiceEdit> = rows
+        let mut diverged = false;
+        let rows: Vec<VoiceEdit> = self
+            .voice_rows
             .iter()
-            .map(|row| {
-                let (schedule, last) = schedule_from(&row.notes, self.sample_rate);
+            .enumerate()
+            .map(|(voice, ids)| {
+                let mut notes: Vec<PlannedNote> = Vec::new();
+                let mut gain = None;
+                for edit in ids.iter().filter_map(|id| rows.iter().find(|r| r.row_id == *id)) {
+                    notes.extend_from_slice(&edit.notes);
+                    match gain {
+                        None => gain = Some(edit.gain),
+                        Some(first) => diverged |= first != edit.gain,
+                    }
+                }
+                let (schedule, last) = schedule_from(&notes, self.sample_rate);
                 last_event = last_event.max(last);
                 VoiceEdit {
-                    row_id: row.row_id,
-                    gain: row.gain,
+                    voice,
+                    gain: gain.unwrap_or(0.0),
                     schedule,
                 }
             })
             .collect();
+        self.gains_diverged.store(diverged, Ordering::Relaxed);
         let update = LiveUpdate {
             rows,
             loop_sample: loop_sample_for(loop_secs, self.sample_rate, last_event),
@@ -456,6 +530,14 @@ impl CompositionPlayer {
             None => -started.saturating_duration_since(t).as_secs_f64(),
         };
         Some(since - self.latency_us.load(Ordering::Relaxed) as f64 / 1e6)
+    }
+
+    /// Whether the last live edit asked for two levels on one instance — rows
+    /// that share one were given different gains. The transport plays them at
+    /// the first row's; hearing the rest takes a fresh Play, which is free to
+    /// group them differently.
+    pub fn gains_diverged(&self) -> bool {
+        self.gains_diverged.load(Ordering::Relaxed)
     }
 
     /// Seconds played so far.
@@ -509,14 +591,18 @@ fn take_live_update(
     if update.applied {
         return;
     }
-    for voice in voices.iter_mut() {
-        match update.rows.iter_mut().find(|r| r.row_id == voice.row_id) {
+    for (i, voice) in voices.iter_mut().enumerate() {
+        // By position: an edit is built from the same voice list this walks, so
+        // the two cannot drift, and a voice serving several rows has no single
+        // row id to be found by.
+        match update.rows.iter_mut().find(|r| r.voice == i) {
             Some(edit) => {
                 std::mem::swap(&mut voice.schedule, &mut edit.schedule);
                 voice.gain = edit.gain;
             }
-            // The row was deleted. Its plugin stays loaded — unloading is not
-            // something this thread can do — but it has nothing left to play.
+            // Every row this voice played was deleted. Its plugin stays loaded —
+            // unloading is not something this thread can do — but it has nothing
+            // left to play.
             None => voice.schedule.clear(),
         }
         voice.cursor = 0;
@@ -533,6 +619,75 @@ fn rewind(voices: &mut [Voice], position: &AtomicU64) {
         voice.cursor = 0;
     }
     position.store(0, Ordering::Relaxed);
+}
+
+/// Which rows can be played by one plugin instance, as groups of indices into
+/// `plans`.
+///
+/// **Why share.** An instance is expensive in exactly the way a composition
+/// multiplies: a LeSynth track carries its grid and a rendered buffer per key,
+/// a sampler its whole kit, and the Composer used to load one per row. Six rows
+/// of one drum track were six copies of that kit in memory — and six times the
+/// loading. A chord recorded from the keyboard is three rows of one instrument,
+/// which is the same instrument playing three notes.
+///
+/// **When it is safe.** Three things have to hold, and each of them is a way the
+/// sharing would otherwise be audible:
+///
+/// * **The same recipe.** A different library, class, grid or saved state is a
+///   different sound; nothing to share.
+/// * **The same gain.** One instance has one output, so rows sharing it are
+///   mixed at one level. Rows at different levels get an instance each.
+/// * **No collision.** A note-off names a pitch, not a note: if two rows have
+///   the same pitch sounding at once, one row's release would cut the other's
+///   note short. Rows that would do that are kept apart.
+///
+/// First-fit, in row order, so the first row of a group is the one whose recipe
+/// and gain the group is named by — and a composition of unrelated rows comes
+/// out exactly as it went in, one group each.
+fn share_groups(plans: &[RowPlan]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    'plan: for (i, plan) in plans.iter().enumerate() {
+        for group in groups.iter_mut() {
+            let host = &plans[group[0]];
+            if !same_recipe(&host.source, &plan.source) || host.gain != plan.gain {
+                continue;
+            }
+            if group
+                .iter()
+                .any(|&j| notes_collide(&plans[j].notes, &plan.notes))
+            {
+                continue;
+            }
+            group.push(i);
+            continue 'plan;
+        }
+        groups.push(vec![i]);
+    }
+    groups
+}
+
+/// Whether two rows would load the identical instance. The track's *name* is not
+/// part of it: two registry entries pointing at the same library with the same
+/// state are the same sound whatever they are called.
+fn same_recipe(a: &PlaybackSource, b: &PlaybackSource) -> bool {
+    a.plugin_path == b.plugin_path
+        && a.class_id == b.class_id
+        && a.is_lesynth == b.is_lesynth
+        && a.state == b.state
+        && a.vst_state == b.vst_state
+}
+
+/// Whether any note of `a` sounds at the same time as one of `b` on the same
+/// pitch.
+///
+/// Quadratic in principle, and deliberately so: it runs once per candidate pair
+/// when Play is pressed, over the notes a person typed into a row. The pitch
+/// test comes first, so the arithmetic only happens for the few notes that could
+/// possibly collide.
+fn notes_collide(a: &[PlannedNote], b: &[PlannedNote]) -> bool {
+    a.iter()
+        .any(|x| b.iter().any(|y| x.collides_with(y)))
 }
 
 /// Load an instance per row, import its grid and resolve its notes to sample
@@ -556,11 +711,12 @@ fn rewind(voices: &mut [Voice], position: &AtomicU64) {
 /// costs the user a message rather than a dead window.
 fn load_instances(
     plans: &[RowPlan],
+    groups: &[Vec<usize>],
     sample_rate: f64,
     max_block: i32,
 ) -> Vec<Option<Arc<PluginInstance>>> {
-    // One module per distinct library rather than one per row: that is what a
-    // VST3 module is for, and it saves a `dlopen` and a `ModuleEntry` per row.
+    // One module per distinct library rather than one per group: that is what a
+    // VST3 module is for, and it saves a `dlopen` and a `ModuleEntry` each time.
     let mut modules: HashMap<PathBuf, Option<Arc<Vst3Module>>> = HashMap::new();
     for plan in plans {
         modules
@@ -574,9 +730,12 @@ fn load_instances(
             });
     }
 
-    plans
+    // One instance per **group**, built from the row that opened it — every row
+    // in a group has the same recipe, so any of them describes it.
+    groups
         .iter()
-        .map(|plan| {
+        .map(|group| {
+            let plan = &plans[group[0]];
             let module = modules.get(&plan.source.plugin_path).cloned().flatten();
             load_one(module, plan, sample_rate, max_block)
         })
@@ -630,30 +789,47 @@ fn load_one(
     Some(inst)
 }
 
+/// Everything [`prepare_voices`] settles: the voices themselves, the instances
+/// keeping their libraries alive, where the composition ends, and how many rows
+/// actually got a voice — which is not the number of voices, since one serves
+/// however many rows it can.
+struct PreparedVoices {
+    voices: Vec<Voice>,
+    plugins: Vec<Arc<PluginInstance>>,
+    end_sample: u64,
+    rows_playing: usize,
+}
+
 fn prepare_voices(
     plans: Vec<RowPlan>,
     sample_rate: f64,
     max_block: i32,
-) -> Result<(Vec<Voice>, Vec<Arc<PluginInstance>>, u64)> {
-    // Load the plugins first, and load them **at the same time**. Each instance
-    // is hundreds of milliseconds of its own work — a sampler reads its samples,
-    // and restoring a saved state can make it read them again — and rows do not
-    // interact while they load. Six rows of the same drum plugin took 2.8 s in a
-    // row and take about one of them together.
-    //
-    // The module is opened once per library rather than once per row: that is
+) -> Result<PreparedVoices> {
+    // Which rows can be played by one instance. Everything below is per *group*
+    // from here on: the loading, the schedule and the mix.
+    let groups = share_groups(&plans);
+    // The module is opened once per library rather than once per group: that is
     // what a VST3 module is for, and `ModuleEntry` is not a thing to race.
-    let instances = load_instances(&plans, sample_rate, max_block);
+    let instances = load_instances(&plans, &groups, sample_rate, max_block);
 
     let mut voices: Vec<Voice> = Vec::new();
     let mut plugins: Vec<Arc<PluginInstance>> = Vec::new();
     let mut last_event = 0u64;
+    let mut rows_playing = 0usize;
 
-    for (plan, inst) in plans.into_iter().zip(instances) {
+    for (group, inst) in groups.iter().zip(instances) {
         let Some(inst) = inst else { continue };
+        let host = &plans[group[0]];
 
-        let (schedule, row_last_event) = schedule_from(&plan.notes, sample_rate);
-        last_event = last_event.max(row_last_event);
+        // Every note of every row in the group, on one instance. Sorted into one
+        // schedule by `schedule_from`, so the callback still only walks a cursor.
+        let notes: Vec<PlannedNote> = group
+            .iter()
+            .flat_map(|&i| plans[i].notes.iter().copied())
+            .collect();
+        let (schedule, group_last_event) = schedule_from(&notes, sample_rate);
+        last_event = last_event.max(group_last_event);
+        rows_playing += group.len();
 
         let event_impl = Arc::new(EventList::default());
         let event_list = ComWrapper::new((*event_impl).clone())
@@ -684,11 +860,11 @@ fn prepare_voices(
         );
 
         voices.push(Voice {
-            row_id: plan.row_id,
+            row_ids: group.iter().map(|&i| plans[i].row_id).collect(),
             plugin: inst.clone(),
             event_impl,
             event_list,
-            gain: plan.gain,
+            gain: host.gain,
             schedule,
             cursor: 0,
             in_channels,
@@ -703,7 +879,12 @@ fn prepare_voices(
 
     anyhow::ensure!(!voices.is_empty(), "no playable rows");
     let end_sample = last_event + (TAIL_SECS * sample_rate).round() as u64;
-    Ok((voices, plugins, end_sample))
+    Ok(PreparedVoices {
+        voices,
+        plugins,
+        end_sample,
+        rows_playing,
+    })
 }
 
 /// Process one block of every voice and sum it into `out` (interleaved,
@@ -824,7 +1005,12 @@ pub fn render_offline(
     // nothing about the result — events are placed by sample — so a fixed one
     // keeps the export independent of whatever device happens to be attached.
     const BLOCK: usize = 512;
-    let (mut voices, plugins, end_sample) = prepare_voices(plans, sample_rate, BLOCK as i32)?;
+    let PreparedVoices {
+        mut voices,
+        plugins,
+        end_sample,
+        rows_playing,
+    } = prepare_voices(plans, sample_rate, BLOCK as i32)?;
 
     let mut block = vec![0f32; BLOCK * channels];
     let mut out: Vec<f32> = Vec::with_capacity(end_sample as usize * channels);
@@ -837,12 +1023,11 @@ pub fn render_offline(
         pos += frames as u64;
     }
 
-    let loaded_rows = plugins.len();
     // Voices hold `ComPtr`s into these libraries: drop them first, in the order
     // the transport tears its stream down in.
     drop(voices);
     drop(plugins);
-    Ok((out, loaded_rows, total_rows))
+    Ok((out, rows_playing, total_rows))
 }
 
 impl Drop for CompositionPlayer {
@@ -851,5 +1036,127 @@ impl Drop for CompositionPlayer {
         // from field order: the stream stops before `_plugins` unloads the
         // libraries its callback calls into.
         self.stream = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(at_secs: f64, dur_secs: f64, pitch: u8) -> PlannedNote {
+        PlannedNote {
+            at_secs,
+            dur_secs,
+            pitch,
+        }
+    }
+
+    fn source(path: &str) -> PlaybackSource {
+        PlaybackSource {
+            name: path.to_string(),
+            plugin_path: PathBuf::from(path),
+            class_id: None,
+            is_lesynth: false,
+            state: None,
+            vst_state: None,
+        }
+    }
+
+    fn plan(row_id: u64, source: PlaybackSource, gain: f32, notes: Vec<PlannedNote>) -> RowPlan {
+        RowPlan {
+            row_id,
+            source,
+            gain,
+            notes,
+        }
+    }
+
+    /// The saving this exists for: a chord recorded from the keyboard is several
+    /// rows of one instrument, and one instance can play all of it.
+    #[test]
+    fn rows_of_one_instrument_share_one_instance() {
+        let plans = vec![
+            plan(0, source("/x.so"), 1.0, vec![note(0.0, 1.0, 60)]),
+            plan(1, source("/x.so"), 1.0, vec![note(0.0, 1.0, 64)]),
+            plan(2, source("/x.so"), 1.0, vec![note(0.0, 1.0, 67)]),
+        ];
+        assert_eq!(share_groups(&plans), vec![vec![0, 1, 2]]);
+    }
+
+    /// A different sound is a different instance, however alike the rows look.
+    #[test]
+    fn a_different_recipe_is_never_shared() {
+        let mut other = source("/x.so");
+        other.class_id = Some([9; 16]);
+        let mut stateful = source("/x.so");
+        stateful.vst_state = Some(vec![1, 2, 3]);
+        let plans = vec![
+            plan(0, source("/x.so"), 1.0, vec![note(0.0, 1.0, 60)]),
+            plan(1, source("/y.so"), 1.0, vec![note(0.0, 1.0, 62)]),
+            plan(2, other, 1.0, vec![note(0.0, 1.0, 64)]),
+            plan(3, stateful, 1.0, vec![note(0.0, 1.0, 65)]),
+            // Same library, same state, a different name: the same sound.
+            plan(4, source("/x.so"), 1.0, vec![note(0.0, 1.0, 67)]),
+        ];
+        assert_eq!(
+            share_groups(&plans),
+            vec![vec![0, 4], vec![1], vec![2], vec![3]]
+        );
+    }
+
+    /// One instance has one output and so one level. Rows at different gains
+    /// have to be kept apart or one of them plays at the other's volume.
+    #[test]
+    fn rows_at_different_levels_are_never_shared() {
+        let plans = vec![
+            plan(0, source("/x.so"), 1.0, vec![note(0.0, 1.0, 60)]),
+            plan(1, source("/x.so"), 0.5, vec![note(0.0, 1.0, 64)]),
+            plan(2, source("/x.so"), 1.0, vec![note(0.0, 1.0, 67)]),
+        ];
+        assert_eq!(share_groups(&plans), vec![vec![0, 2], vec![1]]);
+    }
+
+    /// A note-off names a pitch, not a note: two rows sounding the same pitch at
+    /// once on one instance would have the first release cut the second note.
+    #[test]
+    fn rows_whose_notes_would_collide_are_never_shared() {
+        let plans = vec![
+            plan(0, source("/x.so"), 1.0, vec![note(0.0, 1.0, 60)]),
+            // Same pitch, overlapping — must not share.
+            plan(1, source("/x.so"), 1.0, vec![note(0.5, 1.0, 60)]),
+            // Same pitch, but after the first has finished — safe.
+            plan(2, source("/x.so"), 1.0, vec![note(2.0, 1.0, 60)]),
+        ];
+        assert_eq!(share_groups(&plans), vec![vec![0, 2], vec![1]]);
+
+        // Touching end to end is not a collision: the note-off is sorted ahead
+        // of the note-on at the same sample.
+        let touching = vec![
+            plan(0, source("/x.so"), 1.0, vec![note(0.0, 1.0, 60)]),
+            plan(1, source("/x.so"), 1.0, vec![note(1.0, 1.0, 60)]),
+        ];
+        assert_eq!(share_groups(&touching), vec![vec![0, 1]]);
+    }
+
+    /// Sharing must not change what is played: the merged schedule is every
+    /// note of every row in the group, in time order, note-offs ahead of the
+    /// note-ons they meet.
+    #[test]
+    fn a_shared_schedule_holds_every_row_s_notes() {
+        let rate = 1000.0;
+        let notes = vec![note(0.0, 1.0, 60), note(0.0, 1.0, 64), note(1.0, 1.0, 60)];
+        let (schedule, last) = schedule_from(&notes, rate);
+        assert_eq!(
+            schedule,
+            vec![
+                (0, 60, true),
+                (0, 64, true),
+                (1000, 60, false),
+                (1000, 64, false),
+                (1000, 60, true),
+                (2000, 60, false),
+            ]
+        );
+        assert_eq!(last, 2000);
     }
 }

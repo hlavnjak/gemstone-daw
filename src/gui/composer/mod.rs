@@ -604,6 +604,14 @@ impl ComposerPanel {
             return;
         }
         player.update_live(&snapshot.rows, snapshot.loop_secs);
+        // One instance has one output, so rows sharing one are at one level. The
+        // transport keeps the first row's; saying so beats a slider that visibly
+        // moves and audibly does nothing.
+        if player.gains_diverged() {
+            self.status = "Rows sharing an instance were given different gains — \
+                           press Play again to give them one each."
+                .to_string();
+        }
         self.live_sent = Some(snapshot);
     }
 
@@ -665,15 +673,25 @@ impl ComposerPanel {
             }
         };
         let (loaded, total) = prepared.loaded_rows();
+        let instances = prepared.instances();
         // The length may have been edited while the rows were loading; the loop
         // follows what is on screen now, as a live edit would.
         let loop_secs = self.end_units() as f64 * self.secs_per_unit();
         match CompositionPlayer::start_prepared(prepared, loop_secs, self.repeat.clone()) {
             Ok(player) => {
+                // Say when rows are sharing: it explains both the memory and why
+                // one of them cannot be given its own level while it plays.
+                let shared = match instances < loaded {
+                    true => format!(" on {instances} shared instance(s)"),
+                    false => String::new(),
+                };
                 self.status = if loaded == total {
-                    format!("Playing {loaded} row(s).")
+                    format!("Playing {loaded} row(s){shared}.")
                 } else {
-                    format!("Playing {loaded} of {total} row(s) — the rest failed to load.")
+                    format!(
+                        "Playing {loaded} of {total} row(s){shared} — the rest failed \
+                         to load."
+                    )
                 };
                 if let Some(rec) = &self.recording {
                     // The take starts where the sound does. Loading the rows
