@@ -40,8 +40,15 @@
 //! gain = 1
 //! lead = 0 none
 //! autosave = 1
-//! note = 60 0 1/4 0 1/8
+//! note = 60 0 1/4 0 3/8
 //! ```
+//!
+//! A length is two fields — whole notes, then the fraction, nominator and all:
+//! `0 3/8` is three eighths, `2 1/4` is two whole notes and a quarter, `1 none`
+//! is one whole note. A length with no nominator writes exactly the token it
+//! always did, so files that do not use one are unchanged and load in any build;
+//! one that does is refused by a build too old to know `3/8`, which is a message
+//! rather than a silent misreading.
 //!
 //! Unknown keys are skipped, so a field added later loads in an older build
 //! rather than failing. The version line is checked, so a *newer* format is
@@ -279,15 +286,13 @@ fn num(v: f32) -> String {
 }
 
 fn write_duration(d: Duration) -> String {
-    format!("{} {}", d.wholes, frac_token(d.frac))
+    format!("{} {}", d.wholes, frac_token(d.num, d.frac))
 }
 
 fn read_duration(v: &str) -> Result<Duration> {
     let (w, f) = v.split_once(' ').unwrap_or((v, "none"));
-    Ok(Duration::new(
-        w.trim().parse().unwrap_or(0),
-        frac_from_token(f.trim())?,
-    ))
+    let (num, frac) = frac_from_token(f.trim())?;
+    Ok(Duration::with_num(w.trim().parse().unwrap_or(0), num, frac))
 }
 
 fn read_note(v: &str) -> Result<Item> {
@@ -304,35 +309,43 @@ fn read_note(v: &str) -> Result<Item> {
     })
 }
 
-/// Plain ASCII tokens, not [`Fraction::label`]'s em dash: this is a file, and it
-/// is meant to be typed by hand when a project needs repairing.
-fn frac_token(f: Fraction) -> &'static str {
+/// The fractional part, nominator and all: `1/4`, `3/8`, or `none` where there
+/// is no fraction. Plain ASCII, not [`Fraction::label`]'s em dash — this is a
+/// file, and it is meant to be typed by hand when a project needs repairing.
+///
+/// The nominator rides inside the token rather than in a field of its own, so a
+/// length that has none writes the token this format has always written and the
+/// note line keeps its five fields.
+fn frac_token(num: u8, f: Fraction) -> String {
     match f {
-        Fraction::None => "none",
-        Fraction::Half => "1/2",
-        Fraction::Quarter => "1/4",
-        Fraction::Eighth => "1/8",
-        Fraction::Sixteenth => "1/16",
-        Fraction::ThirtySecond => "1/32",
-        Fraction::SixtyFourth => "1/64",
-        Fraction::HundredTwentyEighth => "1/128",
-        Fraction::TwoHundredFiftySixth => "1/256",
+        Fraction::None => "none".to_string(),
+        f => format!("{num}/{}", f.denom()),
     }
 }
 
-fn frac_from_token(t: &str) -> Result<Fraction> {
-    Ok(match t {
-        "none" | "-" | "0" => Fraction::None,
-        "1/2" => Fraction::Half,
-        "1/4" => Fraction::Quarter,
-        "1/8" => Fraction::Eighth,
-        "1/16" => Fraction::Sixteenth,
-        "1/32" => Fraction::ThirtySecond,
-        "1/64" => Fraction::SixtyFourth,
-        "1/128" => Fraction::HundredTwentyEighth,
-        "1/256" => Fraction::TwoHundredFiftySixth,
-        other => bail!("unknown note fraction {other:?}"),
-    })
+/// The nominator and the fraction the token names. A hand-written nominator
+/// larger than the select box offers is kept as written: the file says what is
+/// playing, and quietly rounding someone's edit down is worse than showing them
+/// a value the box did not offer.
+fn frac_from_token(t: &str) -> Result<(u8, Fraction)> {
+    if matches!(t, "none" | "-" | "0") {
+        return Ok((1, Fraction::None));
+    }
+    let bad = || format!("unknown note fraction {t:?}");
+    let (n, d) = t.split_once('/').with_context(bad)?;
+    let num: u8 = n.parse().with_context(bad)?;
+    if num == 0 {
+        bail!(
+            "a note fraction is counted at least once: {t:?} — a length with no \
+             fraction at all writes \"none\""
+        );
+    }
+    let denom: i64 = d.parse().with_context(bad)?;
+    let frac = Fraction::ALL
+        .into_iter()
+        .find(|f| *f != Fraction::None && f.denom() == denom)
+        .with_context(bad)?;
+    Ok((num, frac))
 }
 
 fn write_source(s: &TrackSource) -> String {
@@ -400,6 +413,7 @@ fn class_from_hex(hex: &str) -> Result<[i8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::composer::UNITS_PER_WHOLE;
 
     fn sample() -> Project {
         Project {
@@ -423,7 +437,10 @@ mod tests {
                         Item {
                             id: 0,
                             pitch: 67,
-                            dur: Duration::new(2, Fraction::None),
+                            // A nominator on the note and none on the space, so
+                            // the round trip proves the field travels rather
+                            // than that both ends happen to say `1`.
+                            dur: Duration::with_num(2, 3, Fraction::Eighth),
                             space: Duration::new(0, Fraction::None),
                         },
                     ],
@@ -469,6 +486,35 @@ mod tests {
         p.name = "Song = 2".to_string();
         let back = Project::parse(&p.to_text()).expect("parses");
         assert_eq!(back, p);
+    }
+
+    /// The nominator rides in the fraction token. A length without one writes
+    /// the token this format has always written — that is what keeps old files
+    /// and old builds working — and one with it writes the fraction whole.
+    #[test]
+    fn a_length_writes_its_nominator_into_the_fraction() {
+        assert_eq!(write_duration(Duration::new(0, Fraction::Quarter)), "0 1/4");
+        assert_eq!(write_duration(Duration::with_num(2, 3, Fraction::Eighth)), "2 3/8");
+        assert_eq!(write_duration(Duration::new(1, Fraction::None)), "1 none");
+
+        // And back, including the tokens written before nominators existed.
+        for (text, units) in [
+            ("0 1/4", UNITS_PER_WHOLE / 4),
+            ("0 3/8", UNITS_PER_WHOLE * 3 / 8),
+            ("2 3/8", UNITS_PER_WHOLE * 2 + UNITS_PER_WHOLE * 3 / 8),
+            ("1 none", UNITS_PER_WHOLE),
+            ("0 none", 0),
+            ("0 16/256", UNITS_PER_WHOLE / 16),
+        ] {
+            let d = read_duration(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(d.units(), units, "{text:?}");
+        }
+
+        // A fraction that is no fraction at all is `none`, not a zero nominator:
+        // the file is refused rather than read as some other length.
+        assert!(read_duration("0 0/8").is_err());
+        assert!(read_duration("0 1/7").is_err());
+        assert!(read_duration("0 3").is_err());
     }
 
     /// A row saved before a per-row switch existed reads as the default a new

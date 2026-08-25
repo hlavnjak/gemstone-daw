@@ -85,7 +85,11 @@ impl DawApp {
     }
 
     /// Apply a consistent, slightly roomier look across the whole app.
-    fn configure_style(ctx: &egui::Context) {
+    ///
+    /// `pub(crate)` so a test that measures a panel's layout can lay it out
+    /// under the text sizes and spacing the user actually sees: egui's defaults
+    /// are smaller, and a card that fits under them can still overflow here.
+    pub(crate) fn configure_style(ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(10.0, 6.0);

@@ -47,13 +47,16 @@ rows may share the same one.
   map and the rule that spots a drum plugin are in `src/midi/drums.rs`.
 - **Notes and spaces.** "➕ Add Note" appends two frames: a **note** frame
   (blue), and behind it a **space** frame (amber) which is the silence that
-  follows. A note frame carries three select boxes — pitch (`C0`–`B8`), the
-  whole-note part of its length, and the fractional part (1/2 … 1/256). A space
-  frame carries only the two length boxes; it has no pitch. A length is the two
-  parts added together, so `1` + `1/8` is a whole note tied to an eighth.
+  follows. A note frame carries four select boxes — pitch (`C0`–`B8`), the
+  whole-note part of its length, the nominator (`× 1` … `× 16`), and the
+  fraction it counts (1/2 … 1/256). A space frame carries the same three length
+  boxes; it has no pitch. A length is the parts added together, so `1` + `× 1` +
+  `1/8` is a whole note tied to an eighth, and `× 3` over `1/8` is `3/8` — the
+  dotted quarter the halving fraction box cannot name on its own. The nominator
+  needs a fraction to count, so it is greyed out while the fraction reads `—`.
 - **A space belongs to its note.** It has no delete button of its own: the ✖ on
   a note frame removes the note *and* its space, and there is no way to remove
-  one without the other. Setting a space to `0 whole` + `—` is the way to run
+  one without the other. Setting a space to `0 whole` and `—` is the way to run
   two notes together — the frame stays as a placeholder, but adds no time.
 - **Time**: every row starts at zero, so two rows sound together exactly when the
   lengths in front of their frames add up the same — that is what makes a chord.

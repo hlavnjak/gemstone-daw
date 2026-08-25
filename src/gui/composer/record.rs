@@ -27,9 +27,13 @@
 //! rounding never accumulates: the tenth note lands on the grid position it was
 //! played nearest to, not ten roundings away from it.
 //!
-//! **A gap is exact; a note length is rounded twice.** A length is two select
-//! boxes — whole notes plus one fraction — which cannot express, say, 3/8. Note
-//! lengths therefore take the nearest value the boxes *can* express. Silence
+//! **A gap is exact; a note length is rounded twice.** A take is written in
+//! plain lengths — whole notes plus one fraction, no nominator — which cannot
+//! express, say, 3/8 in a single frame. Note lengths therefore take the nearest
+//! value a plain length *can* express. (The frames themselves do count a
+//! fraction, so what is written here can be turned into a 3/8 by hand; teaching
+//! the rounding to search nominators is a change to this file, not to what a
+//! frame can hold.) Silence
 //! does not have to: a space that is not expressible is split across the space
 //! frame and one or more silent placeholder frames behind it ([`split_units`]),
 //! which the model already allows and which costs nothing but a frame on screen.
@@ -247,8 +251,12 @@ fn shares_a_row(last: GridNote, next: GridNote) -> bool {
     next.at != last.at && last.end() < next.end()
 }
 
-/// The length the two select boxes express exactly, if they can: whole notes
-/// plus one fraction, and nothing else. `3/8` has no answer here; `1 + 1/8` does.
+/// The length a *plain* frame expresses exactly, if it can: whole notes plus one
+/// fraction, the nominator left at one. `3/8` has no answer here; `1 + 1/8` does.
+///
+/// A frame's nominator would give `3/8` one — the take simply does not use it,
+/// so that what it writes is split and rounded by the one rule described at the
+/// top of this file.
 pub fn duration_from_units(units: i64) -> Option<Duration> {
     if units < 0 {
         return None;
@@ -262,7 +270,7 @@ pub fn duration_from_units(units: i64) -> Option<Duration> {
     Some(Duration::new(wholes as u8, frac))
 }
 
-/// The expressible length closest to `units` — what a *note* has to settle for,
+/// The plain length closest to `units` — what a *note* has to settle for,
 /// because a note that sounds cannot be split into two frames without being
 /// struck twice. Ties go to the shorter, so a note never overruns the one after
 /// it for the sake of a rounding.
@@ -285,12 +293,12 @@ pub fn nearest_duration(units: i64) -> Duration {
     best
 }
 
-/// The longest expressible length that still fits in `units`.
+/// The longest plain length that still fits in `units`.
 pub fn longest_within(units: i64) -> Duration {
     split_units(units).first().copied().unwrap_or(ZERO)
 }
 
-/// A silence as a chain of expressible lengths adding up to it **exactly**,
+/// A silence as a chain of plain lengths adding up to it **exactly**,
 /// longest first. Empty for zero.
 ///
 /// This is why a recorded position never drifts. A gap of 3/8 cannot be one

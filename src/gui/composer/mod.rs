@@ -29,7 +29,9 @@
 //! offset against another. It belongs to the row, not to a note, so deleting the
 //! first note leaves it in place to lead the next; it starts at zero.
 //!
-//! **Length is two select boxes**: whole notes plus a fraction down to 1/256.
+//! **Length is three select boxes**: whole notes, then how many of a fraction
+//! down to 1/256 — the nominator, so `3` of a `1/8` is the dotted quarter that
+//! neither box could say on its own. Notes and spaces carry the same three.
 //! Time is counted in [`UNITS_PER_WHOLE`]ths, so every length is a whole number
 //! of units and the arithmetic stays exact. Playback lives in [`player`].
 //!
@@ -61,12 +63,24 @@ const UNITS_PER_WHOLE: i64 = 256;
 /// A beat is a quarter note.
 const UNITS_PER_BEAT: i64 = UNITS_PER_WHOLE / 4;
 
-/// On-screen width of one frame. Fixed: a frame carries up to three select boxes
+/// On-screen width of one frame. Fixed: a frame carries up to four select boxes
 /// and stops being usable below about this width, and a width proportional to
 /// the length would make a 1/256 invisible.
 const CARD_W: f32 = 108.0;
-/// Height of one frame — a header line plus up to three select boxes.
-const CARD_H: f32 = 112.0;
+/// Height of one frame — a header line plus up to four select boxes. A box costs
+/// 24 of it under the app's text sizes, and a card that no longer fits grows
+/// past this, over the lane it is drawn in; grow the two together — and see
+/// `every_frame_draws_its_nominator_inside_its_card`, which measures the card
+/// against this rather than trusting the arithmetic.
+const CARD_H: f32 = 124.0;
+/// What a frame is filled with: an amber space, a note, and a note while it is
+/// sounding.
+const SPACE_FILL: egui::Color32 = egui::Color32::from_rgb(78, 62, 38);
+const NOTE_FILL: egui::Color32 = egui::Color32::from_rgb(52, 66, 92);
+const NOTE_SOUNDING_FILL: egui::Color32 = egui::Color32::from_rgb(74, 100, 138);
+/// The three together, which is how a layout test picks the cards out of what
+/// the lane painted: they are the only filled rectangles in it.
+const CARD_FILLS: [egui::Color32; 3] = [SPACE_FILL, NOTE_FILL, NOTE_SOUNDING_FILL];
 /// Height of one row's lane. The frames plus a little air around them.
 const ROW_H: f32 = CARD_H + 10.0;
 /// Width of the fixed row head (track select, add-note, gain).
@@ -82,6 +96,10 @@ const DEFAULT_PITCH: u8 = 60;
 const DEFAULT_DRUM_PITCH: u8 = 36;
 /// Largest whole-note count a length may carry.
 const MAX_WHOLES: u8 = 16;
+/// Largest nominator — how many of its fraction a length may carry. Sixteen,
+/// like [`MAX_WHOLES`]: beyond that the whole-note box says the same thing in
+/// fewer parts.
+const MAX_NUM: u8 = 16;
 
 /// The fractional part of a length, as the fraction of a whole note it is named
 /// for. `None` is a length that is a whole number of whole notes.
@@ -126,6 +144,16 @@ impl Fraction {
         }
     }
 
+    /// What the fraction is named after — the `8` of a `1/8`. [`Fraction::None`]
+    /// is not a fraction at all, so it answers `1`, the denominator that changes
+    /// nothing.
+    fn denom(self) -> i64 {
+        match self.units() {
+            0 => 1,
+            units => UNITS_PER_WHOLE / units,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Fraction::None => "—",
@@ -139,34 +167,73 @@ impl Fraction {
             Fraction::TwoHundredFiftySixth => "1/256",
         }
     }
+
+    /// How `num` of this fraction reads: three eighths as `3/8`. One of them is
+    /// just the fraction's own name, and `None` has nothing to count.
+    fn label_times(self, num: u8) -> String {
+        match (self, num) {
+            (Fraction::None, _) | (_, 1) => self.label().to_string(),
+            _ => format!("{num}/{}", self.denom()),
+        }
+    }
 }
 
-/// A length: a whole-note count plus a fraction, added together. Both parts are
-/// picked in their own select box, which is why they are stored apart rather
-/// than as a single unit count.
+/// A length: a whole-note count plus so many of a fraction, added together.
+/// Each part is picked in its own select box, which is why they are stored apart
+/// rather than as a single unit count.
+///
+/// The nominator is what lets a frame say `3/8`: the fraction box halves all the
+/// way down, so every length it can name on its own is a power of two, and the
+/// dotted values that most music is full of are not among them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Duration {
     /// Whole notes, `0..=`[`MAX_WHOLES`].
     wholes: u8,
+    /// How many of [`Duration::frac`] — the nominator, `1..=`[`MAX_NUM`].
+    ///
+    /// Kept canonical by [`Duration::canonicalise`]: never zero, and forced back
+    /// to one when there is no fraction to count. Two lengths that sound the
+    /// same are then the same value, which is what lets the project file
+    /// round-trip and `PartialEq` mean what the tests read it as.
+    num: u8,
     frac: Fraction,
 }
 
 impl Duration {
+    /// One of `frac` past `wholes` whole notes — the plain length, the one the
+    /// nominator leaves alone.
     const fn new(wholes: u8, frac: Fraction) -> Self {
-        Self { wholes, frac }
+        Self { wholes, num: 1, frac }
+    }
+
+    /// `num` of `frac` past `wholes` whole notes, canonicalised.
+    fn with_num(wholes: u8, num: u8, frac: Fraction) -> Self {
+        let mut d = Self { wholes, num, frac };
+        d.canonicalise();
+        d
+    }
+
+    /// Restore the nominator's invariant after the select boxes have been at it:
+    /// a fraction is counted at least once, and no fraction is counted at all.
+    fn canonicalise(&mut self) {
+        if self.frac == Fraction::None {
+            self.num = 1;
+        } else {
+            self.num = self.num.max(1);
+        }
     }
 
     fn units(self) -> i64 {
-        self.wholes as i64 * UNITS_PER_WHOLE + self.frac.units()
+        self.wholes as i64 * UNITS_PER_WHOLE + self.num as i64 * self.frac.units()
     }
 
-    /// How the length reads in the frame's header, e.g. `1 + 1/8`.
+    /// How the length reads in the frame's header, e.g. `1 + 3/8`.
     fn label(self) -> String {
         match (self.wholes, self.frac) {
             (0, Fraction::None) => "0".to_string(),
-            (0, f) => f.label().to_string(),
+            (0, f) => f.label_times(self.num),
             (w, Fraction::None) => w.to_string(),
-            (w, f) => format!("{w} + {}", f.label()),
+            (w, f) => format!("{w} + {}", f.label_times(self.num)),
         }
     }
 }
@@ -290,15 +357,20 @@ impl Row {
     /// whatever comes next.
     ///
     /// The new frame **repeats the last one whole** — its pitch, its note length
-    /// and its space, whole notes and fraction alike. A row is nearly always
-    /// built by repeating something: a run on one note, the same drum over and
-    /// over, a rhythm of one length. What was chosen a moment ago is a far better
-    /// guess than any fixed default, and carrying only *part* of it is the worst
-    /// of both — five select boxes to check every time, three of which have
-    /// silently gone back to a default.
+    /// and its space, whole notes, nominator and fraction alike. A row is nearly
+    /// always built by repeating something: a run on one note, the same drum
+    /// over and over, a rhythm of one length. What was chosen a moment ago is a
+    /// far better guess than any fixed default, and carrying only *part* of it
+    /// is the worst of both — seven select boxes to check every time, five of
+    /// which have silently gone back to a default.
+    ///
+    /// This is one copy of the whole [`Item`], so a box added to a frame is
+    /// carried by the same rule the moment it exists, with nothing here to
+    /// remember to update.
     ///
     /// `default_pitch` is what the *first* note of a row starts on; the lengths
-    /// it starts on are a quarter note and an eighth of silence.
+    /// it starts on are a quarter note and an eighth of silence — one of each,
+    /// the nominator that changes nothing.
     fn add_note(&mut self, default_pitch: u8) {
         let id = self.next_item_id;
         self.next_item_id += 1;
@@ -1385,9 +1457,10 @@ impl ComposerPanel {
     /// landed, which is what a lane following the transport scrolls to.
     ///
     /// `pitch` decides which frame this is: `Some` draws the blue note frame
-    /// (pitch, two length boxes, delete); `None` the amber space frame, which has
-    /// *no delete button* — a space leaves only with its note, and the row's lead
-    /// space never leaves at all.
+    /// (pitch, three length boxes, delete); `None` the amber space frame, which
+    /// carries the same three length boxes — a space is a length like any other
+    /// — but has *no delete button*: a space leaves only with its note, and the
+    /// row's lead space never leaves at all.
     ///
     /// `percussion` names the notes after what they hit on a drum kit.
     fn frame_ui(
@@ -1402,17 +1475,17 @@ impl ComposerPanel {
         let space = pitch.is_none();
         let (fill, stroke, header) = match (space, sounding) {
             (true, _) => (
-                egui::Color32::from_rgb(78, 62, 38),
+                SPACE_FILL,
                 egui::Color32::from_rgb(186, 146, 84),
                 egui::Color32::from_rgb(226, 190, 130),
             ),
             (false, true) => (
-                egui::Color32::from_rgb(74, 100, 138),
+                NOTE_SOUNDING_FILL,
                 PLAYHEAD,
                 egui::Color32::from_rgb(245, 225, 220),
             ),
             (false, false) => (
-                egui::Color32::from_rgb(52, 66, 92),
+                NOTE_FILL,
                 egui::Color32::from_rgb(110, 150, 200),
                 egui::Color32::from_rgb(200, 218, 240),
             ),
@@ -1498,9 +1571,10 @@ impl ComposerPanel {
                                 });
                         }
 
-                        // Both boxes reach zero, and for a space that is the
-                        // point: a 0-length space is a placeholder that keeps
-                        // its frame without putting any silence in the row.
+                        // Whole notes and fraction both reach zero, and for a
+                        // space that is the point: a 0-length space is a
+                        // placeholder that keeps its frame without putting any
+                        // silence in the row.
                         egui::ComboBox::from_id_salt(("wholes", row_id, id, space))
                             .width(inner_w)
                             .height(260.0)
@@ -1513,6 +1587,34 @@ impl ComposerPanel {
                             .response
                             .on_hover_text("Whole notes — the whole part of the length");
 
+                        // The nominator, drawn over the fraction it counts, so
+                        // the two boxes read down the card as the fraction they
+                        // make: `× 3` over `1/8` is three eighths.
+                        //
+                        // Disabled while there is no fraction: it would multiply
+                        // nothing, and a box that says `× 3` over a length that
+                        // is a whole number of whole notes is simply a lie about
+                        // what is playing.
+                        ui.add_enabled_ui(dur.frac != Fraction::None, |ui| {
+                            egui::ComboBox::from_id_salt(("num", row_id, id, space))
+                                .width(inner_w)
+                                .height(260.0)
+                                .selected_text(format!("× {}", dur.num))
+                                .show_ui(ui, |ui| {
+                                    for n in 1..=MAX_NUM {
+                                        ui.selectable_value(&mut dur.num, n, format!("× {n}"));
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "How many of the fraction below — the nominator. \
+                                     Three of a 1/8 is 3/8, the dotted quarter the \
+                                     fraction box cannot name on its own, and it counts \
+                                     for a space exactly as it does for a note.\n\n\
+                                     Needs a fraction to count: pick one below first.",
+                                );
+                        });
+
                         egui::ComboBox::from_id_salt(("frac", row_id, id, space))
                             .width(inner_w)
                             .selected_text(dur.frac.label())
@@ -1523,9 +1625,14 @@ impl ComposerPanel {
                             })
                             .response
                             .on_hover_text(
-                                "Fractional part of the length, down to a 1/256 — added \
-                                 to the whole notes above",
+                                "Fractional part of the length, down to a 1/256 — taken \
+                                 as many times as the nominator above says, and added to \
+                                 the whole notes",
                             );
+
+                        // The boxes are free to leave the nominator counting a
+                        // fraction that is no longer there; the length is not.
+                        dur.canonicalise();
                     });
             },
         );
@@ -1789,10 +1896,10 @@ mod tests {
     }
 
     /// Adding a note repeats the frame before it **whole** — pitch, note length
-    /// and space, whole notes and fraction alike. Building a row means repeating
-    /// something far more often than changing it — a hi-hat line, a run on one
-    /// drum, a rhythm of one length — so none of the five select boxes should
-    /// have to be touched again for the next frame.
+    /// and space, whole notes, nominator and fraction alike. Building a row means
+    /// repeating something far more often than changing it — a hi-hat line, a run
+    /// on one drum, a rhythm of one length — so none of the seven select boxes
+    /// should have to be touched again for the next frame.
     #[test]
     fn a_new_note_carries_on_from_the_one_before_it() {
         let mut row = Row::new(0, None);
@@ -1803,44 +1910,50 @@ mod tests {
         assert_eq!(row.items[0].dur, Duration::new(0, Fraction::Quarter));
         assert_eq!(row.items[0].space, Duration::new(0, Fraction::Eighth));
 
-        // Change every box of it, and everything added after follows all of them.
+        // Change every box of it — the nominator of the note and of the space
+        // included — and everything added after follows all of them.
         row.items[0].pitch = 42;
-        row.items[0].dur = Duration::new(2, Fraction::Sixteenth);
-        row.items[0].space = Duration::new(1, Fraction::Half);
+        row.items[0].dur = Duration::with_num(2, 3, Fraction::Sixteenth);
+        row.items[0].space = Duration::with_num(1, 5, Fraction::Half);
         row.add_note(DEFAULT_DRUM_PITCH);
         row.add_note(DEFAULT_DRUM_PITCH);
         for i in [1, 2] {
             assert_eq!(row.items[i].pitch, 42, "the pitch was not carried over");
             assert_eq!(
                 row.items[i].dur,
-                Duration::new(2, Fraction::Sixteenth),
+                Duration::with_num(2, 3, Fraction::Sixteenth),
                 "the note length was not carried over"
             );
             assert_eq!(
                 row.items[i].space,
-                Duration::new(1, Fraction::Half),
+                Duration::with_num(1, 5, Fraction::Half),
                 "the space was not carried over"
             );
+            assert_eq!(row.items[i].dur.num, 3, "the note's nominator was not carried over");
+            assert_eq!(row.items[i].space.num, 5, "the space's nominator was not carried over");
         }
 
         // It follows the *last* frame, not the first.
         row.items[2].pitch = 46;
-        row.items[2].dur = Duration::new(0, Fraction::ThirtySecond);
+        row.items[2].dur = Duration::with_num(0, 7, Fraction::ThirtySecond);
         row.add_note(DEFAULT_DRUM_PITCH);
         assert_eq!(row.items[3].pitch, 46);
-        assert_eq!(row.items[3].dur, Duration::new(0, Fraction::ThirtySecond));
+        assert_eq!(row.items[3].dur, Duration::with_num(0, 7, Fraction::ThirtySecond));
 
         // Every frame still gets an id of its own, or two of them would share
         // their widgets.
         let ids: std::collections::HashSet<u64> = row.items.iter().map(|i| i.id).collect();
         assert_eq!(ids.len(), row.items.len(), "two frames share an id");
 
-        // A row emptied of notes starts from the defaults again.
+        // A row emptied of notes starts from the defaults again — one of each
+        // fraction, the nominator that changes nothing.
         row.items.clear();
         row.add_note(DEFAULT_PITCH);
         assert_eq!(row.items[0].pitch, DEFAULT_PITCH);
         assert_eq!(row.items[0].dur, Duration::new(0, Fraction::Quarter));
         assert_eq!(row.items[0].space, Duration::new(0, Fraction::Eighth));
+        assert_eq!(row.items[0].dur.num, 1);
+        assert_eq!(row.items[0].space.num, 1);
     }
 
     /// Pressing Play must not wait for the plugins.
@@ -2108,6 +2221,64 @@ mod tests {
         assert_eq!(Duration::new(3, Fraction::None).label(), "3");
     }
 
+    /// The nominator counts the fraction: `3` of a `1/8` is the dotted quarter
+    /// the halving fraction box cannot name on its own, and it reads as `3/8`
+    /// wherever the length is shown.
+    #[test]
+    fn a_nominator_counts_the_fraction_it_sits_over() {
+        let dotted_quarter = Duration::with_num(0, 3, Fraction::Eighth);
+        assert_eq!(dotted_quarter.units(), UNITS_PER_WHOLE * 3 / 8);
+        assert_eq!(
+            dotted_quarter.units(),
+            Duration::new(0, Fraction::Quarter).units()
+                + Duration::new(0, Fraction::Eighth).units(),
+        );
+        assert_eq!(dotted_quarter.label(), "3/8");
+        assert_eq!(Duration::with_num(2, 3, Fraction::Eighth).label(), "2 + 3/8");
+        assert_eq!(
+            Duration::with_num(2, 3, Fraction::Eighth).units(),
+            UNITS_PER_WHOLE * 2 + UNITS_PER_WHOLE * 3 / 8,
+        );
+        // One of a fraction is the fraction, named the way it always was.
+        assert_eq!(
+            Duration::with_num(0, 1, Fraction::Eighth),
+            Duration::new(0, Fraction::Eighth),
+        );
+        assert_eq!(Duration::with_num(0, 1, Fraction::Eighth).label(), "1/8");
+        // Every fraction knows what it is named after, which is what makes the
+        // nominator's `3/8` — and the file's token — say the right thing.
+        for f in Fraction::ALL {
+            let whole = if f == Fraction::None { 0 } else { UNITS_PER_WHOLE };
+            assert_eq!(f.units() * f.denom(), whole);
+        }
+        // It reaches the top of the box without overflowing the grid.
+        assert_eq!(
+            Duration::with_num(MAX_WHOLES, MAX_NUM, Fraction::Half).units(),
+            UNITS_PER_WHOLE * (MAX_WHOLES as i64 + MAX_NUM as i64 / 2),
+        );
+    }
+
+    /// A nominator with no fraction under it would multiply nothing, so the
+    /// select boxes never leave one behind: two lengths that sound the same are
+    /// the same value, which is what the file's round trip and every `assert_eq!`
+    /// on a `Duration` rest on.
+    #[test]
+    fn a_nominator_without_a_fraction_is_canonicalised_away() {
+        // What the boxes can do: count a fraction, then take the fraction away.
+        let mut d = Duration::with_num(2, 5, Fraction::Eighth);
+        d.frac = Fraction::None;
+        d.canonicalise();
+        assert_eq!(d, Duration::new(2, Fraction::None));
+        assert_eq!(d.units(), UNITS_PER_WHOLE * 2);
+        assert_eq!(d.label(), "2");
+        // And a nominator is never zero: a fraction is counted at least once.
+        let mut none = Duration::with_num(0, 0, Fraction::Sixteenth);
+        assert_eq!(none.units(), UNITS_PER_WHOLE / 16);
+        none.num = 0;
+        none.canonicalise();
+        assert_eq!(none.num, 1);
+    }
+
     /// Frames are played one after another: a note starts where the previous
     /// note's space ended, and a space is silence of exactly its own length.
     #[test]
@@ -2286,7 +2457,8 @@ mod tests {
         // extremes a frame has to lay out at.
         panel.add_row();
         panel.rows[1].add_note(DEFAULT_PITCH);
-        panel.rows[1].items[0].dur = Duration::new(MAX_WHOLES, Fraction::TwoHundredFiftySixth);
+        panel.rows[1].items[0].dur =
+            Duration::with_num(MAX_WHOLES, MAX_NUM, Fraction::TwoHundredFiftySixth);
         panel.rows[1].items[0].space = Duration::new(0, Fraction::None);
         frame(&mut panel);
 
@@ -2299,6 +2471,106 @@ mod tests {
         frame(&mut panel);
         assert!(panel.rows.iter().all(|r| r.track_id.is_none()));
     }
+    /// The nominator is a *box on the card*, and a card is a fixed size. It has
+    /// to be drawn — on the space frame and the lead space as much as on the
+    /// note — and it has to be drawn **inside** its own card: a [`CARD_H`] left
+    /// at three boxes would push the fraction box out from under it and into the
+    /// frame below, which nothing asserted about a `Duration` would ever notice.
+    #[test]
+    fn every_frame_draws_its_nominator_inside_its_card() {
+        let (registry, _ids) = registry_with(&["one"]);
+        let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
+        panel.add_row();
+        panel.rows[0].add_note(DEFAULT_PITCH);
+        // A nominator on the note, a different one on its space, and the lead
+        // space left at its default — so each card is told apart by what it
+        // paints, not by where it happens to sit.
+        panel.rows[0].items[0].dur = Duration::with_num(0, 3, Fraction::Eighth);
+        panel.rows[0].items[0].space = Duration::with_num(1, 5, Fraction::Sixteenth);
+
+        // Under the app's own style, not egui's defaults: the boxes are sized
+        // by the text in them, and this is the only way the number this test
+        // measures is the number on screen.
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+        });
+        fn walk(
+            sh: &egui::Shape,
+            texts: &mut Vec<(String, egui::Pos2)>,
+            cards: &mut Vec<egui::Rect>,
+        ) {
+            match sh {
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_string(), t.pos)),
+                // A card is a filled rounded rect drawn in one of the three
+                // frame colours — the only shapes in the panel that are.
+                egui::Shape::Rect(r) if CARD_FILLS.contains(&r.fill) => cards.push(r.rect),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts, cards)),
+                _ => {}
+            }
+        }
+        let (mut texts, mut cards) = (Vec::new(), Vec::new());
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut texts, &mut cards);
+        }
+
+        // The card is a fixed size, and the boxes have to fit *in* it: a card
+        // that grew past [`CARD_H`] overflows the lane it is drawn in, and the
+        // one below it. This is the assertion that fails when a box is added and
+        // the constant is not.
+        assert_eq!(cards.len(), 3, "the lead space, the note and its space: {cards:?}");
+        for card in &cards {
+            assert!(
+                card.height() <= CARD_H && card.width() <= CARD_W,
+                "a frame grew to {:?}, past the {CARD_W}x{CARD_H} it is given",
+                card.size()
+            );
+        }
+        let at = |what: &str| -> egui::Pos2 {
+            let found: Vec<egui::Pos2> =
+                texts.iter().filter(|(t, _)| t == what).map(|(_, p)| *p).collect();
+            assert_eq!(found.len(), 1, "{what:?} is painted {} times: {texts:?}", found.len());
+            found[0]
+        };
+
+        // Every card: its header — right-aligned, so it ends over the boxes'
+        // own column — and then everything painted in that column beneath it,
+        // top to bottom. Reading the column back whole is what makes this a test
+        // of the *card* rather than of one string: a box that landed on the
+        // neighbouring card, or one that did not draw at all, changes the list.
+        for (header, boxes) in [
+            ("lead · 0", vec!["0 whole", "× 1", "—"]),
+            ("C4 · 3/8", vec!["C4", "0 whole", "× 3", "1/8"]),
+            ("space · 1 + 5/16", vec!["1 whole", "× 5", "1/16"]),
+        ] {
+            let top = at(header);
+            let mut column: Vec<&(String, egui::Pos2)> = texts
+                .iter()
+                .filter(|(_, p)| {
+                    p.y > top.y && p.y < top.y + CARD_H && p.x <= top.x && p.x > top.x - CARD_W
+                })
+                .collect();
+            column.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+            let painted: Vec<&str> = column.iter().map(|(t, _)| t.as_str()).collect();
+            assert_eq!(painted, boxes, "the {header:?} card's boxes: {texts:?}");
+            // One column, not two cards' worth read as one.
+            assert!(
+                column.iter().all(|(_, p)| (p.x - column[0].1.x).abs() < 1.0),
+                "the {header:?} card's boxes are not in one column: {column:?}"
+            );
+            // The last box, its text and all, still inside the card it belongs
+            // to: CARD_H has to grow with the number of boxes.
+            let last = column.last().expect("a card draws its boxes").1.y;
+            assert!(
+                last + 20.0 <= top.y + CARD_H,
+                "the {header:?} card's last box falls out of the bottom of the \
+                 card: {last} > {}",
+                top.y + CARD_H - 20.0
+            );
+        }
+    }
+
     /// A take with nothing to play against is still a take: it runs from the
     /// button press, and what was played comes back as rows of the composition —
     /// rounded, on the track the recorder was pointed at.
