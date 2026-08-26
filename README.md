@@ -65,8 +65,12 @@ published there as a wav track — and any number of rows may share the same one
   carries a **start** slider where a pitch would be: a take does not begin on its
   first sample, so the start is what puts the sound on the beat instead of the
   room tone in front of it. Drag the slider to find it, drag the number beside it
-  for milliseconds, or double-click to type one. A length is the parts added
-  together, so `1` + `× 1` +
+  for milliseconds, or double-click to type one. The **⏱** button beside the
+  frame's ✖ sets the note's length to what the file has left to play from that
+  start, as closely as the boxes can name it *at the current tempo* — its hover
+  text says how close, since a recording's length and a whole number of note
+  values agree only by luck. Change the BPM and press it again. A length is the
+  parts added together, so `1` + `× 1` +
   `1/8` is a whole note tied to an eighth, and `× 3` over `1/8` is `3/8` — the
   dotted quarter the halving fraction box cannot name on its own. The nominator
   needs a fraction to count, so it is greyed out while the fraction reads `—`.

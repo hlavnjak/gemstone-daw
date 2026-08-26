@@ -240,6 +240,56 @@ impl Duration {
         self.wholes as i64 * UNITS_PER_WHOLE + self.num as i64 * self.frac.units()
     }
 
+    /// The closest length the three boxes can name to `secs`, at `spu` seconds
+    /// per grid unit — which is where the tempo comes into it.
+    ///
+    /// Every length is `wholes` whole notes plus `num` of a fraction, so for
+    /// each of the (nominator, fraction) pairs there are, the whole-note count
+    /// that gets closest is just the rest of the target rounded off. That makes
+    /// this a short loop rather than a search over every length the boxes can
+    /// say.
+    ///
+    /// Ties go to the plainest way of saying it — the coarsest fraction, then
+    /// the smallest nominator — so half a whole note comes back as `1/2` rather
+    /// than as `2/4` or `128/256`, which name the same length.
+    fn closest_to(secs: f64, spu: f64) -> Duration {
+        let target = if spu > 0.0 { (secs / spu).max(0.0) } else { 0.0 };
+        let mut best = Duration::new(0, Fraction::None);
+        let mut best_key = (f64::INFINITY, 0i64, 0u8);
+        for frac in Fraction::ALL {
+            // A fraction that is no fraction has nothing to count, so it is one
+            // candidate rather than sixteen identical ones.
+            let max_num = if frac == Fraction::None { 1 } else { MAX_NUM };
+            for num in 1..=max_num {
+                let counted = num as i64 * frac.units();
+                let wholes = ((target - counted as f64) / UNITS_PER_WHOLE as f64)
+                    .round()
+                    .clamp(0.0, MAX_WHOLES as f64) as u8;
+                let d = Duration::with_num(wholes, num, frac);
+                let key = ((d.units() as f64 - target).abs(), frac.denom(), num);
+                if key < best_key {
+                    best_key = key;
+                    best = d;
+                }
+            }
+        }
+        // A note with something left to play must not come back with no length
+        // at all: a zero-length frame is skipped by the transport, and "fit this
+        // to the file" answering with silence is worse than answering with the
+        // shortest note there is. Only reachable for a remainder under half a
+        // 1/256 — a few milliseconds.
+        if target > 0.0 && best.units() == 0 {
+            best = Duration::new(0, Fraction::TwoHundredFiftySixth);
+        }
+        best
+    }
+
+    /// How far this length is from `secs`, in seconds — what the fit could not
+    /// name exactly. Signed: positive is longer than asked for.
+    fn error_secs(self, secs: f64, spu: f64) -> f64 {
+        self.units() as f64 * spu - secs
+    }
+
     /// How the length reads in the frame's header, e.g. `1 + 3/8`.
     fn label(self) -> String {
         match (self.wholes, self.frac) {
@@ -270,6 +320,31 @@ fn note_label(pitch: u8, percussion: bool) -> String {
         Some(drum) => format!("{} · {drum}", pitch_name(pitch)),
         None => pitch_name(pitch),
     }
+}
+
+/// What the fit button on a wav note offers to do, spelled out: how much of the
+/// file the note has left to play, the closest length the boxes can name to it,
+/// and how far off that is.
+///
+/// The error is the whole point of saying it. A recording is whatever length it
+/// is, and a bar of music is a whole number of note values, so the two agree
+/// only by luck — the button gets as close as the grid allows and this says how
+/// close, rather than leaving a few milliseconds of drift to be discovered on
+/// the twentieth repeat.
+fn fit_hint(left_secs: f64, fitted: Duration, spu: f64) -> String {
+    let err_ms = fitted.error_secs(left_secs, spu) * 1000.0;
+    let how_close = match err_ms.abs() {
+        e if e < 0.5 => "exactly".to_string(),
+        _ if err_ms > 0.0 => format!("{err_ms:.0} ms long"),
+        _ => format!("{:.0} ms short", -err_ms),
+    };
+    format!(
+        "Fit this note to the file.\n\nFrom where this note starts there is \
+         {left_secs:.3} s of the recording left. At this tempo the closest length \
+         these boxes can name is {}, which is {how_close}.\n\nThe fit is made at \
+         the tempo it is pressed at: change the BPM and press it again.",
+        fitted.label()
+    )
 }
 
 /// A note and the space tied behind it — two frames on screen, one thing in the
@@ -1265,6 +1340,9 @@ impl ComposerPanel {
     fn lanes_ui(&mut self, ui: &mut egui::Ui, tracks: &[(u64, String)]) {
         let mut remove_row: Option<usize> = None;
         let playhead = self.playhead_units();
+        // What a grid unit is worth in seconds, for the frames that have to turn
+        // a stretch of a recording into a length.
+        let spu = self.secs_per_unit();
         // Resolved before the loop: `self.rows` is borrowed mutably inside it,
         // and the registry is what knows a drum track from an instrument.
         let percussion: Vec<bool> = self
@@ -1409,7 +1487,14 @@ impl ComposerPanel {
                                 // them, which would otherwise clip the cards.
                                 .max_height(ROW_H + 12.0)
                                 .show(ui, |ui| {
-                                    Self::chain_ui(ui, row, playhead, percussion[idx], wav[idx]);
+                                    Self::chain_ui(
+                                        ui,
+                                        row,
+                                        playhead,
+                                        percussion[idx],
+                                        wav[idx],
+                                        spu,
+                                    );
                                 });
                         });
                     });
@@ -1436,6 +1521,7 @@ impl ComposerPanel {
         playhead: Option<f64>,
         percussion: bool,
         wav: Option<f32>,
+        spu: f64,
     ) {
         // Follow the transport only while there *is* one, and only if this lane
         // was asked to: scrolling a lane every frame is exactly what stops the
@@ -1481,7 +1567,11 @@ impl ComposerPanel {
                     row_id,
                     item.id,
                     match wav {
-                        Some(len_secs) => Frame::Wav { start: &mut item.start, len_secs },
+                        Some(len_secs) => Frame::Wav {
+                            start: &mut item.start,
+                            len_secs,
+                            spu,
+                        },
                         None => Frame::Note(&mut item.pitch),
                     },
                     &mut item.dur,
@@ -1591,6 +1681,24 @@ impl ComposerPanel {
                                     {
                                         deleted = true;
                                     }
+                                    // Fit the length to the file. Only a wav
+                                    // note has a length that *something* is the
+                                    // right answer for: an instrument sounds for
+                                    // as long as it is asked to, but a recording
+                                    // has an end, and a note that stops short of
+                                    // it or rings on past it into silence is
+                                    // almost never what was meant.
+                                    if let Frame::Wav { start, len_secs, spu } = &kind {
+                                        let left = (*len_secs - **start).max(0.0) as f64;
+                                        let fitted = Duration::closest_to(left, *spu);
+                                        if ui
+                                            .add(egui::Button::new("⏱").small().frame(false))
+                                            .on_hover_text(fit_hint(left, fitted, *spu))
+                                            .clicked()
+                                        {
+                                            *dur = fitted;
+                                        }
+                                    }
                                     // The lead space says so, because it is the
                                     // one space that is not the silence after
                                     // some note and does not leave with one.
@@ -1655,7 +1763,7 @@ impl ComposerPanel {
                             // milliseconds, which is the wrong side of a beat,
                             // and the number beside it can be dragged a
                             // millisecond at a time or typed outright.
-                            Frame::Wav { start, len_secs } => {
+                            Frame::Wav { start, len_secs, .. } => {
                                 // A file that has been replaced by a shorter one
                                 // must not leave a note starting past its end.
                                 let last = len_secs.max(0.001);
@@ -1958,9 +2066,11 @@ const LEAD_SPACE_ID: u64 = u64::MAX;
 /// space is the amber one, which has none.
 enum Frame<'a> {
     Note(&'a mut u8),
-    /// A note on a wav row: where in the file it starts, and how long that file
-    /// runs — which is the range the start can be moved over.
-    Wav { start: &'a mut f32, len_secs: f32 },
+    /// A note on a wav row: where in the file it starts, how long that file runs
+    /// — which is the range the start can be moved over — and seconds per grid
+    /// unit, which is the only frame that needs the tempo: fitting a length to a
+    /// stretch of a recording is a conversion out of seconds.
+    Wav { start: &'a mut f32, len_secs: f32, spu: f64 },
     Space,
 }
 
@@ -2610,6 +2720,65 @@ mod tests {
         frame(&mut panel);
         assert!(panel.rows.iter().all(|r| r.track_id.is_none()));
     }
+    /// A recording is whatever length it is; a length in this panel is a whole
+    /// number of note values at the current tempo. The fit is the closest the
+    /// boxes can come — and which length that is depends on the tempo, which is
+    /// the whole reason the button re-derives it rather than storing an answer.
+    #[test]
+    fn a_length_is_fitted_to_a_stretch_of_a_recording() {
+        // 120 BPM: a beat is half a second, so a whole note is two.
+        let spu = 0.5 / UNITS_PER_BEAT as f64;
+        assert_eq!(Duration::closest_to(2.0, spu), Duration::new(1, Fraction::None));
+        assert_eq!(Duration::closest_to(1.0, spu), Duration::new(0, Fraction::Half));
+        assert_eq!(Duration::closest_to(3.0, spu), Duration::new(1, Fraction::Half));
+        // Three eighths — the dotted quarter, which only the nominator can name.
+        assert_eq!(
+            Duration::closest_to(0.75, spu),
+            Duration::with_num(0, 3, Fraction::Eighth)
+        );
+        // The same stretch of file at twice the tempo is twice the note value.
+        let fast = 0.25 / UNITS_PER_BEAT as f64;
+        assert_eq!(Duration::closest_to(1.0, fast), Duration::new(1, Fraction::None));
+
+        // Ties go to the plainest: half a whole note is `1/2`, not `2/4`.
+        assert_eq!(Duration::closest_to(1.0, spu).frac, Fraction::Half);
+        assert_eq!(Duration::closest_to(1.0, spu).num, 1);
+
+        // Nothing left of the file is no length at all — but a sliver of it is
+        // the shortest note there is, never a frame that plays nothing.
+        assert_eq!(Duration::closest_to(0.0, spu), Duration::new(0, Fraction::None));
+        assert_eq!(Duration::closest_to(-1.0, spu), Duration::new(0, Fraction::None));
+        assert_eq!(
+            Duration::closest_to(0.0001, spu),
+            Duration::new(0, Fraction::TwoHundredFiftySixth)
+        );
+
+        // A recording longer than the boxes can say gets the longest they can.
+        assert_eq!(
+            Duration::closest_to(1000.0, spu),
+            Duration::with_num(MAX_WHOLES, MAX_NUM, Fraction::Half)
+        );
+    }
+
+    /// What the fit could not name is the number the hint has to show: a file
+    /// whose length is not a note value lands short or long, and by how much is
+    /// the difference between a loop that holds and one that drifts.
+    #[test]
+    fn a_fit_that_is_not_exact_says_which_way_it_missed() {
+        let spu = 0.5 / UNITS_PER_BEAT as f64;
+        // D5.wav: 5.81 s, which no length at 120 BPM names — the nominator stops
+        // at sixteen, so the nearest is 2 + 7/8 (5.75 s), 60 ms short.
+        let fitted = Duration::closest_to(5.81, spu);
+        assert_eq!(fitted, Duration::with_num(2, 7, Fraction::Eighth));
+        assert!((fitted.error_secs(5.81, spu) + 0.06).abs() < 1e-6);
+        assert!(fit_hint(5.81, fitted, spu).contains("60 ms short"), "{}", fit_hint(5.81, fitted, spu));
+
+        // An exact fit says so rather than showing a rounded zero.
+        let exact = Duration::closest_to(2.0, spu);
+        assert_eq!(exact.error_secs(2.0, spu), 0.0);
+        assert!(fit_hint(2.0, exact, spu).contains("exactly"));
+    }
+
     /// A row playing a wav track has no pitch to pick — the file sounds at the
     /// pitch it was recorded at — so its note frame draws the *start* of the
     /// file in the pitch box's place, then the same three length boxes as every
@@ -2656,6 +2825,13 @@ mod tests {
         assert!(
             !texts.iter().any(|(t, _)| t == &note_label(DEFAULT_PITCH, false)),
             "a wav row still offers a pitch: {texts:?}"
+        );
+        // The fit button is on the note and only on the note: a space is not
+        // playing a file, so there is nothing for it to be the length of.
+        assert_eq!(
+            texts.iter().filter(|(t, _)| t == "⏱").count(),
+            1,
+            "the fit button is not on exactly the one note frame: {texts:?}"
         );
         // Every card still fits the height it is given; the wav note is the one
         // that is allowed to be wider, and only up to its own width.
