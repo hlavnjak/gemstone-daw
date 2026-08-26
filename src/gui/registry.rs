@@ -23,10 +23,15 @@
 //! track's editor is open. When it is, [`TrackEntry::live`] points at that
 //! instance, so the Composer can snapshot what is being edited right now.
 //!
+//! One kind of track is not a plugin at all: a **wav track** ([`TrackEntry::wav`])
+//! is an audio file, played back whole as one note. Its recipe is the path, and
+//! nothing else — there is no instance to load, no state to import and no editor
+//! to snapshot.
+//!
 //! GUI-thread only (`Rc<RefCell<_>>`) — every user of it is an egui panel.
 
 use std::cell::{Ref, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Weak;
 
@@ -48,6 +53,12 @@ pub struct TrackEntry {
     /// This track plays a drum kit, so its notes are named after what they hit
     /// rather than left as pitches. See [`crate::midi::plays_a_drum_kit`].
     pub percussion: bool,
+    /// The audio file this track *is*, played whole as one note — a track with
+    /// no plugin behind it at all. `Some` makes every plugin field above inert:
+    /// nothing is loaded, no state is imported, and the note's pitch is ignored
+    /// (a file has the pitch it was recorded at). Published from the
+    /// Resynthesis panel, and saved in a project as this path.
+    pub wav: Option<PathBuf>,
     /// Grid to import into a freshly loaded instance. `None` = the plugin's own
     /// default state (a plain synth-mode LeSynth, or any custom VST).
     pub state: Option<TrackState>,
@@ -71,6 +82,9 @@ pub struct PlaybackSource {
     pub is_lesynth: bool,
     pub state: Option<TrackState>,
     pub vst_state: Option<Vec<u8>>,
+    /// See [`TrackEntry::wav`]. `Some` means the row plays this file rather than
+    /// any of the fields above.
+    pub wav: Option<PathBuf>,
 }
 
 struct Inner {
@@ -111,11 +125,60 @@ impl TrackRegistry {
             class_id,
             is_lesynth,
             percussion: false,
+            wav: None,
             state,
             vst_state: None,
             live: None,
         });
         id
+    }
+
+    /// Register an audio file as a track that plays it whole, as one note, and
+    /// return its id. The path is the whole recipe — see [`TrackEntry::wav`].
+    pub fn add_wav(&self, name: impl Into<String>, path: PathBuf) -> u64 {
+        let mut inner = self.0.borrow_mut();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.entries.push(TrackEntry {
+            id,
+            name: name.into(),
+            // A wav track has no library; the file it plays is what it is, and
+            // naming it here is what lets a message about the track say so.
+            plugin_path: path.clone(),
+            class_id: None,
+            is_lesynth: false,
+            percussion: false,
+            wav: Some(path),
+            state: None,
+            vst_state: None,
+            live: None,
+        });
+        id
+    }
+
+    /// The wav track playing `path`, if one is already registered. A file is one
+    /// track however many times it is asked for: opening it again in Resynthesis,
+    /// or loading a project that names it, finds the entry rather than adding a
+    /// second one whose rows would be indistinguishable from the first's.
+    pub fn find_wav(&self, path: &Path) -> Option<u64> {
+        self.0
+            .borrow()
+            .entries
+            .iter()
+            .find(|e| e.wav.as_deref() == Some(path))
+            .map(|e| e.id)
+    }
+
+    /// Whether this track plays an audio file rather than a plugin — which is
+    /// what takes the pitch box off the Composer's frames. `false` for a track
+    /// that is gone.
+    pub fn is_wav(&self, id: u64) -> bool {
+        self.0
+            .borrow()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .is_some_and(|e| e.wav.is_some())
     }
 
     /// Record that this track plays a drum kit, which is what puts drum names in
@@ -209,6 +272,19 @@ impl TrackRegistry {
     pub fn playback_source(&self, id: u64) -> Option<PlaybackSource> {
         let inner = self.0.borrow();
         let entry = inner.entries.iter().find(|e| e.id == id)?;
+        // A wav track is its file. There is no instance to ask what it is
+        // playing, and nothing about it changes while a composition is open.
+        if let Some(path) = &entry.wav {
+            return Some(PlaybackSource {
+                name: entry.name.clone(),
+                plugin_path: entry.plugin_path.clone(),
+                class_id: None,
+                is_lesynth: false,
+                state: None,
+                vst_state: None,
+                wav: Some(path.clone()),
+            });
+        }
         let live = entry.live.as_ref().and_then(Weak::upgrade);
 
         // Whichever kind of state this track carries, prefer the open editor's:
@@ -236,6 +312,7 @@ impl TrackRegistry {
             is_lesynth: entry.is_lesynth,
             state: live_grid.or_else(|| entry.state.clone()),
             vst_state: live_vst.or_else(|| entry.vst_state.clone()),
+            wav: None,
         })
     }
 }

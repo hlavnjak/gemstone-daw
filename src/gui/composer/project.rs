@@ -17,8 +17,10 @@
 //! one `.lsft` per LeSynth Fourier track any row plays, and one `.vststate` per
 //! custom VST3 track — the plugin's own state, which is where it keeps the knobs
 //! the user set. The folder is the unit you move, copy or hand to someone else,
-//! and it carries its own sounds; only a third-party plugin's *binary* is left
-//! outside it, because that is not ours to copy.
+//! and it carries its own sounds; what is left outside it is a third-party
+//! plugin's *binary*, and the audio file behind a wav track — neither is ours to
+//! copy, and the second is usually larger than the whole rest of the folder.
+//! Both are recorded as the path they were added from.
 //!
 //! **The manifest is line-oriented text, deliberately.** The grids are already
 //! binary (`.lsft`); what is left is a small structure whose main job is to hold
@@ -52,7 +54,11 @@
 //!
 //! Unknown keys are skipped, so a field added later loads in an older build
 //! rather than failing. The version line is checked, so a *newer* format is
-//! refused with a message instead of being half-read.
+//! refused with a message instead of being half-read. A *source kind* added
+//! later — `wav` is the most recent — follows the rule the nominator does: a
+//! project that does not use one is unchanged and loads in any build, and one
+//! that does is refused by a build too old to know it, which is a message
+//! rather than a silent misreading.
 
 use std::path::{Path, PathBuf};
 
@@ -85,6 +91,12 @@ pub enum TrackSource {
         class_id: Option<[i8; 16]>,
         state: Option<String>,
     },
+    /// An audio file played whole, as one note, by absolute path. Like a VST3's
+    /// binary and for the same reason, the file is **not** copied into the
+    /// project folder: it is the user's recording, often far larger than
+    /// everything else in the folder put together, and it is not ours to
+    /// duplicate. What is saved is the path it was first added from.
+    Wav { path: PathBuf },
     /// The row had no track assigned when it was saved.
     None,
 }
@@ -98,6 +110,9 @@ impl TrackSource {
             // The plugin itself. A missing `.vststate` is not fatal — the track
             // loads with the plugin's defaults — so it is not required here.
             Self::Vst { path, .. } => Some(path.clone()),
+            // The whole sound of the row: without the file there is nothing to
+            // play at all.
+            Self::Wav { path } => Some(path.clone()),
             Self::LeSynthDefault | Self::None => None,
         }
     }
@@ -106,7 +121,7 @@ impl TrackSource {
     pub fn describe(&self) -> String {
         match self {
             Self::LeSynth { file } => file.clone(),
-            Self::Vst { path, .. } => crate::file_label(path),
+            Self::Vst { path, .. } | Self::Wav { path } => crate::file_label(path),
             Self::LeSynthDefault => "LeSynth Fourier".to_string(),
             Self::None => "no track".to_string(),
         }
@@ -361,6 +376,7 @@ fn write_source(s: &TrackSource) -> String {
             }
             out
         }
+        TrackSource::Wav { path } => format!("wav {}", one_line(&path.display().to_string())),
         TrackSource::None => "none".to_string(),
     }
 }
@@ -384,6 +400,9 @@ fn read_source(v: &str) -> Result<TrackSource> {
             class_id: Some(class_from_hex(hex)?),
             state: None,
         });
+    }
+    if kind == "wav" {
+        return Ok(TrackSource::Wav { path: PathBuf::from(rest) });
     }
     if kind == "vst" {
         return Ok(TrackSource::Vst {
@@ -462,6 +481,26 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// A wav track is a path and nothing else: no file beside the manifest, no
+    /// state, no class id. The row that plays one must come back naming the same
+    /// file — losing it would leave the row silent with nothing to say why.
+    #[test]
+    fn a_wav_row_round_trips_as_its_path() {
+        let mut p = sample();
+        p.rows[1].source = TrackSource::Wav {
+            path: PathBuf::from("/home/kuba/Music/my voice.wav"),
+        };
+        let text = p.to_text();
+        assert!(
+            text.contains("source = wav /home/kuba/Music/my voice.wav"),
+            "the path is the whole source line: {text}"
+        );
+        // No `state =` rides behind it: there is nothing beside the manifest to
+        // point at.
+        assert!(!text.contains("state ="), "a wav track saves no state file: {text}");
+        assert_eq!(Project::parse(&text).expect("parses"), p);
     }
 
     /// The whole point of a save format: what comes back is what went in.
@@ -567,6 +606,7 @@ mod tests {
                 class_id: None,
                 state: Some("y.vststate".to_string()),
             },
+            TrackSource::Wav { path: PathBuf::from("/x/a whole take.wav") },
         ] {
             let mut p = sample();
             p.rows.truncate(1);

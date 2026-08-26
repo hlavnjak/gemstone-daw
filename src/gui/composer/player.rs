@@ -68,7 +68,7 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::{ComPtr, ComWrapper};
 
-use crate::audio::midi_to_vst3_event;
+use crate::audio::{decode_audio_file, midi_to_vst3_event, DecodedAudio};
 use crate::gui::registry::PlaybackSource;
 use crate::audio::engine::{bus_buffers, declared_block_size, AudioScratch};
 use crate::vst::{next_instance_token, EventList, PluginInstance, Vst3Module};
@@ -82,6 +82,12 @@ const NOTE_VELOCITY: u8 = 100;
 /// Analysis mode) the tail of a long note are not cut off by the transport
 /// stopping exactly on the final event.
 const TAIL_SECS: f64 = 1.5;
+
+/// Fade at each end of a wav note. A file starts and ends wherever it happens
+/// to, and a note shorter than the file cuts it mid-waveform; either way a step
+/// straight from silence to the signal is a click, and five milliseconds is
+/// short enough not to be heard as an attack.
+const CLICK_FADE_SECS: f64 = 0.005;
 
 /// One note on the timeline, already resolved to seconds.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -138,24 +144,49 @@ struct VoiceEdit {
     voice: usize,
     gain: f32,
     schedule: Vec<(u64, u8, bool)>,
+    /// The same notes as sample ranges, for a voice that plays a file — see
+    /// [`Voice::hits`]. Built for every voice because it costs a vector of pairs
+    /// and saves the edit having to know which kind it is addressing.
+    hits: Vec<(u64, u64)>,
 }
 
-/// A row's live instance plus its event schedule, as the callback sees it.
+/// A row's sound plus its schedule, as the callback sees it.
 struct Voice {
-    /// The panel's row ids: which rows of the composition this one instance is
+    /// The panel's row ids: which rows of the composition this one voice is
     /// playing. Usually one; several when they were found to be shareable (see
     /// [`share_groups`]).
     row_ids: Vec<u64>,
+    gain: f32,
+    /// `(sample time, pitch, note-on)`, sorted by time — what a plugin voice
+    /// sends.
+    schedule: Vec<(u64, u8, bool)>,
+    /// The same notes as `(start, end)` sample ranges — what a sample voice
+    /// plays over. Built from the schedule by [`schedule_from`], so the two can
+    /// never say different things about when a note sounds.
+    hits: Vec<(u64, u64)>,
+    /// Next event in `schedule` for a plugin voice; next hit in `hits` for a
+    /// sample one. A voice is one or the other, so one cursor is all there is to
+    /// keep.
+    cursor: usize,
+    sound: Sound,
+}
+
+/// What a voice makes its sound with. Two kinds, because a wav track has no
+/// plugin at all: there is nothing to instantiate, nothing to send MIDI to, and
+/// the file plays at the pitch it was recorded at.
+enum Sound {
+    Plugin(PluginSound),
+    Sample(SampleSound),
+}
+
+/// A plugin instance and everything `process()` needs pointed at it.
+struct PluginSound {
     /// The instance this voice plays. Held here, not just in the player, so the
     /// plugin cannot be terminated or its library unloaded while the callback
     /// that calls `process()` on it still exists.
     plugin: Arc<PluginInstance>,
     event_impl: Arc<EventList>,
     event_list: ComPtr<IEventList>,
-    gain: f32,
-    /// `(sample time, pitch, note-on)`, sorted by time.
-    schedule: Vec<(u64, u8, bool)>,
-    cursor: usize,
     /// Total channels across this plugin's audio input buses, which is where its
     /// output channels start in `scratch`.
     in_channels: usize,
@@ -170,6 +201,54 @@ struct Voice {
     /// The bus descriptors, laid out over `scratch` once.
     in_buses: Vec<AudioBusBuffers>,
     out_buses: Vec<AudioBusBuffers>,
+}
+
+/// A decoded audio file, played from its start for as long as the note lasts.
+///
+/// Every note of a wav row plays the same thing, so nothing here is per-note:
+/// where a note is in the file is `(now − its start) × step`, which makes the
+/// playback position a function of the transport's own sample clock rather than
+/// a cursor to keep in step with it. A rewind, a loop and an offline render then
+/// all give the identical samples, with nothing to reset.
+struct SampleSound {
+    /// The decoded file, shared by every voice playing it — a minute of audio is
+    /// ten megabytes, and each of them plays the identical samples.
+    audio: Arc<DecodedAudio>,
+    /// Source samples per output frame — the file's rate against the device's.
+    /// The file plays at its own pitch, so this is a rate conversion and nothing
+    /// more.
+    step: f64,
+    /// Frames of fade at each end of a note, so a file cut short by the note's
+    /// length — or one that does not start and end at silence — does not click.
+    fade: u64,
+}
+
+impl SampleSound {
+    /// The file at `at` source samples in, linearly interpolated: the step is
+    /// almost never a whole number of samples (44.1 kHz material on a 48 kHz
+    /// device), and taking the nearest sample instead puts a rasp of jitter
+    /// noise over everything.
+    fn at(&self, at: f64) -> f32 {
+        let i = at.floor();
+        if i < 0.0 {
+            return 0.0;
+        }
+        let (i, frac) = (i as usize, (at - i) as f32);
+        let a = *self.audio.samples.get(i).unwrap_or(&0.0);
+        let b = *self.audio.samples.get(i + 1).unwrap_or(&0.0);
+        a + (b - a) * frac
+    }
+
+    /// The fade envelope `n` frames into a note that lasts `len` of them: in at
+    /// the start, out at the end, and flat everywhere between. A note shorter
+    /// than two fades gets a shorter fade rather than one that never reaches
+    /// full level.
+    fn envelope(&self, n: u64, len: u64) -> f32 {
+        let fade = self.fade.min(len / 2).max(1);
+        let up = (n + 1).min(fade) as f32 / fade as f32;
+        let down = (len.saturating_sub(n)).min(fade) as f32 / fade as f32;
+        up.min(down)
+    }
 }
 
 /// A running composition. Dropping it stops playback: the stream field is
@@ -486,12 +565,13 @@ impl CompositionPlayer {
                         Some(first) => diverged |= first != edit.gain,
                     }
                 }
-                let (schedule, last) = schedule_from(&notes, self.sample_rate);
+                let (schedule, hits, last) = schedule_from(&notes, self.sample_rate);
                 last_event = last_event.max(last);
                 VoiceEdit {
                     voice,
                     gain: gain.unwrap_or(0.0),
                     schedule,
+                    hits,
                 }
             })
             .collect();
@@ -557,10 +637,19 @@ fn loop_sample_for(loop_secs: f64, sample_rate: f64, last_event: u64) -> u64 {
     ((loop_secs * sample_rate).round().max(1.0) as u64).max(last_event)
 }
 
-/// A row's notes as the sorted `(sample, pitch, note-on)` schedule the callback
-/// walks, and the sample its last event falls on.
-fn schedule_from(notes: &[PlannedNote], sample_rate: f64) -> (Vec<(u64, u8, bool)>, u64) {
+/// A row's notes, resolved to sample times two ways: the sorted
+/// `(sample, pitch, note-on)` schedule a plugin voice sends, and the
+/// `(start, end)` ranges a sample voice plays over. Also the sample the last
+/// event falls on.
+///
+/// Both come out of the same loop deliberately: a note is a note whatever plays
+/// it, and two resolutions of "when" would be two things to keep in step.
+fn schedule_from(
+    notes: &[PlannedNote],
+    sample_rate: f64,
+) -> (Vec<(u64, u8, bool)>, Vec<(u64, u64)>, u64) {
     let mut schedule: Vec<(u64, u8, bool)> = Vec::with_capacity(notes.len() * 2);
+    let mut hits: Vec<(u64, u64)> = Vec::with_capacity(notes.len());
     let mut last_event = 0u64;
     for n in notes {
         let on = (n.at_secs * sample_rate).round().max(0.0) as u64;
@@ -569,10 +658,12 @@ fn schedule_from(notes: &[PlannedNote], sample_rate: f64) -> (Vec<(u64, u8, bool
         let off = on + ((n.dur_secs * sample_rate).round().max(1.0) as u64);
         schedule.push((on, n.pitch, true));
         schedule.push((off, n.pitch, false));
+        hits.push((on, off));
         last_event = last_event.max(off);
     }
     schedule.sort_by_key(|&(t, _, on)| (t, on));
-    (schedule, last_event)
+    hits.sort_unstable();
+    (schedule, hits, last_event)
 }
 
 /// Adopt an edit, if one is waiting. Called at the loop point, from the audio
@@ -598,12 +689,16 @@ fn take_live_update(
         match update.rows.iter_mut().find(|r| r.voice == i) {
             Some(edit) => {
                 std::mem::swap(&mut voice.schedule, &mut edit.schedule);
+                std::mem::swap(&mut voice.hits, &mut edit.hits);
                 voice.gain = edit.gain;
             }
             // Every row this voice played was deleted. Its plugin stays loaded —
             // unloading is not something this thread can do — but it has nothing
             // left to play.
-            None => voice.schedule.clear(),
+            None => {
+                voice.schedule.clear();
+                voice.hits.clear();
+            }
         }
         voice.cursor = 0;
     }
@@ -642,25 +737,36 @@ fn rewind(voices: &mut [Voice], position: &AtomicU64) {
 ///   the same pitch sounding at once, one row's release would cut the other's
 ///   note short. Rows that would do that are kept apart.
 ///
+/// A **wav row** is outside all of it: a sample voice has a single playback
+/// position, and the file it decoded is shared between voices anyway, so a row
+/// playing one always gets a voice to itself.
+///
 /// First-fit, in row order, so the first row of a group is the one whose recipe
 /// and gain the group is named by — and a composition of unrelated rows comes
 /// out exactly as it went in, one group each.
 fn share_groups(plans: &[RowPlan]) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     'plan: for (i, plan) in plans.iter().enumerate() {
-        for group in groups.iter_mut() {
-            let host = &plans[group[0]];
-            if !same_recipe(&host.source, &plan.source) || host.gain != plan.gain {
-                continue;
+        // A wav row never shares. A sample voice has one playback position, so
+        // two rows on one would have to be mixed inside it — and the expense
+        // sharing exists to avoid is not there anyway: what a wav track costs is
+        // the decoded file, and that is shared by every voice playing it (see
+        // `decode_samples`) whether the rows share a voice or not.
+        if plan.source.wav.is_none() {
+            for group in groups.iter_mut() {
+                let host = &plans[group[0]];
+                if !same_recipe(&host.source, &plan.source) || host.gain != plan.gain {
+                    continue;
+                }
+                if group
+                    .iter()
+                    .any(|&j| notes_collide(&plans[j].notes, &plan.notes))
+                {
+                    continue;
+                }
+                group.push(i);
+                continue 'plan;
             }
-            if group
-                .iter()
-                .any(|&j| notes_collide(&plans[j].notes, &plan.notes))
-            {
-                continue;
-            }
-            group.push(i);
-            continue 'plan;
         }
         groups.push(vec![i]);
     }
@@ -676,6 +782,7 @@ fn same_recipe(a: &PlaybackSource, b: &PlaybackSource) -> bool {
         && a.is_lesynth == b.is_lesynth
         && a.state == b.state
         && a.vst_state == b.vst_state
+        && a.wav == b.wav
 }
 
 /// Whether any note of `a` sounds at the same time as one of `b` on the same
@@ -718,7 +825,8 @@ fn load_instances(
     // One module per distinct library rather than one per group: that is what a
     // VST3 module is for, and it saves a `dlopen` and a `ModuleEntry` each time.
     let mut modules: HashMap<PathBuf, Option<Arc<Vst3Module>>> = HashMap::new();
-    for plan in plans {
+    // A wav row has no library to open — its `plugin_path` is the audio file.
+    for plan in plans.iter().filter(|p| p.source.wav.is_none()) {
         modules
             .entry(plan.source.plugin_path.clone())
             .or_insert_with(|| match Vst3Module::open(&plan.source.plugin_path) {
@@ -736,10 +844,41 @@ fn load_instances(
         .iter()
         .map(|group| {
             let plan = &plans[group[0]];
+            if plan.source.wav.is_some() {
+                return None;
+            }
             let module = modules.get(&plan.source.plugin_path).cloned().flatten();
             load_one(module, plan, sample_rate, max_block)
         })
         .collect()
+}
+
+/// Decode the audio files the wav rows play, one per distinct path however many
+/// rows name it: a file is tens of megabytes of `f32`, and every voice playing
+/// it plays the identical samples.
+///
+/// A file that will not decode is logged and left out, and its rows fall silent
+/// the same way a row whose plugin will not load does — one broken track must
+/// not take the composition with it.
+fn decode_samples(plans: &[RowPlan]) -> HashMap<PathBuf, Arc<DecodedAudio>> {
+    let mut decoded: HashMap<PathBuf, Arc<DecodedAudio>> = HashMap::new();
+    for plan in plans {
+        let Some(path) = &plan.source.wav else { continue };
+        if decoded.contains_key(path) {
+            continue;
+        }
+        match decode_audio_file(path) {
+            Ok(audio) => {
+                decoded.insert(path.clone(), Arc::new(audio));
+            }
+            Err(e) => log::warn!(
+                "Composer: '{}' could not decode {}: {e:#}",
+                plan.source.name,
+                path.display()
+            ),
+        }
+    }
+    decoded
 }
 
 /// One instance, ready to play: created, given the state the project saved, and
@@ -811,6 +950,8 @@ fn prepare_voices(
     // The module is opened once per library rather than once per group: that is
     // what a VST3 module is for, and `ModuleEntry` is not a thing to race.
     let instances = load_instances(&plans, &groups, sample_rate, max_block);
+    // And the wav rows' files, decoded once each.
+    let decoded = decode_samples(&plans);
 
     let mut voices: Vec<Voice> = Vec::new();
     let mut plugins: Vec<Arc<PluginInstance>> = Vec::new();
@@ -818,7 +959,6 @@ fn prepare_voices(
     let mut rows_playing = 0usize;
 
     for (group, inst) in groups.iter().zip(instances) {
-        let Some(inst) = inst else { continue };
         let host = &plans[group[0]];
 
         // Every note of every row in the group, on one instance. Sorted into one
@@ -827,7 +967,33 @@ fn prepare_voices(
             .iter()
             .flat_map(|&i| plans[i].notes.iter().copied())
             .collect();
-        let (schedule, group_last_event) = schedule_from(&notes, sample_rate);
+        let (schedule, hits, group_last_event) = schedule_from(&notes, sample_rate);
+
+        // A wav row: no instance, no events — the file, played from its start
+        // for as long as each note lasts.
+        if let Some(path) = &host.source.wav {
+            let Some(audio) = decoded.get(path) else { continue };
+            last_event = last_event.max(group_last_event);
+            rows_playing += group.len();
+            voices.push(Voice {
+                row_ids: group.iter().map(|&i| plans[i].row_id).collect(),
+                gain: host.gain,
+                schedule,
+                hits,
+                cursor: 0,
+                sound: Sound::Sample(SampleSound {
+                    audio: audio.clone(),
+                    // The file plays at its own pitch, so the only conversion is
+                    // of rate: a 44.1 kHz file on a 48 kHz device advances by
+                    // less than a sample a frame.
+                    step: audio.sample_rate.max(1.0) as f64 / sample_rate.max(1.0),
+                    fade: (CLICK_FADE_SECS * sample_rate).round().max(1.0) as u64,
+                }),
+            });
+            continue;
+        }
+
+        let Some(inst) = inst else { continue };
         last_event = last_event.max(group_last_event);
         rows_playing += group.len();
 
@@ -861,18 +1027,21 @@ fn prepare_voices(
 
         voices.push(Voice {
             row_ids: group.iter().map(|&i| plans[i].row_id).collect(),
-            plugin: inst.clone(),
-            event_impl,
-            event_list,
             gain: host.gain,
             schedule,
+            hits,
             cursor: 0,
-            in_channels,
-            main_out: out_channels_per_bus[0],
-            max_block: voice_max_block,
-            scratch,
-            in_buses,
-            out_buses,
+            sound: Sound::Plugin(PluginSound {
+                plugin: inst.clone(),
+                event_impl,
+                event_list,
+                in_channels,
+                main_out: out_channels_per_bus[0],
+                max_block: voice_max_block,
+                scratch,
+                in_buses,
+                out_buses,
+            }),
         });
         plugins.push(inst);
     }
@@ -905,9 +1074,42 @@ fn mix_block(
     out.fill(0.0);
 
     for voice in voices.iter_mut() {
+        let sound = match &mut voice.sound {
+            Sound::Plugin(p) => p,
+            // A file, played from its start for as long as each note lasts.
+            // Nothing to process and no events to send: where a note is in the
+            // file follows from the transport's own clock.
+            Sound::Sample(s) => {
+                // Notes already finished are behind us for good — until a rewind,
+                // which puts the cursor back to the top.
+                while voice
+                    .hits
+                    .get(voice.cursor)
+                    .is_some_and(|&(_, end)| end <= block_start)
+                {
+                    voice.cursor += 1;
+                }
+                for &(on, off) in &voice.hits[voice.cursor.min(voice.hits.len())..] {
+                    if on >= block_end {
+                        break;
+                    }
+                    let len = off - on;
+                    for pos in on.max(block_start)..off.min(block_end) {
+                        let n = pos - on;
+                        let v = s.at(n as f64 * s.step) * s.envelope(n, len) * voice.gain;
+                        let frame = (pos - block_start) as usize;
+                        for ch in 0..channels {
+                            out[frame * channels + ch] += v;
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+
         // Events due in this block, offset to their sample in it.
         {
-            let mut events = voice.event_impl.events.write().unwrap();
+            let mut events = sound.event_impl.events.write().unwrap();
             events.clear();
             while let Some(&(at, pitch, on)) = voice.schedule.get(voice.cursor) {
                 // `flush_events` empties the schedule into this block: the caller
@@ -930,37 +1132,37 @@ fn mix_block(
         }
 
         // Never more than this instance was set up for (see `PluginIo::max_block`).
-        let frames = frames.min(voice.max_block);
-        voice.scratch.reset(frames);
+        let frames = frames.min(sound.max_block);
+        sound.scratch.reset(frames);
 
         let mut data = ProcessData {
-            numInputs: voice.in_buses.len() as i32,
-            inputs: if voice.in_buses.is_empty() {
+            numInputs: sound.in_buses.len() as i32,
+            inputs: if sound.in_buses.is_empty() {
                 std::ptr::null_mut()
             } else {
-                voice.in_buses.as_mut_ptr()
+                sound.in_buses.as_mut_ptr()
             },
-            numOutputs: voice.out_buses.len() as i32,
-            outputs: voice.out_buses.as_mut_ptr(),
+            numOutputs: sound.out_buses.len() as i32,
+            outputs: sound.out_buses.as_mut_ptr(),
             numSamples: frames as i32,
             processMode: 0,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             ..unsafe { std::mem::zeroed() }
         };
-        data.inputEvents = voice.event_list.as_ptr() as *mut _;
+        data.inputEvents = sound.event_list.as_ptr() as *mut _;
 
         unsafe {
-            voice.plugin.processor.as_com_ref().process(&mut data as *mut _);
+            sound.plugin.processor.as_com_ref().process(&mut data as *mut _);
         }
-        voice.event_impl.events.write().unwrap().clear();
+        sound.event_impl.events.write().unwrap().clear();
 
         // Main output bus into the mix. Its channel count is the plugin's, not
         // the device's: a mono plugin repeats, a wider one has the extra dropped.
-        if voice.main_out > 0 {
+        if sound.main_out > 0 {
             for frame in 0..frames {
                 for ch in 0..channels {
-                    let src = voice.in_channels + ch.min(voice.main_out - 1);
-                    out[frame * channels + ch] += voice.scratch.channel(src)[frame] * voice.gain;
+                    let src = sound.in_channels + ch.min(sound.main_out - 1);
+                    out[frame * channels + ch] += sound.scratch.channel(src)[frame] * voice.gain;
                 }
             }
         }
@@ -1059,6 +1261,7 @@ mod tests {
             is_lesynth: false,
             state: None,
             vst_state: None,
+            wav: None,
         }
     }
 
@@ -1145,7 +1348,7 @@ mod tests {
     fn a_shared_schedule_holds_every_row_s_notes() {
         let rate = 1000.0;
         let notes = vec![note(0.0, 1.0, 60), note(0.0, 1.0, 64), note(1.0, 1.0, 60)];
-        let (schedule, last) = schedule_from(&notes, rate);
+        let (schedule, hits, last) = schedule_from(&notes, rate);
         assert_eq!(
             schedule,
             vec![
@@ -1158,5 +1361,103 @@ mod tests {
             ]
         );
         assert_eq!(last, 2000);
+        // And the same notes as the ranges a sample voice plays over, in time
+        // order: what the wav row of a composition is played from.
+        assert_eq!(hits, vec![(0, 1000), (0, 1000), (1000, 2000)]);
+    }
+
+    fn wav_source(path: &str) -> PlaybackSource {
+        let mut src = source(path);
+        src.wav = Some(PathBuf::from(path));
+        src
+    }
+
+    /// A wav row is a voice of its own, always: a sample voice has one playback
+    /// position, so two rows on one would step on each other — and the decoded
+    /// file, the only thing about it worth sharing, is shared regardless.
+    #[test]
+    fn a_wav_row_never_shares_a_voice() {
+        let plans = vec![
+            plan(0, wav_source("/loop.wav"), 1.0, vec![note(0.0, 1.0, 60)]),
+            // Same file, same gain, no collision — a plugin row would join the
+            // group above on all three counts.
+            plan(1, wav_source("/loop.wav"), 1.0, vec![note(2.0, 1.0, 64)]),
+            plan(2, source("/x.so"), 1.0, vec![note(0.0, 1.0, 60)]),
+            plan(3, source("/x.so"), 1.0, vec![note(0.0, 1.0, 64)]),
+        ];
+        assert_eq!(share_groups(&plans), vec![vec![0], vec![1], vec![2, 3]]);
+    }
+
+    /// A plugin row and a wav row are never the same recipe, however alike the
+    /// rest of them looks — `plugin_path` on a wav track is the audio file, and
+    /// a plugin one is a library that would be loaded.
+    #[test]
+    fn a_wav_track_is_not_the_plugin_of_the_same_name() {
+        assert!(!same_recipe(&wav_source("/loop.wav"), &source("/loop.wav")));
+        assert!(same_recipe(&wav_source("/loop.wav"), &wav_source("/loop.wav")));
+    }
+
+    /// The file is played from its start, at the rate it was recorded at, and
+    /// faded at both ends so a note that cuts it does not click. Rendered from
+    /// the transport's clock alone, so any block size gives the same samples.
+    #[test]
+    fn a_sample_voice_plays_the_file_from_the_start_of_every_note() {
+        // A ramp, so every output sample says which input sample it came from.
+        let audio = DecodedAudio {
+            samples: (0..100).map(|i| i as f32 / 100.0).collect(),
+            sample_rate: 1000.0,
+        };
+        let sound = SampleSound {
+            audio: Arc::new(audio),
+            // Device rate == file rate: one source sample per frame.
+            step: 1.0,
+            fade: 2,
+        };
+        // Two notes, the second shorter than the file.
+        let mut voice = Voice {
+            row_ids: vec![0],
+            gain: 1.0,
+            schedule: Vec::new(),
+            hits: vec![(10, 110), (200, 240)],
+            cursor: 0,
+            sound: Sound::Sample(sound),
+        };
+
+        // Rendered in blocks of 7, which divides neither note: a voice that kept
+        // a position of its own rather than reading the clock would drift here.
+        let mut out = vec![0f32; 300];
+        for start in (0..300).step_by(7) {
+            let frames = 7.min(300 - start);
+            let mut block = vec![0f32; frames];
+            mix_block(
+                std::slice::from_mut(&mut voice),
+                &mut block,
+                1,
+                start as u64,
+                frames,
+                false,
+            );
+            out[start..start + frames].copy_from_slice(&block);
+        }
+
+        // Silence before the first note and between the two.
+        assert!(out[..10].iter().all(|&s| s == 0.0), "{:?}", &out[..10]);
+        assert!(out[110..200].iter().all(|&s| s == 0.0));
+        assert!(out[240..].iter().all(|&s| s == 0.0));
+        // The body of the first note is the file, sample for sample.
+        for n in 3..97 {
+            assert!(
+                (out[10 + n] - n as f32 / 100.0).abs() < 1e-6,
+                "frame {n} of the note is {}, not the file's {}",
+                out[10 + n],
+                n as f32 / 100.0
+            );
+        }
+        // The second note starts the file again rather than carrying on.
+        assert!((out[200 + 10] - 0.10).abs() < 1e-6, "{}", out[200 + 10]);
+        // Faded in at the start and out at the end, both times: the fade is what
+        // keeps a cut file from clicking.
+        assert!(out[200] < 0.5 * 0.001 + 0.001);
+        assert!(out[239].abs() < out[220].abs());
     }
 }

@@ -24,6 +24,13 @@
 //! The analysed grid is previewed inline here (a compact amplitude chart), and
 //! can also be opened in a full LeSynth Fourier editor instance running in
 //! Analysis mode, where individual harmonics can be toggled.
+//!
+//! A file can also skip all of that: **"Add whole file as Track"** publishes the
+//! recording itself as a *wav track* — a Track a Composer row plays from its
+//! start for the length of one note, with no pitch to pick and nothing
+//! resynthesised. It is what a recording no additive analysis does justice to (a
+//! drum loop, a spoken line, a whole take) is for, and what a project saves is
+//! the path to the file.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +76,12 @@ struct AudioFile {
     status: String,
     decoded: Option<DecodedAudio>,
     subtracks: Vec<SubtrackView>,
+    /// Set once the *whole file* has been published as a Track the Composer can
+    /// play as one note — the id it was registered under. Not an analysis: a wav
+    /// track is the recording itself, played back, which is what a part no
+    /// resynthesis does justice to (a drum loop, a spoken line, a field
+    /// recording) needs.
+    wav_track: Option<u64>,
 }
 
 impl AudioFile {
@@ -79,9 +92,20 @@ impl AudioFile {
             status: String::new(),
             decoded: None,
             subtracks: Vec::new(),
+            wav_track: None,
         };
         file.decode_and_segment();
         file
+    }
+
+    /// The path this file was opened from.
+    fn path(&self) -> PathBuf {
+        PathBuf::from(self.file_path.trim())
+    }
+
+    /// How long the file runs, for the hint on the wav-track button.
+    fn duration_secs(&self) -> f32 {
+        self.decoded.as_ref().map(DecodedAudio::duration_secs).unwrap_or(0.0)
     }
 
     /// Number of subtracks whose editor window is currently open.
@@ -243,12 +267,24 @@ impl ResynthPanel {
             }
         }
         if let Some(path) = dialog.pick_file() {
-            let id = self.next_id;
-            self.next_id += 1;
-            let file = AudioFile::new(id, path);
-            self.status = file.status.clone();
-            self.files.push(file);
+            self.open_file(path);
         }
+    }
+
+    /// Open `path` as an audio file of this panel: decode it, segment it, and
+    /// show it. The other half of [`Self::add_audio_file`], with the dialog left
+    /// out — which is also what lets a test lay this panel out with a file in it.
+    fn open_file(&mut self, path: PathBuf) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut file = AudioFile::new(id, path);
+        // The same file may already be a wav track — published before this panel
+        // was cleared, or brought in by a loaded project. One file is one track,
+        // so this view takes over the entry rather than offering to add a second
+        // one just like it.
+        file.wav_track = self.registry.find_wav(&file.path());
+        self.status = file.status.clone();
+        self.files.push(file);
     }
 
     /// Compute the inline preview grid for subtrack `sub_idx` of file `file_idx`
@@ -409,6 +445,47 @@ impl ResynthPanel {
             view.registry_id = Some(id);
         }
         self.status = format!("Added “{name}” to the track list — pick it in the Composer.");
+    }
+
+    /// Publish the **whole file** to the shared track list as a wav track: a
+    /// Track that plays the recording itself, from its start, for as long as the
+    /// note a Composer row gives it.
+    ///
+    /// Nothing is analysed and nothing is decoded here — the recipe is the path,
+    /// and the transport decodes it when it loads the composition (once per
+    /// file, however many rows play it). That is also what a project saves, so a
+    /// wav track survives on any machine the file does.
+    fn add_whole_file_as_track(&mut self, file_idx: usize) {
+        let Some(file) = self.files.get(file_idx) else { return };
+        let path = file.path();
+        if !path.exists() {
+            self.status = format!("{} is no longer there.", crate::file_label(&path));
+            return;
+        }
+        // One track per file, as when a file is opened: two entries playing the
+        // same recording would be indistinguishable in every select box.
+        let name = match self.registry.find_wav(&path) {
+            Some(id) => {
+                self.files[file_idx].wav_track = Some(id);
+                self.registry.name_of(id).unwrap_or_default()
+            }
+            None => {
+                let name = crate::gui::track::unique_track_name(file.display_name());
+                let id = self.registry.add_wav(&name, path);
+                self.files[file_idx].wav_track = Some(id);
+                name
+            }
+        };
+        self.status = format!("Added “{name}” to the track list as a wav track.");
+    }
+
+    /// Take the whole-file track back out of the track list.
+    fn remove_whole_file_track(&mut self, file_idx: usize) {
+        let Some(file) = self.files.get_mut(file_idx) else { return };
+        if let Some(id) = file.wav_track.take() {
+            self.registry.remove(id);
+            self.status = format!("Removed {} from the track list.", file.display_name());
+        }
     }
 
     /// Take a published subtrack back out of the track list. Composer rows using
@@ -606,6 +683,12 @@ impl ResynthPanel {
         // step, so the Composer plays the grid as it is being edited here.
         for file in &mut self.files {
             file.reap_closed_editors();
+            // A wav track can leave the registry without this panel: loading a
+            // project drops the ones a previous load brought in. The button then
+            // has to offer to add it again rather than to remove what is gone.
+            if file.wav_track.is_some_and(|id| !self.registry.contains(id)) {
+                file.wav_track = None;
+            }
             for view in &file.subtracks {
                 if let Some(id) = view.registry_id {
                     self.registry.set_live(
@@ -619,6 +702,8 @@ impl ResynthPanel {
         // Deferred actions, so we don't mutate `self` while iterating/borrowing it.
         let mut to_remove: Option<usize> = None;
         let mut to_close_editors: Option<usize> = None;
+        let mut to_add_wav: Option<usize> = None;
+        let mut to_remove_wav: Option<usize> = None;
         let mut pending: Option<(usize, usize, SubtrackAction)> = None;
 
         for (file_idx, file) in self.files.iter().enumerate() {
@@ -640,8 +725,9 @@ impl ResynthPanel {
                             egui::RichText::new(format!("· {} subtracks", file.subtracks.len()))
                                 .color(egui::Color32::from_gray(150)),
                         );
-                        // Right-aligned controls: remove the whole file, and
-                        // optionally just close its open editors.
+                        // Right-aligned controls: remove the whole file, put it
+                        // on the track list as it stands, and optionally just
+                        // close its open editors.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .button("🗑 Remove")
@@ -649,6 +735,35 @@ impl ResynthPanel {
                                 .clicked()
                             {
                                 to_remove = Some(file_idx);
+                            }
+                            // The whole file as one Track, played as the
+                            // recording rather than as an analysis of it.
+                            if file.wav_track.is_some() {
+                                if ui
+                                    .button("🗑 Remove wav track")
+                                    .on_hover_text(
+                                        "Take this file's wav track back out of the \
+                                         track list",
+                                    )
+                                    .clicked()
+                                {
+                                    to_remove_wav = Some(file_idx);
+                                }
+                            } else if ui
+                                .button("🌊 Add whole file as Track")
+                                .on_hover_text(format!(
+                                    "Add the whole file ({:.1}s) to the track list as \
+                                     a wav track: a Composer row plays the recording \
+                                     itself, from its start, for as long as the note \
+                                     it is given.\n\nNothing is analysed and nothing \
+                                     is resynthesised — there is no pitch to pick, \
+                                     only a length. The project saves the path to \
+                                     this file.",
+                                    file.duration_secs()
+                                ))
+                                .clicked()
+                            {
+                                to_add_wav = Some(file_idx);
                             }
                             if editor_count > 0
                                 && ui.button(format!("Close editors ({})", editor_count)).clicked()
@@ -674,6 +789,12 @@ impl ResynthPanel {
             ui.add_space(8.0);
         }
 
+        if let Some(idx) = to_add_wav {
+            self.add_whole_file_as_track(idx);
+        }
+        if let Some(idx) = to_remove_wav {
+            self.remove_whole_file_track(idx);
+        }
         if let Some(idx) = to_close_editors {
             // Dropping the editors closes their windows (via `EditorInstance`'s
             // `Drop`) and stops each instance's audio stream.
@@ -685,11 +806,15 @@ impl ResynthPanel {
             if idx < self.files.len() {
                 let removed = self.files.remove(idx);
                 // The file's subtracks go with it, so any track published from
-                // them leaves the registry too.
+                // them leaves the registry too — and so does the wav track, if
+                // the whole file was published as one.
                 for view in &removed.subtracks {
                     if let Some(id) = view.registry_id {
                         self.registry.remove(id);
                     }
+                }
+                if let Some(id) = removed.wav_track {
+                    self.registry.remove(id);
                 }
                 self.status = format!("Removed {}.", removed.display_name());
             }
@@ -731,4 +856,82 @@ enum SubtrackAction {
     Export,
     AddTrack,
     RemoveTrack,
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d5() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("D5.wav")
+    }
+
+    /// The whole file as one Track: the button publishes it, a second press of
+    /// it — or the same file opened twice — finds the track that is already
+    /// there rather than adding one indistinguishable from it, and removing the
+    /// file takes it back out of the list.
+    #[test]
+    fn a_file_is_one_wav_track_however_often_it_is_asked_for() {
+        let registry = TrackRegistry::default();
+        let mut panel = ResynthPanel::new(registry.clone());
+        panel.open_file(d5());
+        assert!(panel.files[0].wav_track.is_none(), "nothing is published until it is asked for");
+
+        panel.add_whole_file_as_track(0);
+        let id = panel.files[0].wav_track.expect("published");
+        assert!(registry.is_wav(id), "the track plays a file, not a plugin");
+        assert_eq!(registry.find_wav(&d5()), Some(id));
+        assert_eq!(registry.list().len(), 1);
+
+        // The same file again — a second view of it takes over the same track.
+        panel.open_file(d5());
+        assert_eq!(panel.files[1].wav_track, Some(id));
+        panel.add_whole_file_as_track(1);
+        assert_eq!(registry.list().len(), 1, "one file is one track: {:?}", registry.list());
+
+        panel.remove_whole_file_track(1);
+        assert!(registry.list().is_empty());
+        assert!(panel.files[1].wav_track.is_none());
+    }
+
+    /// Lay the panel out for real (headless egui, no window) with a file open,
+    /// published and unpublished: the header carries two different controls in
+    /// those two states, and a layout test is what catches a duplicate widget id
+    /// or a rect that does not fit.
+    #[test]
+    fn the_panel_lays_out_with_a_published_file_without_panicking() {
+        let registry = TrackRegistry::default();
+        let mut panel = ResynthPanel::new(registry);
+        panel.open_file(d5());
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let frame = |panel: &mut ResynthPanel| -> Vec<String> {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+            });
+            fn walk(sh: &egui::Shape, texts: &mut Vec<String>) {
+                match sh {
+                    egui::Shape::Text(t) => texts.push(t.galley.text().to_string()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts)),
+                    _ => {}
+                }
+            }
+            let mut texts = Vec::new();
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+
+        let texts = frame(&mut panel);
+        assert!(
+            texts.iter().any(|t| t.contains("Add whole file as Track")),
+            "the whole-file control is missing: {texts:?}"
+        );
+        panel.add_whole_file_as_track(0);
+        let texts = frame(&mut panel);
+        assert!(
+            texts.iter().any(|t| t.contains("Remove wav track")),
+            "a published file should offer to unpublish: {texts:?}"
+        );
+    }
 }

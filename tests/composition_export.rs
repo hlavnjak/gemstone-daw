@@ -70,6 +70,7 @@ fn lesynth_source() -> PlaybackSource {
         is_lesynth: true,
         state: Some(grid()),
         vst_state: None,
+        wav: None,
     }
 }
 

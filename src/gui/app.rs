@@ -50,6 +50,13 @@ pub struct DawApp {
     // track — including subtracks published straight from Resynthesis, which
     // never pass through the Tracks panel.
     registry: TrackRegistry,
+    /// Wav tracks a loaded project asked for. They play a file, so they have no
+    /// plugin, no editor and no place in the Tracks panel — but something has to
+    /// take them back out of the registry when the next project replaces them,
+    /// the way [`TracksPanel::clear`] does for its own. A wav track published in
+    /// this session from Resynthesis is *not* in here: that panel owns it, and
+    /// loading a project leaves it alone.
+    adopted_wavs: Vec<u64>,
 }
 
 impl Default for DawApp {
@@ -72,6 +79,7 @@ impl Default for DawApp {
             octave_shift,
             resynth: ResynthPanel::new(registry.clone()),
             registry,
+            adopted_wavs: Vec::new(),
         }
     }
 }
@@ -330,6 +338,13 @@ impl DawApp {
             // `playback_source` snapshots the live editor when one is open, so
             // what gets written is what the user can currently hear.
             let Some(src) = self.registry.playback_source(id) else { continue };
+            // A wav track is a path. Like a third-party plugin's binary the file
+            // stays where it is — it is the user's recording, and usually larger
+            // than everything else in the folder together.
+            if let Some(path) = src.wav {
+                sources.insert(id, TrackSource::Wav { path });
+                continue;
+            }
             if !src.is_lesynth {
                 // A third-party plugin's binary stays where it is — but the state
                 // it is playing does not live in the plugin, it lives in the
@@ -398,8 +413,13 @@ impl DawApp {
 
         // The loaded project replaces what is open, so the tracks it brings are
         // the only ones left — otherwise the previous project's tracks would sit
-        // in the list looking like part of this one.
+        // in the list looking like part of this one. The wav tracks the *last*
+        // load brought go with them; the ones Resynthesis is holding open stay,
+        // because that panel is still showing the file they play.
         self.tracks.clear();
+        for id in self.adopted_wavs.drain(..) {
+            self.registry.remove(id);
+        }
 
         // Distinct sources first, so rows sharing a track share one instance.
         let mut adopted: Vec<(TrackSource, Option<u64>)> = Vec::new();
@@ -433,6 +453,21 @@ impl DawApp {
             TrackSource::LeSynth { file } => {
                 let state = crate::track_format::TrackState::read(&dir.join(file)).ok()?;
                 self.tracks.adopt_lesynth(name, Some(state)).ok()
+            }
+            TrackSource::Wav { path } => {
+                if !path.exists() {
+                    log::warn!("'{name}': audio file {} is missing", path.display());
+                    return None;
+                }
+                // One track per file: a file already open in Resynthesis, or
+                // named by two rows, is the track that is already registered
+                // rather than a second one indistinguishable from it.
+                if let Some(id) = self.registry.find_wav(path) {
+                    return Some(id);
+                }
+                let id = self.registry.add_wav(name, path.clone());
+                self.adopted_wavs.push(id);
+                Some(id)
             }
             TrackSource::Vst { path, class_id, state } => {
                 // A state file that has gone missing is not fatal: the track
@@ -526,5 +561,94 @@ fn octave_shift_label(shift: i32) -> String {
         -1 => "−1 octave down".to_string(),
         n if n > 0 => format!("+{n} octaves up"),
         n => format!("−{} octaves down", -n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn d5() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("D5.wav")
+    }
+
+    /// A wav track survives a project the way every other track does — except
+    /// that what is saved is the path to the file, since the recording is not
+    /// ours to copy into the folder. Loading it back must bind the row to a
+    /// track that plays that file, and saving again must write the same path.
+    #[test]
+    fn a_wav_row_saves_as_a_path_and_loads_back_onto_the_file() {
+        let dir = std::env::temp_dir().join("gemstone-wav-project");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let manifest = dir.join(format!("Take.{}", project::EXTENSION));
+        std::fs::write(
+            &manifest,
+            format!(
+                "gemstone-project 1\nname = Take\ntempo = 120\n\n\
+                 [row]\ntrack = take.wav\nsource = wav {}\ngain = 1\n\
+                 lead = 0 none\nnote = 60 0 1/4 0 1/8\n",
+                d5().display()
+            ),
+        )
+        .expect("write the manifest");
+
+        let mut app = DawApp::default();
+        app.load_project(&manifest).expect("loads");
+
+        // One track, playing the file, and the row is on it — not left showing a
+        // missing source.
+        let tracks = app.registry.list();
+        assert_eq!(tracks.len(), 1, "{tracks:?}");
+        let id = app.registry.find_wav(&d5()).expect("the file is a track");
+        assert!(app.registry.is_wav(id));
+
+        // And saving writes the path back out — through the app, which is what
+        // decides what a track's source is.
+        let written = app.save_project(&dir, "Take").expect("saves");
+        assert_eq!(written, 0, "a wav track writes no file into the folder");
+        let text = std::fs::read_to_string(&manifest).expect("re-read");
+        assert!(
+            text.contains(&format!("source = wav {}", d5().display())),
+            "the path did not survive the round trip: {text}"
+        );
+
+        // Loading again must not leave the first load's track behind: one file
+        // is one track, however many times a project names it.
+        app.load_project(&manifest).expect("loads again");
+        assert_eq!(app.registry.list().len(), 1, "{:?}", app.registry.list());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project naming a file that is not there must say so rather than bind
+    /// the row to nothing quietly: the row keeps what it was looking for, which
+    /// is what puts "⚠ missing" in its select box.
+    #[test]
+    fn a_missing_audio_file_leaves_the_row_asking_for_it() {
+        let dir = std::env::temp_dir().join("gemstone-wav-project-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let manifest = dir.join(format!("Gone.{}", project::EXTENSION));
+        std::fs::write(
+            &manifest,
+            "gemstone-project 1\nname = Gone\n\n\
+             [row]\ntrack = gone.wav\nsource = wav /nonexistent/gone.wav\n\
+             note = 60 0 1/4 0 none\n",
+        )
+        .expect("write the manifest");
+
+        let mut app = DawApp::default();
+        app.load_project(&manifest).expect("loads");
+        assert!(app.registry.list().is_empty(), "nothing to play, so no track");
+        let saved = app.composer.to_project("Gone", |_| TrackSource::None);
+        assert_eq!(
+            saved.rows[0].source,
+            TrackSource::Wav { path: PathBuf::from("/nonexistent/gone.wav") },
+            "a save after a failed load must not lose the file it was looking for"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

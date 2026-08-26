@@ -753,7 +753,9 @@ impl ComposerPanel {
             Ok(player) => {
                 // Say when rows are sharing: it explains both the memory and why
                 // one of them cannot be given its own level while it plays.
-                let shared = match instances < loaded {
+                // Only when there are instances to share — a composition of wav
+                // rows loads none, and "on 0 shared instance(s)" is not news.
+                let shared = match instances > 0 && instances < loaded {
                     true => format!(" on {instances} shared instance(s)"),
                     false => String::new(),
                 };
@@ -1244,6 +1246,13 @@ impl ComposerPanel {
             .iter()
             .map(|r| r.track_id.is_some_and(|id| self.registry.is_percussion(id)))
             .collect();
+        // And which rows play an audio file rather than an instrument: those
+        // frames have no pitch to pick.
+        let wav: Vec<bool> = self
+            .rows
+            .iter()
+            .map(|r| r.track_id.is_some_and(|id| self.registry.is_wav(id)))
+            .collect();
 
         for (idx, row) in self.rows.iter_mut().enumerate() {
             let row_id = row.id;
@@ -1373,7 +1382,7 @@ impl ComposerPanel {
                                 // them, which would otherwise clip the cards.
                                 .max_height(ROW_H + 12.0)
                                 .show(ui, |ui| {
-                                    Self::chain_ui(ui, row, playhead, percussion[idx]);
+                                    Self::chain_ui(ui, row, playhead, percussion[idx], wav[idx]);
                                 });
                         });
                     });
@@ -1394,7 +1403,13 @@ impl ComposerPanel {
     /// frame's length or pitch is immediate; everything after it simply shifts,
     /// because a frame's position is nothing but the sum of the lengths before
     /// it.
-    fn chain_ui(ui: &mut egui::Ui, row: &mut Row, playhead: Option<f64>, percussion: bool) {
+    fn chain_ui(
+        ui: &mut egui::Ui,
+        row: &mut Row,
+        playhead: Option<f64>,
+        percussion: bool,
+        wav: bool,
+    ) {
         // Follow the transport only while there *is* one, and only if this lane
         // was asked to: scrolling a lane every frame is exactly what stops the
         // user scrolling it themselves.
@@ -1418,17 +1433,27 @@ impl ComposerPanel {
             // so it stays put when that note is deleted and leads the next one
             // instead. Drawn only when there is a note for it to lead.
             if !row.items.is_empty() {
-                Self::frame_ui(ui, row_id, LEAD_SPACE_ID, None, &mut row.lead, false, percussion);
-
+                Self::frame_ui(
+                    ui,
+                    row_id,
+                    LEAD_SPACE_ID,
+                    Frame::Space,
+                    &mut row.lead,
+                    false,
+                    percussion,
+                );
             }
             for (idx, (item, start)) in row.items.iter_mut().zip(starts).enumerate() {
                 let sounding = playhead
                     .is_some_and(|p| p >= start as f64 && p < (start + item.dur.units()) as f64);
+                // A wav row's note has no pitch to pick: the file plays at the
+                // pitch it was recorded at, and the only choice left is how long
+                // it plays for.
                 let note = Self::frame_ui(
                     ui,
                     row_id,
                     item.id,
-                    Some(&mut item.pitch),
+                    if wav { Frame::Wav } else { Frame::Note(&mut item.pitch) },
                     &mut item.dur,
                     sounding,
                     percussion,
@@ -1444,7 +1469,15 @@ impl ComposerPanel {
                 }
                 // The space tied to it, drawn right behind it and carrying no
                 // delete button of its own: it leaves only with its note.
-                Self::frame_ui(ui, row_id, item.id, None, &mut item.space, false, percussion);
+                Self::frame_ui(
+                    ui,
+                    row_id,
+                    item.id,
+                    Frame::Space,
+                    &mut item.space,
+                    false,
+                    percussion,
+                );
             }
         });
 
@@ -1456,23 +1489,23 @@ impl ComposerPanel {
     /// One frame. Reports whether its delete button was pressed and where it
     /// landed, which is what a lane following the transport scrolls to.
     ///
-    /// `pitch` decides which frame this is: `Some` draws the blue note frame
-    /// (pitch, three length boxes, delete); `None` the amber space frame, which
-    /// carries the same three length boxes — a space is a length like any other
-    /// — but has *no delete button*: a space leaves only with its note, and the
-    /// row's lead space never leaves at all.
+    /// [`Frame`] decides which frame this is — the blue note, the blue note of a
+    /// row that plays a file (the same frame with no pitch box on it), or the
+    /// amber space, which carries the same length boxes but *no delete button*:
+    /// a space leaves only with its note, and the row's lead space never leaves
+    /// at all.
     ///
     /// `percussion` names the notes after what they hit on a drum kit.
     fn frame_ui(
         ui: &mut egui::Ui,
         row_id: u64,
         id: u64,
-        pitch: Option<&mut u8>,
+        kind: Frame<'_>,
         dur: &mut Duration,
         sounding: bool,
         percussion: bool,
     ) -> FrameOut {
-        let space = pitch.is_none();
+        let space = matches!(kind, Frame::Space);
         let (fill, stroke, header) = match (space, sounding) {
             (true, _) => (
                 SPACE_FILL,
@@ -1530,12 +1563,17 @@ impl ComposerPanel {
                                     // The lead space says so, because it is the
                                     // one space that is not the silence after
                                     // some note and does not leave with one.
-                                    let title = match &pitch {
-                                        Some(p) => format!("{} · {}", note_label(**p, percussion), dur.label()),
-                                        None if id == LEAD_SPACE_ID => {
+                                    let title = match &kind {
+                                        Frame::Note(p) => {
+                                            format!("{} · {}", note_label(**p, percussion), dur.label())
+                                        }
+                                        // No pitch to name it by, so it is named
+                                        // after what it plays: the file, whole.
+                                        Frame::Wav => format!("wav · {}", dur.label()),
+                                        Frame::Space if id == LEAD_SPACE_ID => {
                                             format!("lead · {}", dur.label())
                                         }
-                                        None => format!("space · {}", dur.label()),
+                                        Frame::Space => format!("space · {}", dur.label()),
                                     };
                                     ui.add(
                                         egui::Label::new(
@@ -1547,7 +1585,7 @@ impl ComposerPanel {
                             );
                         });
 
-                        if let Some(pitch) = pitch {
+                        if let Frame::Note(pitch) = kind {
                             // The popup measures itself once per id and keeps
                             // that width forever, so the id carries `percussion`
                             // — a row moved from a synth to a drum kit gets a
@@ -1837,6 +1875,18 @@ impl ComposerPanel {
 const LEAD_SPACE_ID: u64 = u64::MAX;
 
 /// What drawing one frame reported back to its lane.
+/// Which of a row's three frames [`ComposerPanel::frame_ui`] is drawing.
+///
+/// A note carries a pitch, unless the row plays an audio file: a wav track has
+/// the pitch it was recorded at, so its frames offer a length and nothing else.
+/// Both are the blue note frame, and both leave with their delete button; a
+/// space is the amber one, which has none.
+enum Frame<'a> {
+    Note(&'a mut u8),
+    Wav,
+    Space,
+}
+
 struct FrameOut {
     /// Its delete button was pressed.
     deleted: bool,
@@ -2471,6 +2521,65 @@ mod tests {
         frame(&mut panel);
         assert!(panel.rows.iter().all(|r| r.track_id.is_none()));
     }
+    /// A row playing a wav track has no pitch to pick — the file sounds at the
+    /// pitch it was recorded at — so its note frame draws the length boxes and
+    /// nothing else, and names itself after what it plays. The space behind it
+    /// is untouched: a silence is a silence whatever sounds around it.
+    #[test]
+    fn a_wav_row_s_note_frame_offers_a_length_and_no_pitch() {
+        let registry = TrackRegistry::default();
+        let id = registry.add_wav("a whole take.wav", std::path::PathBuf::from("/x/take.wav"));
+        let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
+        panel.add_row();
+        assert_eq!(panel.rows[0].track_id, Some(id));
+        panel.rows[0].add_note(DEFAULT_PITCH);
+        panel.rows[0].items[0].dur = Duration::with_num(0, 3, Fraction::Eighth);
+        panel.rows[0].items[0].space = Duration::new(0, Fraction::Quarter);
+
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+        });
+        let mut texts: Vec<(String, egui::Pos2)> = Vec::new();
+        fn walk(sh: &egui::Shape, texts: &mut Vec<(String, egui::Pos2)>) {
+            match sh {
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_string(), t.pos)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts)),
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut texts);
+        }
+
+        // No pitch anywhere in the lane — not in a box, not in a header.
+        assert!(
+            !texts.iter().any(|(t, _)| t == &note_label(DEFAULT_PITCH, false)),
+            "a wav row still offers a pitch: {texts:?}"
+        );
+        // The note frame says what it plays and how long for, and carries the
+        // three length boxes under it — the same three as any other frame.
+        for (header, boxes) in [
+            ("wav · 3/8", vec!["0 whole", "× 3", "1/8"]),
+            ("space · 1/4", vec!["0 whole", "× 1", "1/4"]),
+        ] {
+            let found: Vec<egui::Pos2> =
+                texts.iter().filter(|(t, _)| t == header).map(|(_, p)| *p).collect();
+            assert_eq!(found.len(), 1, "{header:?} is painted {} times: {texts:?}", found.len());
+            let top = found[0];
+            let mut column: Vec<&(String, egui::Pos2)> = texts
+                .iter()
+                .filter(|(_, p)| {
+                    p.y > top.y && p.y < top.y + CARD_H && p.x <= top.x && p.x > top.x - CARD_W
+                })
+                .collect();
+            column.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+            let painted: Vec<&str> = column.iter().map(|(t, _)| t.as_str()).collect();
+            assert_eq!(painted, boxes, "the {header:?} card's boxes: {texts:?}");
+        }
+    }
+
     /// The nominator is a *box on the card*, and a card is a fixed size. It has
     /// to be drawn — on the space frame and the lead space as much as on the
     /// note — and it has to be drawn **inside** its own card: a [`CARD_H`] left
