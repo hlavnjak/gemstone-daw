@@ -84,8 +84,8 @@ fn repeat_loops_the_composition_until_it_is_switched_off() {
         source: lesynth_source(),
         gain: 1.0,
         notes: vec![
-            PlannedNote { at_secs: 0.0, dur_secs: 0.4, pitch: 60 },
-            PlannedNote { at_secs: 0.5, dur_secs: 0.4, pitch: 64 },
+            PlannedNote { at_secs: 0.0, dur_secs: 0.4, pitch: 60, start_secs: 0.0 },
+            PlannedNote { at_secs: 0.5, dur_secs: 0.4, pitch: 64, start_secs: 0.0 },
         ],
     }];
 
@@ -137,8 +137,8 @@ fn repeat_loops_the_composition_until_it_is_switched_off() {
             row_id: 0,
             gain: 1.0,
             notes: vec![
-                PlannedNote { at_secs: 0.0, dur_secs: 0.4, pitch: 67 },
-                PlannedNote { at_secs: 1.2, dur_secs: 0.4, pitch: 72 },
+                PlannedNote { at_secs: 0.0, dur_secs: 0.4, pitch: 67, start_secs: 0.0 },
+                PlannedNote { at_secs: 1.2, dur_secs: 0.4, pitch: 72, start_secs: 0.0 },
             ],
         }],
         edited,

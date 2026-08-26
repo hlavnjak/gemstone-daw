@@ -27,9 +27,10 @@ arbitrary recording and rebuilds it as additive synthesis you can play and edit:
 
 A file can also skip all of it. **"Add whole file as Track"** publishes the
 recording *itself* — not an analysis of it — as a **wav track**: a Track a
-Composer row plays from the file's start for the length of one note. There is no
-pitch to pick, because a recording has the pitch it was made at; a note frame on
-such a row carries the length boxes and nothing else. It is what a take no
+Composer row plays for the length of one note. There is no pitch to pick, because
+a recording has the pitch it was made at; what a note frame carries in the pitch
+box's place is a **start** — a slider saying where in the file the note begins,
+which is how a take gets lined up with the beat. It is what a take no
 additive analysis does justice to is for — a drum loop, a spoken line, a whole
 performance — and a project saves it as the path to the file it was added from,
 so the file stays where it is rather than being copied into the project folder.
@@ -60,8 +61,12 @@ published there as a wav track — and any number of rows may share the same one
   whole-note part of its length, the nominator (`× 1` … `× 16`), and the
   fraction it counts (1/2 … 1/256). A space frame carries the same three length
   boxes; it has no pitch — and neither does a note on a **wav row**, which plays
-  its file from the start for as long as its length says. A length is the parts
-  added together, so `1` + `× 1` +
+  its file for as long as its length says. That frame is wider than the rest, and
+  carries a **start** slider where a pitch would be: a take does not begin on its
+  first sample, so the start is what puts the sound on the beat instead of the
+  room tone in front of it. Drag the slider to find it, drag the number beside it
+  for milliseconds, or double-click to type one. A length is the parts added
+  together, so `1` + `× 1` +
   `1/8` is a whole note tied to an eighth, and `× 3` over `1/8` is `3/8` — the
   dotted quarter the halving fraction box cannot name on its own. The nominator
   needs a fraction to count, so it is greyed out while the fraction reads `—`.
@@ -98,9 +103,10 @@ published there as a wav track — and any number of rows may share the same one
   (`internal_plugins/liblesynth_fourier.so`, committed precompiled) by its class
   ID. No separate plugin install required.
 - **A wav track is a path.** A row playing one needs no plugin at all: the
-  Composer decodes the file once, however many rows name it, and plays it from
-  its start under every note, cut to the note's length and faded a few
-  milliseconds at each end so a cut cannot click. It is mixed through the same
+  Composer decodes the file once, however many rows name it, and plays it under
+  every note from that note's own start, cut to the note's length and faded a few
+  milliseconds at each end so a cut cannot click. A start past the end of the
+  file is simply silent. It is mixed through the same
   voices and the same per-row gain as everything else, so "Export WAV" writes
   exactly what the transport plays.
 - **Custom VST3 sounds are kept.** What a plugin is playing — the knobs set in

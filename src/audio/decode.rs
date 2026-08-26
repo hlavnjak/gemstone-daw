@@ -43,6 +43,48 @@ impl DecodedAudio {
     }
 }
 
+/// How long a file runs, without decoding it.
+///
+/// The container almost always says (a frame count and a time base), and reading
+/// that costs a seek and a header where decoding a five-minute recording costs
+/// seconds. A container that does *not* say — a raw MP3 with no Xing header — is
+/// decoded after all rather than guessed at: the answer is a slider's range, and
+/// a wrong one puts part of the file out of reach.
+pub fn probe_duration_secs(path: &Path) -> Result<f32> {
+    let file = File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .context("Unsupported or unrecognised audio format")?;
+    let params = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .map(|t| t.codec_params.clone())
+        .context("No decodable audio track found")?;
+    match (params.n_frames, params.time_base, params.sample_rate) {
+        (Some(frames), _, Some(rate)) if rate > 0 => Ok(frames as f32 / rate as f32),
+        (Some(frames), Some(tb), _) => {
+            // Whole seconds and the fraction after them — the seconds alone
+            // would round a 5.8 s file down to 5.
+            let t = tb.calc_time(frames);
+            Ok(t.seconds as f32 + t.frac as f32)
+        }
+        // Nothing declared: decode it and count.
+        _ => Ok(decode_audio_file(path)?.duration_secs()),
+    }
+}
+
 /// Decode a `.wav`, `.mp3` or `.m4a` file to mono f32 PCM at its native sample rate.
 pub fn decode_audio_file(path: &Path) -> Result<DecodedAudio> {
     let file = File::open(path).with_context(|| format!("Failed to open {:?}", path))?;

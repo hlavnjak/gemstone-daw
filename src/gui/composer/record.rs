@@ -373,6 +373,10 @@ pub fn voice_items(notes: &[GridNote], next_item_id: &mut u64) -> (Duration, Vec
         items.push(Item {
             id: take_id(next_item_id),
             pitch: note.pitch,
+            // A take is played on a keyboard, and a key has no file to start
+            // into. A row moved onto a wav track afterwards starts at the top of
+            // it, which is where a note that was never given a start belongs.
+            start: 0.0,
             dur,
             space,
         });
@@ -397,6 +401,7 @@ fn filler(next_item_id: &mut u64, pitch: u8, space: Duration) -> Item {
     Item {
         id: take_id(next_item_id),
         pitch,
+        start: 0.0,
         dur: ZERO,
         space,
     }

@@ -82,8 +82,8 @@ fn installed_vst3_plugins_load_and_render() {
             },
             gain: 1.0,
             notes: vec![
-                PlannedNote { at_secs: 0.0, dur_secs: 0.5, pitch: 60 },
-                PlannedNote { at_secs: 0.5, dur_secs: 0.5, pitch: 64 },
+                PlannedNote { at_secs: 0.0, dur_secs: 0.5, pitch: 60, start_secs: 0.0 },
+                PlannedNote { at_secs: 0.5, dur_secs: 0.5, pitch: 64, start_secs: 0.0 },
             ],
         };
         let (samples, loaded, total) = render_offline(vec![plan], RATE, CHANNELS)

@@ -59,6 +59,11 @@ pub struct TrackEntry {
     /// (a file has the pitch it was recorded at). Published from the
     /// Resynthesis panel, and saved in a project as this path.
     pub wav: Option<PathBuf>,
+    /// How long that file runs. Not playback's business — it decodes the file
+    /// and knows — but the Composer's: it is the range of the slider that says
+    /// where in the file a note starts, and a range short of the recording puts
+    /// part of it out of reach.
+    pub wav_secs: f32,
     /// Grid to import into a freshly loaded instance. `None` = the plugin's own
     /// default state (a plain synth-mode LeSynth, or any custom VST).
     pub state: Option<TrackState>,
@@ -126,6 +131,7 @@ impl TrackRegistry {
             is_lesynth,
             percussion: false,
             wav: None,
+            wav_secs: 0.0,
             state,
             vst_state: None,
             live: None,
@@ -134,8 +140,10 @@ impl TrackRegistry {
     }
 
     /// Register an audio file as a track that plays it whole, as one note, and
-    /// return its id. The path is the whole recipe — see [`TrackEntry::wav`].
-    pub fn add_wav(&self, name: impl Into<String>, path: PathBuf) -> u64 {
+    /// return its id. The path is the whole recipe — see [`TrackEntry::wav`];
+    /// `secs` is how long the file runs, which only the Composer's start slider
+    /// needs.
+    pub fn add_wav(&self, name: impl Into<String>, path: PathBuf, secs: f32) -> u64 {
         let mut inner = self.0.borrow_mut();
         let id = inner.next_id;
         inner.next_id += 1;
@@ -149,6 +157,7 @@ impl TrackRegistry {
             is_lesynth: false,
             percussion: false,
             wav: Some(path),
+            wav_secs: secs.max(0.0),
             state: None,
             vst_state: None,
             live: None,
@@ -169,16 +178,20 @@ impl TrackRegistry {
             .map(|e| e.id)
     }
 
-    /// Whether this track plays an audio file rather than a plugin — which is
-    /// what takes the pitch box off the Composer's frames. `false` for a track
-    /// that is gone.
+    /// How long the file this track plays runs, or `None` for a track that is
+    /// not a wav track (or is gone). This is also the question "is this a wav
+    /// track?": what the Composer does with the answer — no pitch box, and a
+    /// start slider over the file — needs the length in the same breath.
+    pub fn wav_secs(&self, id: u64) -> Option<f32> {
+        let inner = self.0.borrow();
+        let entry = inner.entries.iter().find(|e| e.id == id)?;
+        entry.wav.as_ref().map(|_| entry.wav_secs)
+    }
+
+    /// Whether this track plays an audio file rather than a plugin. `false` for
+    /// a track that is gone.
     pub fn is_wav(&self, id: u64) -> bool {
-        self.0
-            .borrow()
-            .entries
-            .iter()
-            .find(|e| e.id == id)
-            .is_some_and(|e| e.wav.is_some())
+        self.wav_secs(id).is_some()
     }
 
     /// Record that this track plays a drum kit, which is what puts drum names in

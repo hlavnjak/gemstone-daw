@@ -67,6 +67,19 @@ const UNITS_PER_BEAT: i64 = UNITS_PER_WHOLE / 4;
 /// and stops being usable below about this width, and a width proportional to
 /// the length would make a 1/256 invisible.
 const CARD_W: f32 = 108.0;
+/// Width of a **wav row's** note frame, which is wider than the rest.
+///
+/// It carries a control none of the others do — the slider that says where in
+/// the file the note starts — and that slider is the one thing on a frame whose
+/// usefulness is measured in pixels: over a six-second recording, a track this
+/// panel's ordinary width would move the start by sixty milliseconds a pixel,
+/// which is most of the distance between landing on the beat and landing behind
+/// it. Frames are laid side by side and nothing lines up across rows, so a
+/// wider one costs nothing but its own space.
+const WAV_CARD_W: f32 = 184.0;
+/// Room kept for the number beside the start slider — the part of it that is
+/// dragged a millisecond at a time, or typed into.
+const START_VALUE_W: f32 = 70.0;
 /// Height of one frame — a header line plus up to four select boxes. A box costs
 /// 24 of it under the app's text sizes, and a card that no longer fits grows
 /// past this, over the lane it is drawn in; grow the two together — and see
@@ -270,6 +283,17 @@ pub struct Item {
     /// deleted around it.
     pub(crate) id: u64,
     pub(crate) pitch: u8,
+    /// Where in the file this note starts, in seconds — a **wav row** only,
+    /// where there is a file to start into. Zero everywhere else, and ignored:
+    /// a plugin note starts where a note starts.
+    ///
+    /// This is what lines a recording up with the beat. A take does not begin
+    /// on its first sample — there is a breath, a stick click, a moment of room
+    /// before the downbeat — so a frame that always played from sample zero
+    /// would put the *silence* on the beat and the music behind it. The slider
+    /// on the frame moves the file under the note until the transient lands on
+    /// it.
+    pub(crate) start: f32,
     /// How long the note sounds.
     pub(crate) dur: Duration,
     /// The silence after it. Zero is legal and useful: the frame stays on
@@ -379,6 +403,7 @@ impl Row {
             None => Item {
                 id,
                 pitch: default_pitch,
+                start: 0.0,
                 dur: Duration::new(0, Fraction::Quarter),
                 space: Duration::new(0, Fraction::Eighth),
             },
@@ -420,6 +445,7 @@ impl Row {
                     at_secs: at as f64 * spu,
                     dur_secs: units as f64 * spu,
                     pitch: item.pitch,
+                    start_secs: item.start as f64,
                 });
             }
             at += item.total_units();
@@ -1246,12 +1272,13 @@ impl ComposerPanel {
             .iter()
             .map(|r| r.track_id.is_some_and(|id| self.registry.is_percussion(id)))
             .collect();
-        // And which rows play an audio file rather than an instrument: those
-        // frames have no pitch to pick.
-        let wav: Vec<bool> = self
+        // And which rows play an audio file rather than an instrument — with how
+        // long that file runs, which is the range of the start slider on its
+        // frames. `None` is an ordinary instrument row.
+        let wav: Vec<Option<f32>> = self
             .rows
             .iter()
-            .map(|r| r.track_id.is_some_and(|id| self.registry.is_wav(id)))
+            .map(|r| r.track_id.and_then(|id| self.registry.wav_secs(id)))
             .collect();
 
         for (idx, row) in self.rows.iter_mut().enumerate() {
@@ -1408,7 +1435,7 @@ impl ComposerPanel {
         row: &mut Row,
         playhead: Option<f64>,
         percussion: bool,
-        wav: bool,
+        wav: Option<f32>,
     ) {
         // Follow the transport only while there *is* one, and only if this lane
         // was asked to: scrolling a lane every frame is exactly what stops the
@@ -1447,13 +1474,16 @@ impl ComposerPanel {
                 let sounding = playhead
                     .is_some_and(|p| p >= start as f64 && p < (start + item.dur.units()) as f64);
                 // A wav row's note has no pitch to pick: the file plays at the
-                // pitch it was recorded at, and the only choice left is how long
-                // it plays for.
+                // pitch it was recorded at. What it has instead is a start —
+                // where in the file this note begins.
                 let note = Self::frame_ui(
                     ui,
                     row_id,
                     item.id,
-                    if wav { Frame::Wav } else { Frame::Note(&mut item.pitch) },
+                    match wav {
+                        Some(len_secs) => Frame::Wav { start: &mut item.start, len_secs },
+                        None => Frame::Note(&mut item.pitch),
+                    },
                     &mut item.dur,
                     sounding,
                     percussion,
@@ -1525,8 +1555,9 @@ impl ComposerPanel {
         };
 
         let mut deleted = false;
+        let card_w = kind.width();
         let placed = ui.allocate_ui_with_layout(
-            egui::vec2(CARD_W, CARD_H),
+            egui::vec2(card_w, CARD_H),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::Frame::new()
@@ -1535,7 +1566,7 @@ impl ComposerPanel {
                     .corner_radius(4.0)
                     .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
-                        let inner_w = CARD_W - 10.0;
+                        let inner_w = card_w - 10.0;
                         ui.set_width(inner_w);
                         ui.set_min_height(CARD_H - 10.0);
                         ui.spacing_mut().item_spacing.y = 3.0;
@@ -1569,7 +1600,7 @@ impl ComposerPanel {
                                         }
                                         // No pitch to name it by, so it is named
                                         // after what it plays: the file, whole.
-                                        Frame::Wav => format!("wav · {}", dur.label()),
+                                        Frame::Wav { .. } => format!("wav · {}", dur.label()),
                                         Frame::Space if id == LEAD_SPACE_ID => {
                                             format!("lead · {}", dur.label())
                                         }
@@ -1585,28 +1616,72 @@ impl ComposerPanel {
                             );
                         });
 
-                        if let Frame::Note(pitch) = kind {
-                            // The popup measures itself once per id and keeps
-                            // that width forever, so the id carries `percussion`
-                            // — a row moved from a synth to a drum kit gets a
-                            // fresh popup instead of one sized for bare pitches.
-                            egui::ComboBox::from_id_salt(("pitch", row_id, id, percussion))
-                                .width(inner_w)
-                                .height(260.0)
-                                .selected_text(note_label(*pitch, percussion))
-                                .show_ui(ui, |ui| {
-                                    for p in PITCH_MIN..=PITCH_MAX {
-                                        ui.selectable_value(pitch, p, note_label(p, percussion));
-                                    }
-                                })
-                                .response
-                                .on_hover_text(if percussion {
-                                    "Which drum to hit. The name is General MIDI's, \
-                                     which is the map nearly every kit follows; the \
-                                     note is what is actually sent."
-                                } else {
-                                    "Pitch"
-                                });
+                        match kind {
+                            Frame::Note(pitch) => {
+                                // The popup measures itself once per id and keeps
+                                // that width forever, so the id carries
+                                // `percussion` — a row moved from a synth to a
+                                // drum kit gets a fresh popup instead of one
+                                // sized for bare pitches.
+                                egui::ComboBox::from_id_salt(("pitch", row_id, id, percussion))
+                                    .width(inner_w)
+                                    .height(260.0)
+                                    .selected_text(note_label(*pitch, percussion))
+                                    .show_ui(ui, |ui| {
+                                        for p in PITCH_MIN..=PITCH_MAX {
+                                            ui.selectable_value(
+                                                pitch,
+                                                p,
+                                                note_label(p, percussion),
+                                            );
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(if percussion {
+                                        "Which drum to hit. The name is General MIDI's, \
+                                         which is the map nearly every kit follows; the \
+                                         note is what is actually sent."
+                                    } else {
+                                        "Pitch"
+                                    });
+                            }
+                            // Where in the file this note starts. In the pitch
+                            // box's place, because it answers the same question
+                            // for a recording that a pitch answers for an
+                            // instrument: *what* is sounding here.
+                            //
+                            // A slider to find it by ear, and a value to set it
+                            // exactly: the track moves it in tens of
+                            // milliseconds, which is the wrong side of a beat,
+                            // and the number beside it can be dragged a
+                            // millisecond at a time or typed outright.
+                            Frame::Wav { start, len_secs } => {
+                                // A file that has been replaced by a shorter one
+                                // must not leave a note starting past its end.
+                                let last = len_secs.max(0.001);
+                                *start = start.clamp(0.0, last);
+                                // The value box takes the rest of the card; the
+                                // default slider width would overrun it.
+                                ui.spacing_mut().slider_width = inner_w - START_VALUE_W;
+                                ui.add(
+                                    egui::Slider::new(start, 0.0..=last)
+                                        .fixed_decimals(3)
+                                        .step_by(0.001)
+                                        .suffix("s"),
+                                )
+                                .on_hover_text(
+                                    "Where in the file this note starts.\n\nA take does \
+                                     not begin on its first sample — there is room, a \
+                                     breath, a stick click before the downbeat — so this \
+                                     is what puts the sound itself on the beat rather \
+                                     than the silence in front of it. Drag the slider to \
+                                     find it, then drag the number for milliseconds, or \
+                                     double-click it to type one.\n\nThe note plays from \
+                                     here for its own length; past the end of the file it \
+                                     falls silent.",
+                                );
+                            }
+                            Frame::Space => {}
                         }
 
                         // Whole notes and fraction both reach zero, and for a
@@ -1883,8 +1958,21 @@ const LEAD_SPACE_ID: u64 = u64::MAX;
 /// space is the amber one, which has none.
 enum Frame<'a> {
     Note(&'a mut u8),
-    Wav,
+    /// A note on a wav row: where in the file it starts, and how long that file
+    /// runs — which is the range the start can be moved over.
+    Wav { start: &'a mut f32, len_secs: f32 },
     Space,
+}
+
+impl Frame<'_> {
+    /// How wide the card is. Only the wav note is different, and only because of
+    /// the slider on it — see [`WAV_CARD_W`].
+    fn width(&self) -> f32 {
+        match self {
+            Frame::Wav { .. } => WAV_CARD_W,
+            _ => CARD_W,
+        }
+    }
 }
 
 struct FrameOut {
@@ -1924,6 +2012,7 @@ mod tests {
             row.items.push(Item {
                 id,
                 pitch: *pitch,
+                start: 0.0,
                 dur: *dur,
                 space: *space,
             });
@@ -2522,35 +2611,45 @@ mod tests {
         assert!(panel.rows.iter().all(|r| r.track_id.is_none()));
     }
     /// A row playing a wav track has no pitch to pick — the file sounds at the
-    /// pitch it was recorded at — so its note frame draws the length boxes and
-    /// nothing else, and names itself after what it plays. The space behind it
-    /// is untouched: a silence is a silence whatever sounds around it.
+    /// pitch it was recorded at — so its note frame draws the *start* of the
+    /// file in the pitch box's place, then the same three length boxes as every
+    /// other frame. The space behind it is untouched: a silence is a silence
+    /// whatever sounds around it.
     #[test]
-    fn a_wav_row_s_note_frame_offers_a_length_and_no_pitch() {
+    fn a_wav_row_s_note_frame_offers_a_start_and_no_pitch() {
         let registry = TrackRegistry::default();
-        let id = registry.add_wav("a whole take.wav", std::path::PathBuf::from("/x/take.wav"));
+        let id =
+            registry.add_wav("a whole take.wav", std::path::PathBuf::from("/x/take.wav"), 5.8);
         let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
         panel.add_row();
         assert_eq!(panel.rows[0].track_id, Some(id));
         panel.rows[0].add_note(DEFAULT_PITCH);
         panel.rows[0].items[0].dur = Duration::with_num(0, 3, Fraction::Eighth);
         panel.rows[0].items[0].space = Duration::new(0, Fraction::Quarter);
+        // A start past the top of the file, so the slider is read for what it
+        // carries rather than for a zero it would show either way.
+        panel.rows[0].items[0].start = 1.25;
 
         let ctx = egui::Context::default();
         crate::gui::app::DawApp::configure_style(&ctx);
         let out = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
         });
-        let mut texts: Vec<(String, egui::Pos2)> = Vec::new();
-        fn walk(sh: &egui::Shape, texts: &mut Vec<(String, egui::Pos2)>) {
+        let (mut texts, mut cards) = (Vec::new(), Vec::new());
+        fn walk(
+            sh: &egui::Shape,
+            texts: &mut Vec<(String, egui::Pos2)>,
+            cards: &mut Vec<egui::Rect>,
+        ) {
             match sh {
                 egui::Shape::Text(t) => texts.push((t.galley.text().to_string(), t.pos)),
-                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts)),
+                egui::Shape::Rect(r) if CARD_FILLS.contains(&r.fill) => cards.push(r.rect),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts, cards)),
                 _ => {}
             }
         }
         for cs in &out.shapes {
-            walk(&cs.shape, &mut texts);
+            walk(&cs.shape, &mut texts, &mut cards);
         }
 
         // No pitch anywhere in the lane — not in a box, not in a header.
@@ -2558,11 +2657,22 @@ mod tests {
             !texts.iter().any(|(t, _)| t == &note_label(DEFAULT_PITCH, false)),
             "a wav row still offers a pitch: {texts:?}"
         );
+        // Every card still fits the height it is given; the wav note is the one
+        // that is allowed to be wider, and only up to its own width.
+        assert_eq!(cards.len(), 3, "the lead space, the note and its space: {cards:?}");
+        for card in &cards {
+            assert!(
+                card.height() <= CARD_H && card.width() <= WAV_CARD_W,
+                "a frame grew to {:?}, past the {WAV_CARD_W}x{CARD_H} it is given",
+                card.size()
+            );
+        }
+
         // The note frame says what it plays and how long for, and carries the
-        // three length boxes under it — the same three as any other frame.
-        for (header, boxes) in [
-            ("wav · 3/8", vec!["0 whole", "× 3", "1/8"]),
-            ("space · 1/4", vec!["0 whole", "× 1", "1/4"]),
+        // start over the three length boxes; the space carries the three alone.
+        for (header, width, boxes) in [
+            ("wav · 3/8", WAV_CARD_W, vec!["1.250s", "0 whole", "× 3", "1/8"]),
+            ("space · 1/4", CARD_W, vec!["0 whole", "× 1", "1/4"]),
         ] {
             let found: Vec<egui::Pos2> =
                 texts.iter().filter(|(t, _)| t == header).map(|(_, p)| *p).collect();
@@ -2571,13 +2681,33 @@ mod tests {
             let mut column: Vec<&(String, egui::Pos2)> = texts
                 .iter()
                 .filter(|(_, p)| {
-                    p.y > top.y && p.y < top.y + CARD_H && p.x <= top.x && p.x > top.x - CARD_W
+                    p.y > top.y && p.y < top.y + CARD_H && p.x <= top.x && p.x > top.x - width
                 })
                 .collect();
             column.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
             let painted: Vec<&str> = column.iter().map(|(t, _)| t.as_str()).collect();
             assert_eq!(painted, boxes, "the {header:?} card's boxes: {texts:?}");
         }
+    }
+
+    /// The start belongs to the *file*, so it cannot point past the end of one.
+    /// A track swapped for a shorter recording, or a hand-edited project, must
+    /// come back inside it rather than play silence.
+    #[test]
+    fn a_start_past_the_end_of_the_file_is_pulled_back_into_it() {
+        let registry = TrackRegistry::default();
+        registry.add_wav("short.wav", std::path::PathBuf::from("/x/short.wav"), 2.0);
+        let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
+        panel.add_row();
+        panel.rows[0].add_note(DEFAULT_PITCH);
+        panel.rows[0].items[0].start = 30.0;
+
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+        });
+        assert_eq!(panel.rows[0].items[0].start, 2.0);
     }
 
     /// The nominator is a *box on the card*, and a card is a fixed size. It has
@@ -2932,6 +3062,7 @@ mod tests {
                 items: vec![Item {
                     id: 0,
                     pitch: 62,
+                    start: 0.0,
                     dur: Duration::new(0, Fraction::Quarter),
                     space: Duration::new(0, Fraction::None),
                 }],
@@ -3000,6 +3131,7 @@ mod tests {
                     items: vec![Item {
                         id: 0,
                         pitch: 70,
+                        start: 0.0,
                         dur: Duration::new(0, Fraction::Half),
                         space: Duration::new(0, Fraction::Quarter),
                     }],

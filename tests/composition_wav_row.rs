@@ -70,8 +70,8 @@ fn a_wav_row_renders_the_file_under_every_note() {
         source: wav_source(&path),
         gain: 1.0,
         notes: vec![
-            PlannedNote { at_secs: 0.25, dur_secs: 0.5, pitch: 60 },
-            PlannedNote { at_secs: 1.5, dur_secs: 0.25, pitch: 72 },
+            PlannedNote { at_secs: 0.25, dur_secs: 0.5, pitch: 60, start_secs: 0.0 },
+            PlannedNote { at_secs: 1.5, dur_secs: 0.25, pitch: 72, start_secs: 0.0 },
         ],
     }];
     let (out, loaded, total) = render_offline(plans, RATE, 1).expect("renders");
@@ -111,6 +111,63 @@ fn a_wav_row_renders_the_file_under_every_note() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The point of the start: a note plays from where it is pointed *into* the
+/// file, not from the file's first sample — which is what puts the sound on the
+/// beat rather than the room tone in front of it. Two notes on one file, started
+/// at different places, must play different parts of it.
+#[test]
+fn a_note_plays_the_file_from_where_its_start_points() {
+    let dir = std::env::temp_dir().join("gemstone-wav-start");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("take.wav");
+    let source = ramp();
+    write_wav_f32(&path, &source, 1, RATE as u32).expect("write the source file");
+
+    // The same note twice: one from the top of the file, one from 0.5 s in.
+    let plans = vec![RowPlan {
+        row_id: 0,
+        source: wav_source(&path),
+        gain: 1.0,
+        notes: vec![
+            PlannedNote { at_secs: 0.0, dur_secs: 0.25, pitch: 60, start_secs: 0.0 },
+            PlannedNote { at_secs: 1.0, dur_secs: 0.25, pitch: 60, start_secs: 0.5 },
+        ],
+    }];
+    let (out, _, _) = render_offline(plans, RATE, 1).expect("renders");
+
+    let at = |secs: f64| (secs * RATE).round() as usize;
+    let skip = at(0.5);
+    for n in 100..at(0.25) - 100 {
+        assert!(
+            (out[n] - source[n]).abs() < 1e-4,
+            "the first note left the top of the file: sample {n} is {}, not {}",
+            out[n],
+            source[n]
+        );
+        let got = out[at(1.0) + n];
+        assert!(
+            (got - source[skip + n]).abs() < 1e-4,
+            "the second note is at sample {n} playing {got}, not the file's {} \
+             half a second in",
+            source[skip + n]
+        );
+    }
+
+    // A start past the end of the file has nothing to play. Not an error — the
+    // note simply falls silent, which is what a length running off the end does
+    // too.
+    let plans = vec![RowPlan {
+        row_id: 0,
+        source: wav_source(&path),
+        gain: 1.0,
+        notes: vec![PlannedNote { at_secs: 0.0, dur_secs: 0.25, pitch: 60, start_secs: 9.0 }],
+    }];
+    let (out, _, _) = render_offline(plans, RATE, 1).expect("renders");
+    assert!(out.iter().all(|s| *s == 0.0), "a start past the end of the file must be silent");
+
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A file that is not there must not take the composition with it: the row is
 /// dropped, the rest plays, and the caller is told how many rows made it.
 #[test]
@@ -119,7 +176,7 @@ fn a_missing_file_leaves_the_row_out_rather_than_failing_the_render() {
     std::fs::create_dir_all(present.parent().unwrap()).expect("temp dir");
     write_wav_f32(&present, &ramp(), 1, RATE as u32).expect("write the source file");
 
-    let note = |at_secs: f64| PlannedNote { at_secs, dur_secs: 0.5, pitch: 60 };
+    let note = |at_secs: f64| PlannedNote { at_secs, dur_secs: 0.5, pitch: 60, start_secs: 0.0 };
     let plans = vec![
         RowPlan {
             row_id: 0,

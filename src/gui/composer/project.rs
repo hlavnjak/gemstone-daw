@@ -45,6 +45,12 @@
 //! note = 60 0 1/4 0 3/8
 //! ```
 //!
+//! A note line is five fields, and a sixth when a **wav row's** note starts
+//! somewhere other than the top of its file: `note = 60 0 1/4 0 3/8 1.25` plays
+//! from 1.25 s in. A note that starts at zero — which is every note on every
+//! instrument — writes the five it always did, so a project with no such note in
+//! it is byte for byte what it was.
+//!
 //! A length is two fields — whole notes, then the fraction, nominator and all:
 //! `0 3/8` is three eighths, `2 1/4` is two whole notes and a quarter, `1 none`
 //! is one whole note. A length with no nominator writes exactly the token it
@@ -172,11 +178,19 @@ impl Project {
             s += &format!("autoscroll = {}\n", u8::from(row.autoscroll));
             for item in &row.items {
                 s += &format!(
-                    "note = {} {} {}\n",
+                    "note = {} {} {}",
                     item.pitch,
                     write_duration(item.dur),
                     write_duration(item.space)
                 );
+                // Where in the file the note starts — a wav row only, and only
+                // when it is not the top of the file. A note that starts there
+                // writes the five fields this format has always written, so a
+                // project with no wav row in it is byte for byte what it was.
+                if item.start > 0.0 {
+                    s += &format!(" {}", num(item.start));
+                }
+                s += "\n";
             }
         }
         s
@@ -312,8 +326,11 @@ fn read_duration(v: &str) -> Result<Duration> {
 
 fn read_note(v: &str) -> Result<Item> {
     let parts: Vec<&str> = v.split_whitespace().collect();
-    if parts.len() != 5 {
-        bail!("a note takes 5 fields (pitch, note length, space length), got {v:?}");
+    if !matches!(parts.len(), 5 | 6) {
+        bail!(
+            "a note takes 5 fields (pitch, note length, space length) and may \
+             carry a sixth (where in the file it starts), got {v:?}"
+        );
     }
     Ok(Item {
         // Filled in by the loader, which owns row-local ids.
@@ -321,6 +338,12 @@ fn read_note(v: &str) -> Result<Item> {
         pitch: parts[0].parse().context("note pitch")?,
         dur: read_duration(&format!("{} {}", parts[1], parts[2]))?,
         space: read_duration(&format!("{} {}", parts[3], parts[4]))?,
+        // A note written before starts existed, or one that starts at the top of
+        // its file, has no sixth field — and starts at zero either way.
+        start: match parts.get(5) {
+            Some(t) => t.parse::<f32>().context("where in the file the note starts")?.max(0.0),
+            None => 0.0,
+        },
     })
 }
 
@@ -450,12 +473,14 @@ mod tests {
                         Item {
                             id: 0,
                             pitch: 60,
+                            start: 0.0,
                             dur: Duration::new(0, Fraction::Quarter),
                             space: Duration::new(0, Fraction::Eighth),
                         },
                         Item {
                             id: 0,
                             pitch: 67,
+                            start: 0.0,
                             // A nominator on the note and none on the space, so
                             // the round trip proves the field travels rather
                             // than that both ends happen to say `1`.
@@ -492,6 +517,24 @@ mod tests {
         p.rows[1].source = TrackSource::Wav {
             path: PathBuf::from("/home/kuba/Music/my voice.wav"),
         };
+        // And its notes carry where in the file they start — the field only a
+        // wav row has anything to say about.
+        p.rows[1].items = vec![
+            Item {
+                id: 0,
+                pitch: 60,
+                start: 1.25,
+                dur: Duration::new(0, Fraction::Quarter),
+                space: Duration::new(0, Fraction::Eighth),
+            },
+            Item {
+                id: 0,
+                pitch: 60,
+                start: 0.0,
+                dur: Duration::new(0, Fraction::Quarter),
+                space: Duration::new(0, Fraction::None),
+            },
+        ];
         let text = p.to_text();
         assert!(
             text.contains("source = wav /home/kuba/Music/my voice.wav"),
@@ -500,7 +543,30 @@ mod tests {
         // No `state =` rides behind it: there is nothing beside the manifest to
         // point at.
         assert!(!text.contains("state ="), "a wav track saves no state file: {text}");
+        // A start writes a sixth field; a note that starts at the top of its
+        // file writes the five this format has always written.
+        assert!(text.contains("note = 60 0 1/4 0 1/8 1.25\n"), "{text}");
+        assert!(text.contains("note = 60 0 1/4 0 none\n"), "{text}");
         assert_eq!(Project::parse(&text).expect("parses"), p);
+    }
+
+    /// The start rides on the note line as an optional sixth field, so a project
+    /// written before it existed reads as a note at the top of its file — and a
+    /// line with one field too many is refused rather than half-read.
+    #[test]
+    fn a_note_without_a_start_reads_as_the_top_of_the_file() {
+        let text = "gemstone-project 1\nname = X\n\n\
+                    [row]\nsource = none\nnote = 60 0 1/4 0 none\n\
+                    note = 62 0 1/4 0 none 0.5\n";
+        let p = Project::parse(text).expect("parses");
+        assert_eq!(p.rows[0].items[0].start, 0.0);
+        assert_eq!(p.rows[0].items[1].start, 0.5);
+
+        assert!(read_note("60 0 1/4 0 none 0.5 7").is_err(), "seven fields is not a note");
+        assert!(read_note("60 0 1/4 0 none x").is_err(), "a start is a number of seconds");
+        // A negative start is not a place in a file; it reads as the top of one
+        // rather than as a note that plays before the file begins.
+        assert_eq!(read_note("60 0 1/4 0 none -2").expect("parses").start, 0.0);
     }
 
     /// The whole point of a save format: what comes back is what went in.

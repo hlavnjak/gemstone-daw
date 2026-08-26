@@ -95,6 +95,10 @@ pub struct PlannedNote {
     pub at_secs: f64,
     pub dur_secs: f64,
     pub pitch: u8,
+    /// Where in the file the note starts, for a row that plays one — see
+    /// [`crate::gui::composer::Item::start`]. Zero, and ignored, for a note on a
+    /// plugin: an instrument has nothing to start into.
+    pub start_secs: f64,
 }
 
 impl PlannedNote {
@@ -106,6 +110,18 @@ impl PlannedNote {
             && self.at_secs < other.at_secs + other.dur_secs
             && other.at_secs < self.at_secs + self.dur_secs
     }
+}
+
+/// One note of a sample voice, resolved to the transport's sample clock: when it
+/// starts, when it stops, and where in the file it plays from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Hit {
+    on: u64,
+    off: u64,
+    /// Seconds into the file — the frame's start slider. Kept in seconds rather
+    /// than in source samples because a schedule is built without knowing which
+    /// file it is for, and the rate is the file's, not the device's.
+    start_secs: f64,
 }
 
 /// One composer row, ready to play.
@@ -144,10 +160,10 @@ struct VoiceEdit {
     voice: usize,
     gain: f32,
     schedule: Vec<(u64, u8, bool)>,
-    /// The same notes as sample ranges, for a voice that plays a file — see
-    /// [`Voice::hits`]. Built for every voice because it costs a vector of pairs
-    /// and saves the edit having to know which kind it is addressing.
-    hits: Vec<(u64, u64)>,
+    /// The same notes as file ranges, for a voice that plays one — see
+    /// [`Voice::hits`]. Built for every voice because it costs a vector of
+    /// triples and saves the edit having to know which kind it is addressing.
+    hits: Vec<Hit>,
 }
 
 /// A row's sound plus its schedule, as the callback sees it.
@@ -160,10 +176,10 @@ struct Voice {
     /// `(sample time, pitch, note-on)`, sorted by time — what a plugin voice
     /// sends.
     schedule: Vec<(u64, u8, bool)>,
-    /// The same notes as `(start, end)` sample ranges — what a sample voice
-    /// plays over. Built from the schedule by [`schedule_from`], so the two can
-    /// never say different things about when a note sounds.
-    hits: Vec<(u64, u64)>,
+    /// The same notes as [`Hit`]s — what a sample voice plays over. Built from
+    /// the same notes as the schedule by [`schedule_from`], so the two can never
+    /// say different things about when a note sounds.
+    hits: Vec<Hit>,
     /// Next event in `schedule` for a plugin voice; next hit in `hits` for a
     /// sample one. A voice is one or the other, so one cursor is all there is to
     /// keep.
@@ -647,9 +663,9 @@ fn loop_sample_for(loop_secs: f64, sample_rate: f64, last_event: u64) -> u64 {
 fn schedule_from(
     notes: &[PlannedNote],
     sample_rate: f64,
-) -> (Vec<(u64, u8, bool)>, Vec<(u64, u64)>, u64) {
+) -> (Vec<(u64, u8, bool)>, Vec<Hit>, u64) {
     let mut schedule: Vec<(u64, u8, bool)> = Vec::with_capacity(notes.len() * 2);
-    let mut hits: Vec<(u64, u64)> = Vec::with_capacity(notes.len());
+    let mut hits: Vec<Hit> = Vec::with_capacity(notes.len());
     let mut last_event = 0u64;
     for n in notes {
         let on = (n.at_secs * sample_rate).round().max(0.0) as u64;
@@ -658,11 +674,11 @@ fn schedule_from(
         let off = on + ((n.dur_secs * sample_rate).round().max(1.0) as u64);
         schedule.push((on, n.pitch, true));
         schedule.push((off, n.pitch, false));
-        hits.push((on, off));
+        hits.push(Hit { on, off, start_secs: n.start_secs.max(0.0) });
         last_event = last_event.max(off);
     }
     schedule.sort_by_key(|&(t, _, on)| (t, on));
-    hits.sort_unstable();
+    hits.sort_by_key(|h| (h.on, h.off));
     (schedule, hits, last_event)
 }
 
@@ -1085,18 +1101,22 @@ fn mix_block(
                 while voice
                     .hits
                     .get(voice.cursor)
-                    .is_some_and(|&(_, end)| end <= block_start)
+                    .is_some_and(|h| h.off <= block_start)
                 {
                     voice.cursor += 1;
                 }
-                for &(on, off) in &voice.hits[voice.cursor.min(voice.hits.len())..] {
-                    if on >= block_end {
+                for hit in &voice.hits[voice.cursor.min(voice.hits.len())..] {
+                    if hit.on >= block_end {
                         break;
                     }
-                    let len = off - on;
-                    for pos in on.max(block_start)..off.min(block_end) {
-                        let n = pos - on;
-                        let v = s.at(n as f64 * s.step) * s.envelope(n, len) * voice.gain;
+                    let len = hit.off - hit.on;
+                    // Where the note starts *in the file* — the frame's start
+                    // slider, in the file's own samples.
+                    let skip = hit.start_secs * s.audio.sample_rate as f64;
+                    for pos in hit.on.max(block_start)..hit.off.min(block_end) {
+                        let n = pos - hit.on;
+                        let v =
+                            s.at(skip + n as f64 * s.step) * s.envelope(n, len) * voice.gain;
                         let frame = (pos - block_start) as usize;
                         for ch in 0..channels {
                             out[frame * channels + ch] += v;
@@ -1250,6 +1270,7 @@ mod tests {
             at_secs,
             dur_secs,
             pitch,
+            start_secs: 0.0,
         }
     }
 
@@ -1363,7 +1384,14 @@ mod tests {
         assert_eq!(last, 2000);
         // And the same notes as the ranges a sample voice plays over, in time
         // order: what the wav row of a composition is played from.
-        assert_eq!(hits, vec![(0, 1000), (0, 1000), (1000, 2000)]);
+        assert_eq!(
+            hits,
+            vec![
+                Hit { on: 0, off: 1000, start_secs: 0.0 },
+                Hit { on: 0, off: 1000, start_secs: 0.0 },
+                Hit { on: 1000, off: 2000, start_secs: 0.0 },
+            ]
+        );
     }
 
     fn wav_source(path: &str) -> PlaybackSource {
@@ -1418,7 +1446,10 @@ mod tests {
             row_ids: vec![0],
             gain: 1.0,
             schedule: Vec::new(),
-            hits: vec![(10, 110), (200, 240)],
+            hits: vec![
+                Hit { on: 10, off: 110, start_secs: 0.0 },
+                Hit { on: 200, off: 240, start_secs: 0.0 },
+            ],
             cursor: 0,
             sound: Sound::Sample(sound),
         };

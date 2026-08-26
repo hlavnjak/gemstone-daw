@@ -77,8 +77,8 @@ fn lesynth_source() -> PlaybackSource {
 #[test]
 fn a_composition_exports_the_audio_it_plays() {
     let notes = vec![
-        PlannedNote { at_secs: 0.0, dur_secs: 0.4, pitch: 60 },
-        PlannedNote { at_secs: 0.5, dur_secs: 0.4, pitch: 64 },
+        PlannedNote { at_secs: 0.0, dur_secs: 0.4, pitch: 60, start_secs: 0.0 },
+        PlannedNote { at_secs: 0.5, dur_secs: 0.4, pitch: 64, start_secs: 0.0 },
     ];
     let last_off = 0.9;
     let plans = vec![RowPlan {

@@ -465,7 +465,14 @@ impl DawApp {
                 if let Some(id) = self.registry.find_wav(path) {
                     return Some(id);
                 }
-                let id = self.registry.add_wav(name, path.clone());
+                // How long it runs, for the start slider on its notes. Read
+                // from the container rather than by decoding: a project of long
+                // recordings would otherwise take a decode each to open.
+                let secs = crate::audio::probe_duration_secs(path).unwrap_or_else(|e| {
+                    log::warn!("'{name}': cannot measure {} ({e:#})", path.display());
+                    0.0
+                });
+                let id = self.registry.add_wav(name, path.clone(), secs);
                 self.adopted_wavs.push(id);
                 Some(id)
             }
@@ -603,6 +610,14 @@ mod tests {
         assert_eq!(tracks.len(), 1, "{tracks:?}");
         let id = app.registry.find_wav(&d5()).expect("the file is a track");
         assert!(app.registry.is_wav(id));
+        // How long the file runs came back with it: that is the range of the
+        // start slider on every note of the row, and a zero would put the whole
+        // recording out of reach.
+        let secs = app.registry.wav_secs(id).expect("a wav track knows its length");
+        assert!(
+            (secs - 5.81).abs() < 0.05,
+            "D5.wav is 5.8 s; the project loaded it as {secs}"
+        );
 
         // And saving writes the path back out — through the app, which is what
         // decides what a track's source is.

@@ -471,7 +471,9 @@ impl ResynthPanel {
             }
             None => {
                 let name = crate::gui::track::unique_track_name(file.display_name());
-                let id = self.registry.add_wav(&name, path);
+                // The file is already decoded here, so its length is known
+                // exactly — no need to go back to the container for it.
+                let id = self.registry.add_wav(&name, path, file.duration_secs());
                 self.files[file_idx].wav_track = Some(id);
                 name
             }
