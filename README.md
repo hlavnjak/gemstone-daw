@@ -78,6 +78,34 @@ published there as a wav track — and any number of rows may share the same one
   a note frame removes the note *and* its space, and there is no way to remove
   one without the other. Setting a space to `0 whole` and `—` is the way to run
   two notes together — the frame stays as a placeholder, but adds no time.
+- **Blocks — copying a section across every track at once.** Music repeats, and
+  the second time round should not cost what the first did. Each note frame
+  carries a select box (`☐`): click it to start a **block**, shift-click another
+  frame on the row to take everything between them, click it again to drop it.
+  Rows are selected independently, so a block spans as many of them as you like —
+  or mark the phrase on the row you can hear it in and press **↔ Span Rows**,
+  which takes *the same stretch of time* out of every other row. That is what
+  makes a natural block one press: a section is a stretch of time, not a count of
+  frames, and no two rows spend it on the same number of notes.
+  - **🔁 Clone ×N** repeats the block in place — each copy directly behind the
+    last, on every row at once, with everything that followed moved along by the
+    same amount on every row. A copy occupies the block's **window** (from its
+    first note to the end of its last space), not the frames' own extent, so the
+    silence a row leaves at either end of the window is put back between one copy
+    and the next and the tracks stay in step however many times it is pressed.
+    The selection moves onto the copy, so pressing it again repeats the repeat.
+  - **🗐 Copy** and **📋 Paste at End** carry a block, with the silence in front
+    of each row's part of it, to the end of the composition — every row padded up
+    to the end of the longest one, so a block that sounded together is pasted
+    sounding together. It goes back on the rows it came from: the frames name a
+    pitch, a length and a place in a file that mean what they mean on the track
+    they were written for.
+  - A gap between copies is arithmetic, not a length anyone picked, so it is not
+    always one the three length boxes can name — `255/256` needs 255 of the
+    smallest fraction there is. What will not fit in one frame is laid out over
+    frames of no length: silence, which is what a gap is, and which the transport
+    skips. A rounded gap would be a copy that drifts further out of step with
+    every repeat.
 - **Time**: every row starts at zero, so two rows sound together exactly when the
   lengths in front of their frames add up the same — that is what makes a chord.
   The tempo control (BPM) sets what a beat is worth — a beat is a quarter note.

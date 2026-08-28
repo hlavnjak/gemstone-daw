@@ -35,6 +35,15 @@
 //! Time is counted in [`UNITS_PER_WHOLE`]ths, so every length is a whole number
 //! of units and the arithmetic stays exact. Playback lives in [`player`].
 //!
+//! **Frames are edited in blocks as well as one at a time.** A note frame's
+//! select box puts it in the **block**, which is a stretch of frames spanning
+//! any number of rows at once: "Span Rows" takes the same stretch of *time* out
+//! of every row, "Clone" repeats the block in place on all of them, and
+//! "Copy"/"Paste at End" carry it to the end of the composition. What keeps the
+//! rows in step through all of it is that a copy occupies the block's window —
+//! the time from its first note to the end of its last space — rather than the
+//! frames' own extent; see [`ComposerPanel::clone_block`].
+//!
 //! **Rows can also be played in rather than written.** "Record & Play Once"
 //! plays the composition through once and captures a MIDI keyboard against it,
 //! rounding what was played onto a chosen note value and appending it as new
@@ -91,9 +100,23 @@ const CARD_H: f32 = 124.0;
 const SPACE_FILL: egui::Color32 = egui::Color32::from_rgb(78, 62, 38);
 const NOTE_FILL: egui::Color32 = egui::Color32::from_rgb(52, 66, 92);
 const NOTE_SOUNDING_FILL: egui::Color32 = egui::Color32::from_rgb(74, 100, 138);
-/// The three together, which is how a layout test picks the cards out of what
+/// …and what a frame in the selected block is filled with: the same colour,
+/// lit. A block runs across rows, so it has to be legible as *one* shape in a
+/// panel full of cards — the fill says which frames, the [`SEL_STROKE`] round
+/// them says they are one thing.
+const SPACE_SEL_FILL: egui::Color32 = egui::Color32::from_rgb(108, 86, 50);
+const NOTE_SEL_FILL: egui::Color32 = egui::Color32::from_rgb(70, 92, 130);
+/// The border every frame in the block wears.
+const SEL_STROKE: egui::Color32 = egui::Color32::from_rgb(238, 198, 120);
+/// All of them together, which is how a layout test picks the cards out of what
 /// the lane painted: they are the only filled rectangles in it.
-const CARD_FILLS: [egui::Color32; 3] = [SPACE_FILL, NOTE_FILL, NOTE_SOUNDING_FILL];
+const CARD_FILLS: [egui::Color32; 5] = [
+    SPACE_FILL,
+    NOTE_FILL,
+    NOTE_SOUNDING_FILL,
+    SPACE_SEL_FILL,
+    NOTE_SEL_FILL,
+];
 /// Height of one row's lane. The frames plus a little air around them.
 const ROW_H: f32 = CARD_H + 10.0;
 /// Width of the fixed row head (track select, add-note, gain).
@@ -284,6 +307,74 @@ impl Duration {
         best
     }
 
+    /// The one length the three boxes can name that is exactly `units`, if
+    /// there is one.
+    ///
+    /// A length is whole notes plus a nominator's worth of one fraction, so a
+    /// unit count is nameable only when what is left over after the whole notes
+    /// divides into at most [`MAX_NUM`] of some fraction: `255/256` does not, as
+    /// nothing but the 1/256 divides it and that would take 255 of them. This is
+    /// what lets a block edit put a silence *into a frame that already exists*
+    /// rather than adding one — and [`Duration::split`] is what it falls back on
+    /// when the answer is `None`.
+    ///
+    /// The coarsest fraction that fits is the one returned, so 128 units come
+    /// back as `1/2` rather than as `128/256`, matching [`Duration::closest_to`].
+    fn exact(units: i64) -> Option<Duration> {
+        if units < 0 {
+            return None;
+        }
+        let wholes = (units / UNITS_PER_WHOLE).min(MAX_WHOLES as i64);
+        let rem = units - wholes * UNITS_PER_WHOLE;
+        if rem == 0 {
+            return Some(Duration::new(wholes as u8, Fraction::None));
+        }
+        for frac in Fraction::ALL {
+            let f = frac.units();
+            if f > 0 && rem % f == 0 && rem / f <= MAX_NUM as i64 {
+                return Some(Duration::with_num(wholes as u8, (rem / f) as u8, frac));
+            }
+        }
+        None
+    }
+
+    /// `units` spread over as few lengths as the boxes can name it in — what a
+    /// silence too odd for one frame is laid out over.
+    ///
+    /// Whole by preference: a length [`Duration::exact`] can say is one entry,
+    /// and only a remainder no fraction divides finely enough is chipped away
+    /// coarsest-first. Each step takes more than half of what is left, so this
+    /// is a handful of entries at worst and one entry nearly always.
+    fn split(units: i64) -> Vec<Duration> {
+        let mut left = units;
+        let mut out = Vec::new();
+        while left > 0 {
+            if let Some(d) = Duration::exact(left) {
+                out.push(d);
+                break;
+            }
+            let wholes = (left / UNITS_PER_WHOLE).min(MAX_WHOLES as i64);
+            let rem = left - wholes * UNITS_PER_WHOLE;
+            let mut d = Duration::new(wholes as u8, Fraction::None);
+            for frac in Fraction::ALL {
+                let f = frac.units();
+                if f > 0 && f <= rem {
+                    let num = (rem / f).min(MAX_NUM as i64) as u8;
+                    d = Duration::with_num(wholes as u8, num, frac);
+                    break;
+                }
+            }
+            // Nothing left that a 1/256 could take: unreachable while `left`
+            // is positive, and a break rather than a hang if it ever is not.
+            if d.units() == 0 {
+                break;
+            }
+            left -= d.units();
+            out.push(d);
+        }
+        out
+    }
+
     /// How far this length is from `secs`, in seconds — what the fit could not
     /// name exactly. Signed: positive is longer than asked for.
     fn error_secs(self, secs: f64, spu: f64) -> f64 {
@@ -298,6 +389,19 @@ impl Duration {
             (w, Fraction::None) => w.to_string(),
             (w, f) => format!("{w} + {}", f.label_times(self.num)),
         }
+    }
+}
+
+/// What the block controls say when they are pressed with nothing selected.
+const NO_BLOCK: &str = "Nothing selected — press ☐ on a note frame to start a block.";
+
+/// How a stretch of time reads in the block bar: as a length when the length
+/// boxes can name it, and as a count of whole notes when they cannot — a window
+/// is the sum of whatever was selected and does not have to be nameable.
+fn span_label(units: i64) -> String {
+    match Duration::exact(units) {
+        Some(d) => d.label(),
+        None => format!("{:.2} whole", units as f64 / UNITS_PER_WHOLE as f64),
     }
 }
 
@@ -418,6 +522,15 @@ struct Row {
     /// In play order: item `n` starts where item `n - 1`'s space ended.
     items: Vec<Item>,
     next_item_id: u64,
+    /// The block selected on this row, as the ids of the frames at its two
+    /// ends — see [`Row::sel_range`].
+    ///
+    /// Ids rather than positions: a frame deleted in front of the block would
+    /// slide a range of *indices* silently onto other notes, and a whole block
+    /// is the one thing in this panel that is edited without being looked at.
+    /// The ends are stored as picked, anchor first, so shift-clicking keeps
+    /// dragging the same end.
+    sel: Option<(u64, u64)>,
 }
 
 impl Row {
@@ -432,7 +545,50 @@ impl Row {
             missing: None,
             items: Vec::new(),
             next_item_id: 0,
+            sel: None,
         }
+    }
+
+    /// The selected block as positions, first and last inclusive. `None` when
+    /// nothing is selected on this row — or when what was selected has been
+    /// deleted since, which is the whole reason the ends are held as ids.
+    fn sel_range(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.sel?;
+        let a = self.items.iter().position(|i| i.id == a)?;
+        let b = self.items.iter().position(|i| i.id == b)?;
+        Some((a.min(b), a.max(b)))
+    }
+
+    /// A click on a frame's select box. Plain, it starts a block of one — or
+    /// ends the block, when that frame *was* the whole of it, so one box both
+    /// selects and deselects. `extend` (shift) drags the free end of the block
+    /// onto this frame instead, keeping the end it was anchored on.
+    ///
+    /// Rows are selected independently: clicking on one row never clears
+    /// another, because a block that spans rows is built by clicking on each of
+    /// them — or, faster, by marking one row and pressing “Span Rows”.
+    fn select_item(&mut self, id: u64, extend: bool) {
+        self.sel = match (self.sel, extend) {
+            (Some((anchor, _)), true) => Some((anchor, id)),
+            (Some((a, b)), false) if a == id && b == id => None,
+            _ => Some((id, id)),
+        };
+    }
+
+    /// Select the run of items `a..=b`, by position. Used by the block
+    /// operations, which know where they put the frames they made.
+    fn select_range(&mut self, a: usize, b: usize) {
+        self.sel = match (self.items.get(a), self.items.get(b)) {
+            (Some(first), Some(last)) => Some((first.id, last.id)),
+            _ => None,
+        };
+    }
+
+    /// Hand out the next item id.
+    fn take_item_id(&mut self) -> u64 {
+        let id = self.next_item_id;
+        self.next_item_id += 1;
+        id
     }
 
     /// Where the row's first note starts: the lead space, which counts only
@@ -492,6 +648,12 @@ impl Row {
         if idx < self.items.len() {
             self.items.remove(idx);
         }
+        // A block one of whose ends has just gone is no block. Dropping it here
+        // rather than leaving `sel_range` to fail keeps "is anything selected"
+        // one question with one answer.
+        if self.sel_range().is_none() {
+            self.sel = None;
+        }
     }
 
     /// Where each note starts, in units — the running sum of everything before
@@ -527,6 +689,102 @@ impl Row {
         }
         out
     }
+}
+
+/// A **block**: the frames selected across the rows, resolved against the
+/// composition.
+///
+/// A block is not a rectangle of notes — rows hold different numbers of frames
+/// of different lengths, and nothing lines up across them by position. What
+/// makes it one thing is the **window**: the stretch of time from the first
+/// note in the selection to the end of the last space in it. Every row's part is
+/// copied against that window rather than against its own extent, which is what
+/// keeps a chord a chord and a row that comes in late coming in late.
+struct Block {
+    /// One entry per row that has something selected, in row order.
+    rows: Vec<BlockRow>,
+    /// Start of the window: the earliest selected note in any row.
+    from: i64,
+    /// End of it: where the last selected space in any row runs out.
+    to: i64,
+}
+
+struct BlockRow {
+    /// Where the row is in [`ComposerPanel::rows`].
+    idx: usize,
+    /// First and last selected item on it, inclusive.
+    first: usize,
+    last: usize,
+}
+
+impl Block {
+    /// How long the window is, in units. Every copy of the block occupies
+    /// exactly this, however much silence a given row leaves at either end.
+    fn window(&self) -> i64 {
+        self.to - self.from
+    }
+
+    fn frames(&self) -> usize {
+        self.rows.iter().map(|r| r.last - r.first + 1).sum()
+    }
+}
+
+/// A block lifted out of the composition and held for putting back — the
+/// clipboard.
+///
+/// It keeps each row's frames *and* the silence in front of them (`lead`), so
+/// pasting reproduces the alignment the block was copied with rather than
+/// stacking every row flush against the paste point.
+#[derive(Clone)]
+struct Clip {
+    /// The window the block covered — see [`Block`].
+    window: i64,
+    rows: Vec<ClipRow>,
+}
+
+#[derive(Clone)]
+struct ClipRow {
+    /// The row this came off, which is the row it goes back on. A block is
+    /// copied *between times*, not between tracks: the frames carry pitches and
+    /// file starts that mean what they mean on the track they were written for.
+    row_id: u64,
+    /// Units between the window's start and this row's first copied note.
+    lead: i64,
+    items: Vec<Item>,
+}
+
+impl Clip {
+    fn frames(&self) -> usize {
+        self.rows.iter().map(|r| r.items.len()).sum()
+    }
+}
+
+/// Put `units` of extra silence into `space` — the space of whatever frame the
+/// insertion follows — and report what would not fit.
+///
+/// A frame's length is three select boxes, which cannot name every unit count
+/// (see [`Duration::exact`]): the rest comes back as lengths for placeholder
+/// frames the caller appends. Silence that a block edit has computed must land
+/// somewhere *exactly*, because it is the difference between two rows staying in
+/// step and drifting apart by a fraction that grows with every repeat.
+fn add_gap(space: &mut Duration, units: i64) -> Vec<Duration> {
+    if units <= 0 {
+        return Vec::new();
+    }
+    match Duration::exact(space.units() + units) {
+        Some(d) => {
+            *space = d;
+            Vec::new()
+        }
+        None => Duration::split(units),
+    }
+}
+
+/// A frame that is nothing but silence: a note of no length — which the
+/// transport skips — carrying `space` behind it. What silence too odd for one
+/// length box is spread over.
+fn spacer(id: u64, pitch: u8, space: Duration) -> Item {
+    Item { id, pitch, start: 0.0, dur: Duration::new(0, Fraction::None), space }
 }
 
 /// What the Composer wants the app to do with the project. The panel owns the
@@ -613,6 +871,13 @@ pub struct ComposerPanel {
     /// The track a recorded row plays. `None` falls back to the first track
     /// there is, which is what an empty registry and a fresh panel both mean.
     record_track: Option<u64>,
+    /// The last block copied, ready to be pasted. Not saved with the project: a
+    /// clipboard is part of an editing session, not of the music.
+    clip: Option<Clip>,
+    /// How many copies “Clone” makes at once. A section is nearly always wanted
+    /// four times rather than twice, and a repeat that takes one press is the
+    /// difference between writing the arrangement and typing it.
+    clone_times: u8,
 }
 
 impl ComposerPanel {
@@ -635,6 +900,8 @@ impl ComposerPanel {
             recording: None,
             round_units: record::DEFAULT_ROUND_UNITS,
             record_track: None,
+            clip: None,
+            clone_times: 1,
         }
     }
 
@@ -680,6 +947,253 @@ impl ComposerPanel {
     /// End of the composition in units — the longest row.
     fn end_units(&self) -> i64 {
         self.rows.iter().map(Row::end_units).max().unwrap_or(0)
+    }
+
+    // ── Blocks ────────────────────────────────────────────────────────────
+    //
+    // A block is a stretch of frames selected across any number of rows at
+    // once, and the reason it exists is that music repeats: a chorus, a bar of
+    // drums, a two-bar figure played by three tracks together. Written frame by
+    // frame, the second time round costs as much as the first, and the copy
+    // drifts out of step with the original the moment one row is a 1/16 short.
+    // Copying whole blocks makes the repeat one press, and pins the alignment
+    // to arithmetic rather than to counting boxes by eye.
+
+    /// The selected block, resolved — `None` when nothing is selected anywhere.
+    fn block(&self) -> Option<Block> {
+        let mut rows = Vec::new();
+        let (mut from, mut to) = (i64::MAX, i64::MIN);
+        for (idx, row) in self.rows.iter().enumerate() {
+            let Some((first, last)) = row.sel_range() else {
+                continue;
+            };
+            let starts = row.starts();
+            from = from.min(starts[first]);
+            to = to.max(starts[last] + row.items[last].total_units());
+            rows.push(BlockRow { idx, first, last });
+        }
+        (!rows.is_empty()).then_some(Block { rows, from, to })
+    }
+
+    /// Select every frame in every row — the whole composition as one block.
+    fn select_all(&mut self) {
+        let mut rows = 0;
+        for row in &mut self.rows {
+            match row.items.len() {
+                0 => row.sel = None,
+                n => {
+                    row.select_range(0, n - 1);
+                    rows += 1;
+                }
+            }
+        }
+        self.status = match rows {
+            0 => "Nothing to select — the rows are empty.".to_string(),
+            n => format!("Selected everything on {n} row(s)."),
+        };
+    }
+
+    fn clear_block(&mut self) {
+        for row in &mut self.rows {
+            row.sel = None;
+        }
+        self.status = "Selection cleared.".to_string();
+    }
+
+    /// Take the block's stretch of time out of **every** row: each row's notes
+    /// that begin inside the window join the block.
+    ///
+    /// This is what makes a natural block one press. Mark a phrase on the row
+    /// you can hear it in — the melody, the drums — and the same stretch of the
+    /// arrangement, on every other track, comes with it. What the ear calls a
+    /// section is a stretch of time, not a count of frames, and no two rows
+    /// spend it on the same number of notes.
+    ///
+    /// The window can only grow: a row joining the block with a note that rings
+    /// on past the end of it puts that end further out, so pressing this again
+    /// may take in a little more. That is the same rule read twice, not a
+    /// different one — and it is why the button says what the block spans.
+    fn span_rows(&mut self) {
+        let Some(block) = self.block() else {
+            self.status = NO_BLOCK.to_string();
+            return;
+        };
+        let (from, to) = (block.from, block.to);
+        let mut rows = 0;
+        let mut frames = 0;
+        for row in &mut self.rows {
+            let starts = row.starts();
+            let inside = |s: &i64| *s >= from && *s < to;
+            match (starts.iter().position(inside), starts.iter().rposition(inside)) {
+                (Some(a), Some(b)) => {
+                    row.select_range(a, b);
+                    rows += 1;
+                    frames += b - a + 1;
+                }
+                _ => row.sel = None,
+            }
+        }
+        self.status =
+            format!("Block spans {rows} row(s), {frames} frame(s) — {} of music.", span_label(to - from));
+    }
+
+    /// Hold the block for pasting. The frames are copied with the silence in
+    /// front of them, per row, so what goes back keeps the shape that was taken.
+    fn copy_block(&mut self) {
+        let Some(block) = self.block() else {
+            self.status = NO_BLOCK.to_string();
+            return;
+        };
+        let rows: Vec<ClipRow> = block
+            .rows
+            .iter()
+            .map(|br| {
+                let row = &self.rows[br.idx];
+                let starts = row.starts();
+                ClipRow {
+                    row_id: row.id,
+                    lead: starts[br.first] - block.from,
+                    items: row.items[br.first..=br.last].to_vec(),
+                }
+            })
+            .collect();
+        let clip = Clip { window: block.window(), rows };
+        self.status = format!(
+            "Copied {} frame(s) from {} row(s) — {} of music.",
+            clip.frames(),
+            clip.rows.len(),
+            span_label(clip.window)
+        );
+        self.clip = Some(clip);
+    }
+
+    /// Put the clipboard back at the end of the composition, on the rows it came
+    /// from and all of them at once.
+    ///
+    /// The paste point is the end of the **longest** row, not of each row: rows
+    /// are played from zero together, so pasting each one at its own end would
+    /// take a block that sounded together and deal it out as an echo. Every row
+    /// is padded up to that point, plus the silence the block was copied with in
+    /// front of it.
+    ///
+    /// A row that has since been removed is reported rather than guessed at: the
+    /// frames on it name a pitch, a length and a place in a file that mean what
+    /// they mean on the track they were written for.
+    fn paste_block(&mut self) {
+        let Some(clip) = self.clip.clone() else {
+            self.status = "Nothing copied yet — select a block and press Copy.".to_string();
+            return;
+        };
+        let at = self.end_units();
+        let (mut rows, mut frames, mut gone) = (0, 0, 0);
+        for crow in &clip.rows {
+            if crow.items.is_empty() {
+                continue;
+            }
+            let Some(row) = self.rows.iter_mut().find(|r| r.id == crow.row_id) else {
+                gone += 1;
+                continue;
+            };
+            // Never negative: `at` is the end of the longest row.
+            let pad = (at + crow.lead - row.end_units()).max(0);
+            let pitch = crow.items[0].pitch;
+            let mut out: Vec<Item> = Vec::new();
+            let extra = {
+                let space = match row.items.last_mut() {
+                    Some(last) => &mut last.space,
+                    // An empty row has no frame to put the silence in — and its
+                    // lead space *is* that silence, by definition.
+                    None => &mut row.lead,
+                };
+                add_gap(space, pad)
+            };
+            for d in extra {
+                let id = row.take_item_id();
+                out.push(spacer(id, pitch, d));
+            }
+            for item in &crow.items {
+                let id = row.take_item_id();
+                out.push(Item { id, ..*item });
+            }
+            let end = row.items.len() + out.len();
+            row.items.extend(out);
+            // The block moves onto what was just pasted, which is what a second
+            // press of Clone or Paste is nearly always meant to work on.
+            row.select_range(end - crow.items.len(), end - 1);
+            rows += 1;
+            frames += crow.items.len();
+        }
+        self.status = match gone {
+            0 => format!("Pasted {frames} frame(s) onto {rows} row(s) at the end of the composition."),
+            n => format!(
+                "Pasted {frames} frame(s) onto {rows} row(s) — {n} row(s) the block was \
+                 copied from are gone."
+            ),
+        };
+    }
+
+    /// Repeat the block `times` over, in place: each copy lands directly behind
+    /// the one before it, on every row at once, and whatever followed moves
+    /// along by exactly as much on every row.
+    ///
+    /// The arithmetic is the whole point. A copy occupies the block's **window**
+    /// — not the frames' own extent — so the silence a row leaves at the front
+    /// of the window and the silence it leaves at the end are put back between
+    /// one copy and the next. Every row therefore advances by the same amount
+    /// per repeat, and a figure that sounded together on the first pass sounds
+    /// together on the fourth.
+    ///
+    /// The selection moves onto the last copy made, so pressing Clone again
+    /// repeats the repeat: the copy is measured the same as its original, which
+    /// a selection left on the original — whose trailing space now carries the
+    /// gap to the copy — would not be.
+    fn clone_block(&mut self, times: u8) {
+        let Some(block) = self.block() else {
+            self.status = NO_BLOCK.to_string();
+            return;
+        };
+        // The select box never offers it, and a repeat of nothing is nothing.
+        if times == 0 {
+            return;
+        }
+        let (window, frames, rows) = (block.window(), block.frames(), block.rows.len());
+        for br in &block.rows {
+            let row = &mut self.rows[br.idx];
+            let starts = row.starts();
+            let lead = starts[br.first] - block.from;
+            let tail = block.to - (starts[br.last] + row.items[br.last].total_units());
+            // What separates one copy from the next on this row: what it leaves
+            // at the end of the window plus what it leaves at the start of it.
+            let gap = lead + tail;
+            let source: Vec<Item> = row.items[br.first..=br.last].to_vec();
+            let pitch = source[0].pitch;
+            let mut out: Vec<Item> = Vec::new();
+            for _ in 0..times {
+                let extra = {
+                    let space = match out.last_mut() {
+                        Some(last) => &mut last.space,
+                        None => &mut row.items[br.last].space,
+                    };
+                    add_gap(space, gap)
+                };
+                for d in extra {
+                    let id = row.take_item_id();
+                    out.push(spacer(id, pitch, d));
+                }
+                for item in &source {
+                    let id = row.take_item_id();
+                    out.push(Item { id, ..*item });
+                }
+            }
+            let at = br.last + 1;
+            let end = at + out.len();
+            row.items.splice(at..at, out);
+            row.select_range(end - source.len(), end - 1);
+        }
+        self.status = format!(
+            "Cloned {frames} frame(s) on {rows} row(s), ×{times} — {} of music each time.",
+            span_label(window)
+        );
     }
 
     /// Every row that has something to play, resolved to seconds. A row with no
@@ -1133,6 +1647,8 @@ impl ComposerPanel {
 
         if !self.rows.is_empty() {
             ui.add_space(6.0);
+            self.block_ui(ui);
+            ui.add_space(4.0);
             self.lanes_ui(ui, &tracks);
         }
 
@@ -1337,6 +1853,138 @@ impl ComposerPanel {
 
     /// One strip per row: the head on the left, the chain of frames scrolling on
     /// the right.
+    /// The block bar — what is selected across the rows, and everything that can
+    /// be done to it.
+    ///
+    /// It sits above the lanes rather than in each row's head because a block is
+    /// the one thing in this panel that is *not* a property of one row: it is
+    /// one selection spanning as many rows as were clicked, and the operations
+    /// on it act on all of them at once.
+    fn block_ui(&mut self, ui: &mut egui::Ui) {
+        // Resolved once, before the buttons borrow the panel: it is what tells
+        // them whether there is anything to act on, and what the bar reports.
+        let block = self.block();
+        let has = block.is_some();
+        let (rows, frames, window) = match &block {
+            Some(b) => (b.rows.len(), b.frames(), b.window()),
+            None => (0, 0, 0),
+        };
+        let clip = self
+            .clip
+            .as_ref()
+            .map(|c| format!("clipboard: {} frame(s), {}", c.frames(), span_label(c.window)));
+        let mut clone_now = false;
+        egui::Frame::new()
+            .fill(egui::Color32::from_gray(26))
+            .inner_margin(egui::Margin::same(6))
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Block").strong().color(SEL_STROKE));
+                    if ui
+                        .button("▣ All")
+                        .on_hover_text("Select every frame in every row")
+                        .clicked()
+                    {
+                        self.select_all();
+                    }
+                    if ui
+                        .add_enabled(has, egui::Button::new("↔ Span Rows"))
+                        .on_hover_text(
+                            "Take the same stretch of time out of every row.\n\n\
+                             Mark a phrase on the row you can hear it in and press this: \
+                             every note that begins inside it, on every other track, \
+                             joins the block. A section is a stretch of time, not a count \
+                             of frames — no two rows spend it on the same number of notes.",
+                        )
+                        .clicked()
+                    {
+                        self.span_rows();
+                    }
+                    if ui
+                        .add_enabled(has, egui::Button::new("✖ Clear"))
+                        .on_hover_text("Select nothing")
+                        .clicked()
+                    {
+                        self.clear_block();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(has, egui::Button::new("🗐 Copy"))
+                        .on_hover_text(
+                            "Hold the block, with the silence in front of each row's part \
+                             of it, so what is pasted keeps the shape that was taken",
+                        )
+                        .clicked()
+                    {
+                        self.copy_block();
+                    }
+                    if ui
+                        .add_enabled(clip.is_some(), egui::Button::new("📋 Paste at End"))
+                        .on_hover_text(
+                            "Put the copied block back at the end of the composition, on \
+                             the rows it came from and all of them at once.\n\n\
+                             Every row is padded up to the end of the longest one, so a \
+                             block that sounded together is pasted sounding together.",
+                        )
+                        .clicked()
+                    {
+                        self.paste_block();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(has, egui::Button::new("🔁 Clone"))
+                        .on_hover_text(
+                            "Repeat the block in place — each copy directly behind the \
+                             last, on every row at once, with everything that followed \
+                             moved along by the same amount on every row.\n\n\
+                             A copy takes exactly as long as the block's window, so the \
+                             tracks stay in step however many times it is pressed. The \
+                             selection moves onto the copy, so pressing it again repeats \
+                             the repeat.",
+                        )
+                        .clicked()
+                    {
+                        clone_now = true;
+                    }
+                    egui::ComboBox::from_id_salt("clone_times")
+                        .width(64.0)
+                        .selected_text(format!("× {}", self.clone_times))
+                        .show_ui(ui, |ui| {
+                            for n in 1..=MAX_NUM {
+                                ui.selectable_value(&mut self.clone_times, n, format!("× {n}"));
+                            }
+                        })
+                        .response
+                        .on_hover_text("How many copies one press of Clone makes");
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(if has {
+                            format!(
+                                "{frames} frame(s) on {rows} row(s) · {}",
+                                span_label(window)
+                            )
+                        } else {
+                            "nothing selected — press ☐ on a note frame".to_string()
+                        })
+                        .color(if has {
+                            SEL_STROKE
+                        } else {
+                            egui::Color32::from_gray(140)
+                        }),
+                    );
+                    if let Some(clip) = clip {
+                        ui.separator();
+                        ui.label(egui::RichText::new(clip).color(egui::Color32::from_gray(150)));
+                    }
+                });
+            });
+        // Outside the closure: cloning rewrites the rows the bar was drawn from.
+        if clone_now {
+            self.clone_block(self.clone_times);
+        }
+    }
+
     fn lanes_ui(&mut self, ui: &mut egui::Ui, tracks: &[(u64, String)]) {
         let mut remove_row: Option<usize> = None;
         let playhead = self.playhead_units();
@@ -1529,6 +2177,10 @@ impl ComposerPanel {
         let follow = row.autoscroll && playhead.is_some();
         // Deferred: removing a frame rewrites the list this loop walks.
         let mut pending_delete: Option<usize> = None;
+        // Likewise the block: the row's selection is read for every frame in
+        // the loop, so a click changes it once the row has been drawn.
+        let mut pending_select: Option<(u64, bool)> = None;
+        let sel = row.sel_range();
         // Taken before the frames are drawn, so an edit made in one frame moves
         // the ones behind it only on the next pass — never mid-loop.
         let starts = row.starts();
@@ -1552,11 +2204,13 @@ impl ComposerPanel {
                     LEAD_SPACE_ID,
                     Frame::Space,
                     &mut row.lead,
-                    false,
-                    percussion,
+                    // The lead belongs to the row, not to an item: there is no
+                    // block it could be part of, and nothing sounds in it.
+                    FrameState { sounding: false, percussion, selected: false },
                 );
             }
             for (idx, (item, start)) in row.items.iter_mut().zip(starts).enumerate() {
+                let selected = sel.is_some_and(|(a, b)| idx >= a && idx <= b);
                 let sounding = playhead
                     .is_some_and(|p| p >= start as f64 && p < (start + item.dur.units()) as f64);
                 // A wav row's note has no pitch to pick: the file plays at the
@@ -1575,11 +2229,13 @@ impl ComposerPanel {
                         None => Frame::Note(&mut item.pitch),
                     },
                     &mut item.dur,
-                    sounding,
-                    percussion,
+                    FrameState { sounding, percussion, selected },
                 );
                 if note.deleted {
                     pending_delete = Some(idx);
+                }
+                if let Some(extend) = note.select {
+                    pending_select = Some((item.id, extend));
                 }
                 // Centred, not merely "into view": a frame scrolled to the edge
                 // is one the next note leaves again immediately, and centring
@@ -1595,12 +2251,16 @@ impl ComposerPanel {
                     item.id,
                     Frame::Space,
                     &mut item.space,
-                    false,
-                    percussion,
+                    // A space is never *sounding* — it is the silence — but it
+                    // is in the block whenever its note is: they are one item.
+                    FrameState { sounding: false, percussion, selected },
                 );
             }
         });
 
+        if let Some((id, extend)) = pending_select {
+            row.select_item(id, extend);
+        }
         if let Some(idx) = pending_delete {
             row.delete_item(idx);
         }
@@ -1622,9 +2282,9 @@ impl ComposerPanel {
         id: u64,
         kind: Frame<'_>,
         dur: &mut Duration,
-        sounding: bool,
-        percussion: bool,
+        state: FrameState,
     ) -> FrameOut {
+        let FrameState { sounding, percussion, selected } = state;
         let space = matches!(kind, Frame::Space);
         let (fill, stroke, header) = match (space, sounding) {
             (true, _) => (
@@ -1644,7 +2304,22 @@ impl ComposerPanel {
             ),
         };
 
+        // In the block: the same card, lit, and ringed so the block reads as one
+        // shape across the rows. A frame that is *sounding* keeps the
+        // playhead's colours — where the transport is beats what is selected,
+        // and the border says the rest.
+        let (fill, stroke, stroke_w) = match (selected, sounding) {
+            (false, _) => (fill, stroke, 1.0),
+            (true, true) => (fill, SEL_STROKE, 2.0),
+            (true, false) => (
+                if space { SPACE_SEL_FILL } else { NOTE_SEL_FILL },
+                SEL_STROKE,
+                2.0,
+            ),
+        };
+
         let mut deleted = false;
+        let mut select = None;
         let card_w = kind.width();
         let placed = ui.allocate_ui_with_layout(
             egui::vec2(card_w, CARD_H),
@@ -1652,7 +2327,7 @@ impl ComposerPanel {
             |ui| {
                 egui::Frame::new()
                     .fill(fill)
-                    .stroke(egui::Stroke::new(1.0, stroke))
+                    .stroke(egui::Stroke::new(stroke_w, stroke))
                     .corner_radius(4.0)
                     .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
@@ -1668,6 +2343,30 @@ impl ComposerPanel {
                         // truncates instead of pushing the card wider than its
                         // neighbours.
                         ui.horizontal(|ui| {
+                            // The block's handle, on the left of the header: a
+                            // note *and its space* are one item, so the box is
+                            // on the note and the space follows it in and out
+                            // of the block — the same rule the delete button
+                            // already follows.
+                            if !space
+                                && ui
+                                    .add(
+                                        egui::Button::new(if selected { "☑" } else { "☐" })
+                                            .small()
+                                            .frame(false),
+                                    )
+                                    .on_hover_text(
+                                        "Select this frame into the block.\n\n\
+                                         Shift-click another frame on the row to take \
+                                         everything between them; click this one again to \
+                                         drop the block. Rows are selected independently, \
+                                         so a block can span as many as you like — or \
+                                         mark one row and press “↔ Span Rows”.",
+                                    )
+                                    .clicked()
+                            {
+                                select = Some(ui.input(|i| i.modifiers.shift));
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -1859,6 +2558,7 @@ impl ComposerPanel {
         );
         FrameOut {
             deleted,
+            select,
             rect: placed.response.rect,
         }
     }
@@ -2085,9 +2785,25 @@ impl Frame<'_> {
     }
 }
 
+/// What a frame is besides its length — the three things it is drawn against,
+/// travelling together because three bare `bool`s at a call site say nothing
+/// about which is which.
+#[derive(Clone, Copy)]
+struct FrameState {
+    /// The transport is inside this note.
+    sounding: bool,
+    /// Its row plays a drum kit, so its pitches are named after drums.
+    percussion: bool,
+    /// It is in the selected block.
+    selected: bool,
+}
+
 struct FrameOut {
     /// Its delete button was pressed.
     deleted: bool,
+    /// Its select box was pressed, and whether shift was down — which extends
+    /// the block onto this frame instead of starting a new one.
+    select: Option<bool>,
     /// Where it landed, so a lane that follows the transport can scroll the
     /// sounding frame into the middle of itself.
     rect: egui::Rect,
@@ -2133,6 +2849,41 @@ mod tests {
     /// Shorthand for a length with no whole-note part.
     const fn frac(f: Fraction) -> Duration {
         Duration::new(0, f)
+    }
+
+    /// A panel of several rows, each with its own id — which is what a paste
+    /// looks a row up by.
+    fn panel_with_rows(rows: &[&[(u8, Duration, Duration)]]) -> ComposerPanel {
+        let mut panel = ComposerPanel::new(TrackRegistry::default(), crate::midi::new_midi_taps());
+        for items in rows {
+            let id = panel.next_row_id;
+            panel.next_row_id += 1;
+            let mut row = row_with(items);
+            row.id = id;
+            panel.rows.push(row);
+        }
+        panel
+    }
+
+    /// Where each row's notes start, in units — spacer frames, which have no
+    /// length, left out. What every block edit is measured by: two rows are in
+    /// step exactly to the extent that these agree.
+    fn note_starts(panel: &ComposerPanel) -> Vec<Vec<i64>> {
+        panel
+            .rows
+            .iter()
+            .map(|row| {
+                let mut at = row.lead_units();
+                let mut out = Vec::new();
+                for item in &row.items {
+                    if item.dur.units() > 0 {
+                        out.push(at);
+                    }
+                    at += item.total_units();
+                }
+                out
+            })
+            .collect()
     }
 
     /// A panel with one row of `items`, playing track `track`.
@@ -3330,5 +4081,274 @@ mod tests {
         assert_ne!(panel.rows[0].id, panel.rows[1].id);
         // And only rows with autosave on ask for a fresh grid.
         assert_eq!(panel.autosave_track_ids(), vec![ids[0]]);
+    }
+
+    /// A block is built by clicking frames: one click starts it, shift-click
+    /// takes everything up to another frame, and the same click on the same
+    /// frame ends it. Rows are independent, because a block that spans rows is
+    /// exactly what this is for.
+    #[test]
+    fn a_block_is_clicked_open_and_clicked_shut() {
+        let mut row = row_with(&[
+            (60, frac(Fraction::Quarter), frac(Fraction::None)),
+            (62, frac(Fraction::Quarter), frac(Fraction::None)),
+            (64, frac(Fraction::Quarter), frac(Fraction::None)),
+        ]);
+        let ids: Vec<u64> = row.items.iter().map(|i| i.id).collect();
+
+        row.select_item(ids[1], false);
+        assert_eq!(row.sel_range(), Some((1, 1)), "a plain click selects one frame");
+
+        row.select_item(ids[1], false);
+        assert_eq!(row.sel_range(), None, "the same click again drops the block");
+
+        row.select_item(ids[2], false);
+        row.select_item(ids[0], true);
+        assert_eq!(
+            row.sel_range(),
+            Some((0, 2)),
+            "shift takes everything between the anchor and the frame clicked, \
+             whichever way round they are"
+        );
+
+        // The ends are ids, so a frame deleted in front of the block does not
+        // slide the block onto other notes.
+        row.select_item(ids[1], false);
+        row.select_item(ids[2], true);
+        row.delete_item(0);
+        assert_eq!(row.sel_range(), Some((0, 1)), "the same two frames, one place earlier");
+
+        // …and a frame deleted *from* the block takes the block with it, rather
+        // than leaving a range pointing at nothing.
+        row.delete_item(1);
+        assert_eq!(row.sel, None);
+    }
+
+    /// "Span Rows" is what makes a natural block one press: mark a phrase on
+    /// the row you can hear it in, and the same *stretch of time* comes out of
+    /// every other row — however many frames each of them spends on it.
+    #[test]
+    fn spanning_the_rows_takes_the_same_stretch_of_time_out_of_each() {
+        let quarter = (60, frac(Fraction::Quarter), frac(Fraction::None));
+        let eighth = (48, frac(Fraction::Eighth), frac(Fraction::None));
+        let mut panel = panel_with_rows(&[&[quarter; 4], &[eighth; 8]]);
+
+        // The second and third quarter on the top row: 1/4 up to 3/4.
+        panel.rows[0].select_range(1, 2);
+        panel.span_rows();
+
+        assert_eq!(panel.rows[0].sel_range(), Some((1, 2)), "the row it was marked on is unchanged");
+        assert_eq!(
+            panel.rows[1].sel_range(),
+            Some((2, 5)),
+            "four eighths cover the same stretch as two quarters"
+        );
+        let block = panel.block().expect("a block");
+        assert_eq!((block.from, block.to), (QUARTER, 3 * QUARTER));
+        assert_eq!(block.frames(), 6);
+    }
+
+    /// The point of a block: cloning it repeats every row by **the same amount
+    /// of time**, so what sounded together on the first pass sounds together on
+    /// the fourth. Rows spend a window on different numbers of frames and leave
+    /// different amounts of silence at either end of it; the copy occupies the
+    /// window, not the frames.
+    #[test]
+    fn a_clone_moves_every_row_on_by_the_same_stretch_of_time() {
+        // A row that comes in an eighth late, against one that starts at zero
+        // and stops an eighth early — so both ends of the window are silence on
+        // one row or the other.
+        let mut panel = panel_with_rows(&[
+            &[(60, frac(Fraction::Quarter), frac(Fraction::None))],
+            &[(36, frac(Fraction::Eighth), frac(Fraction::Eighth))],
+        ]);
+        panel.rows[0].lead = frac(Fraction::Eighth);
+        panel.select_all();
+
+        let block = panel.block().expect("a block");
+        assert_eq!((block.from, block.to), (0, 3 * EIGHTH), "the window is what the rows span");
+
+        let before = note_starts(&panel);
+        assert_eq!(before, vec![vec![EIGHTH], vec![0]]);
+
+        panel.clone_block(2);
+
+        let window = 3 * EIGHTH;
+        assert_eq!(
+            note_starts(&panel),
+            vec![
+                vec![EIGHTH, EIGHTH + window, EIGHTH + 2 * window],
+                vec![0, window, 2 * window],
+            ],
+            "each copy lands exactly one window on, on both rows"
+        );
+        // Nothing was invented: the copies are the frames that were selected.
+        assert_eq!(panel.rows[0].items.len(), 3);
+        assert!(panel.rows[0].items.iter().all(|i| i.pitch == 60));
+        assert!(panel.rows[1].items.iter().all(|i| i.pitch == 36));
+    }
+
+    /// Clone is pressed twice as often as it is pressed once, so the second
+    /// press has to mean the same as the first. It does because the selection
+    /// moves onto the copy: the *original's* trailing space now carries the gap
+    /// to that copy, and measuring the block from there would grow the window
+    /// every time.
+    #[test]
+    fn cloning_the_clone_repeats_the_same_stretch_again() {
+        let mut panel = panel_with_rows(&[
+            &[(60, frac(Fraction::Quarter), frac(Fraction::None))],
+            &[(36, frac(Fraction::Eighth), frac(Fraction::Eighth))],
+        ]);
+        panel.rows[0].lead = frac(Fraction::Eighth);
+        panel.select_all();
+        let window = 3 * EIGHTH;
+
+        panel.clone_block(1);
+        assert_eq!(panel.block().expect("a block").window(), window, "the copy measures the same");
+        panel.clone_block(1);
+
+        assert_eq!(
+            note_starts(&panel),
+            vec![
+                vec![EIGHTH, EIGHTH + window, EIGHTH + 2 * window],
+                vec![0, window, 2 * window],
+            ],
+        );
+    }
+
+    /// A gap between copies is arithmetic, not a length anyone picked, so it is
+    /// not always a length the three select boxes can name — `255/256` needs
+    /// 255 of the smallest fraction there is. It still has to land *exactly*,
+    /// because a rounded gap is a copy that drifts further out of step with
+    /// every repeat, so what will not fit in one frame is laid out over frames
+    /// of no length: silence, which is what a gap is.
+    #[test]
+    fn a_gap_no_length_box_can_name_is_still_exact() {
+        assert_eq!(Duration::exact(255), None, "no fraction divides 255 units few enough times");
+        assert_eq!(Duration::split(255).iter().map(|d| d.units()).sum::<i64>(), 255);
+        assert_eq!(
+            Duration::exact(UNITS_PER_WHOLE + 3 * EIGHTH),
+            Some(Duration::with_num(1, 3, Fraction::Eighth)),
+            "and a length that can be named is named the plainest way"
+        );
+
+        // A whole note against a single 1/256: the short row has 255 units of
+        // window to make up between one copy and the next.
+        let mut panel = panel_with_rows(&[
+            &[(60, Duration::new(1, Fraction::None), frac(Fraction::None))],
+            &[(36, frac(Fraction::TwoHundredFiftySixth), frac(Fraction::None))],
+        ]);
+        panel.select_all();
+        panel.clone_block(2);
+
+        let w = UNITS_PER_WHOLE;
+        assert_eq!(
+            note_starts(&panel),
+            vec![vec![0, w, 2 * w], vec![0, w, 2 * w]],
+            "the odd gap is spread over placeholder frames rather than rounded away"
+        );
+        // The frames it was spread over are silences: they play nothing.
+        let spu = panel.secs_per_unit();
+        assert_eq!(panel.rows[1].planned_notes(spu).len(), 3);
+    }
+
+    /// Paste puts the block back at the end of the **longest** row, not at the
+    /// end of each row: rows are played from zero together, so a block pasted
+    /// row by row would be dealt out as an echo of itself.
+    #[test]
+    fn a_pasted_block_lands_at_the_end_of_the_composition_on_every_row_at_once() {
+        let mut panel = panel_with_rows(&[
+            &[(60, frac(Fraction::Quarter), frac(Fraction::None))],
+            &[(36, frac(Fraction::Eighth), frac(Fraction::None))],
+        ]);
+        panel.select_all();
+        panel.copy_block();
+        panel.clear_block();
+        panel.paste_block();
+
+        assert_eq!(
+            note_starts(&panel),
+            vec![vec![0, QUARTER], vec![0, QUARTER]],
+            "the short row is padded up to the paste point rather than closing the gap"
+        );
+        // The block follows what was pasted, so a second paste carries on.
+        assert_eq!(panel.rows[0].sel_range(), Some((1, 1)));
+        assert_eq!(panel.rows[1].sel_range(), Some((1, 1)));
+
+        panel.paste_block();
+        assert_eq!(note_starts(&panel), vec![vec![0, QUARTER, 2 * QUARTER], vec![0, QUARTER, 2 * QUARTER]]);
+    }
+
+    /// A block copied off a row that has since been removed is not quietly
+    /// pasted somewhere else: the frames name a pitch, a length and a place in
+    /// a file that mean what they mean on the track they were written for.
+    #[test]
+    fn a_paste_says_when_the_row_it_was_copied_from_is_gone() {
+        let mut panel = panel_with_rows(&[
+            &[(60, frac(Fraction::Quarter), frac(Fraction::None))],
+            &[(36, frac(Fraction::Eighth), frac(Fraction::None))],
+        ]);
+        panel.select_all();
+        panel.copy_block();
+        panel.rows.remove(1);
+        panel.paste_block();
+
+        assert_eq!(panel.rows.len(), 1);
+        assert_eq!(note_starts(&panel), vec![vec![0, QUARTER]]);
+        assert!(panel.status.contains("gone"), "the status says so: {}", panel.status);
+    }
+
+    /// The block is visible: the frames in it are lit and ringed, the note
+    /// frames carry the box that put them there, and the bar above the lanes
+    /// says what is selected — a block spans rows, so it cannot be read off any
+    /// one row's head.
+    #[test]
+    fn the_block_bar_and_the_lit_frames_say_what_is_selected() {
+        let mut panel = panel_with_rows(&[&[
+            (60, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+            (62, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+        ]]);
+        panel.rows[0].select_range(0, 0);
+
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+        });
+        let (mut texts, mut fills) = (Vec::new(), Vec::new());
+        fn walk(sh: &egui::Shape, texts: &mut Vec<String>, fills: &mut Vec<egui::Color32>) {
+            match sh {
+                egui::Shape::Text(t) => texts.push(t.galley.text().to_string()),
+                egui::Shape::Rect(r) if CARD_FILLS.contains(&r.fill) => fills.push(r.fill),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, texts, fills)),
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut texts, &mut fills);
+        }
+
+        // One note and its space are one item, so both of the selected item's
+        // frames are lit — and nothing else is.
+        assert_eq!(
+            fills.iter().filter(|f| **f == NOTE_SEL_FILL).count(),
+            1,
+            "the selected note is not lit: {fills:?}"
+        );
+        assert_eq!(
+            fills.iter().filter(|f| **f == SPACE_SEL_FILL).count(),
+            1,
+            "the space tied to it did not follow it into the block: {fills:?}"
+        );
+        // A select box on each note frame, filled on the one in the block.
+        assert_eq!(texts.iter().filter(|t| *t == "☑").count(), 1);
+        assert_eq!(texts.iter().filter(|t| *t == "☐").count(), 1);
+        // And the bar, which is the only place a block that spans rows can be
+        // read at all.
+        assert!(
+            texts.iter().any(|t| t.contains("1 frame(s) on 1 row(s)")),
+            "the block bar does not say what is selected: {texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "↔ Span Rows"), "{texts:?}");
     }
 }
