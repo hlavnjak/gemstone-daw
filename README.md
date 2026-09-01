@@ -46,6 +46,17 @@ published there as a wav track — and any number of rows may share the same one
   The select box at the head of a row picks its Track, and follows the track
   list: delete the track a row is playing and the row moves to another one, or
   to a placeholder while no tracks exist.
+- **Enabled — a lane that is silent, not gone.** Every row carries an
+  **Enabled** box, ticked on every new row. Untick it and the row is left out of
+  the transport and out of an exported wav, while everything on it stays exactly
+  where it is: the notes, the block, the track it plays, the length it gives the
+  composition. That is how a part is heard without the two rows drowning it, and
+  how they come back afterwards — deleting the rows and building them again is
+  the alternative, and it loses the work. **Enable all**, beside "➕ Add Track
+  Row", is the same switch for every row at once: it is unticked while any row
+  is off, and a click makes them all agree with it. The setting is saved with
+  the project; a project written before it existed loads with every row playing,
+  which is what those rows did.
 - **A row is a sequence of frames**, laid left to right and simply played one
   after another: nothing is positioned by hand, nothing is dragged, and nothing
   can overlap. Deleting a frame pulls everything behind it forward.
@@ -118,9 +129,10 @@ published there as a wav track — and any number of rows may share the same one
   pass in flight the last one.
 - **A loop follows your edits.** While Repeat is on, changing notes — pitch,
   length, adding or deleting them — or a row's gain or the tempo is picked up at
-  the next time round, without stopping. Adding a row or pointing one at another
-  track is the exception: that needs a plugin loaded, which cannot happen while
-  the audio callback is running, so the panel says to press Play again.
+  the next time round, without stopping. Adding a row, pointing one at another
+  track, or switching one off is the exception: each changes which plugins are
+  loaded, which cannot happen while the audio callback is running, so the panel
+  says to press Play again.
 - **Play / Stop** at the foot of the section renders the whole arrangement in
   real time, lighting up the frame each row is sounding as it goes: one output
   stream, one plugin instance per row, mixed with each row's own gain. The

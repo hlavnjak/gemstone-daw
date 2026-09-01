@@ -41,6 +41,7 @@
 //! state = Dexed.vststate
 //! gain = 1
 //! lead = 0 none
+//! enabled = 1
 //! autosave = 1
 //! note = 60 0 1/4 0 3/8
 //! ```
@@ -59,7 +60,11 @@
 //! rather than a silent misreading.
 //!
 //! Unknown keys are skipped, so a field added later loads in an older build
-//! rather than failing. The version line is checked, so a *newer* format is
+//! rather than failing — `enabled`, the newest of them, is exactly that: an
+//! older build ignores the key and plays the row, and a project written before
+//! it existed has no key and reads as `enabled`, which is what a row is.
+//!
+//! The version line is checked, so a *newer* format is
 //! refused with a message instead of being half-read. A *source kind* added
 //! later — `wav` is the most recent — follows the rule the nominator does: a
 //! project that does not use one is unchanged and loads in any build, and one
@@ -143,6 +148,11 @@ pub struct ProjectRow {
     pub source: TrackSource,
     pub gain: f32,
     pub lead: Duration,
+    /// Play this row at all — see [`super::Row::enabled`]. A project written
+    /// before this existed has no such key, and a row from one reads as `true`:
+    /// every row in every older project played, so that is what it must still
+    /// mean.
+    pub enabled: bool,
     /// Re-export this row's grid on every save — see [`super::Row::autosave`].
     pub autosave: bool,
     /// Follow the transport in this lane — see [`super::Row::autoscroll`]. A
@@ -174,6 +184,7 @@ impl Project {
             }
             s += &format!("gain = {}\n", num(row.gain));
             s += &format!("lead = {}\n", write_duration(row.lead));
+            s += &format!("enabled = {}\n", u8::from(row.enabled));
             s += &format!("autosave = {}\n", u8::from(row.autosave));
             s += &format!("autoscroll = {}\n", u8::from(row.autoscroll));
             for item in &row.items {
@@ -219,6 +230,7 @@ impl Project {
                     source: TrackSource::None,
                     gain: 1.0,
                     lead: Duration::new(0, Fraction::None),
+                    enabled: true,
                     autosave: true,
                     autoscroll: true,
                     items: Vec::new(),
@@ -243,6 +255,7 @@ impl Project {
                 }
                 ("gain", Some(row)) => row.gain = value.parse().unwrap_or(1.0),
                 ("lead", Some(row)) => row.lead = read_duration(value)?,
+                ("enabled", Some(row)) => row.enabled = value != "0",
                 ("autosave", Some(row)) => row.autosave = value != "0",
                 ("autoscroll", Some(row)) => row.autoscroll = value != "0",
                 ("note", Some(row)) => row.items.push(read_note(value)?),
@@ -467,6 +480,7 @@ mod tests {
                     source: TrackSource::LeSynth { file: "voice.lsft".to_string() },
                     gain: 0.75,
                     lead: Duration::new(0, Fraction::Eighth),
+                    enabled: true,
                     autosave: true,
                     autoscroll: true,
                     items: vec![
@@ -498,9 +512,10 @@ mod tests {
                     },
                     gain: 1.0,
                     lead: Duration::new(1, Fraction::Sixteenth),
-                    autosave: false,
-                    // Both per-row switches off on this row, so the round trip
+                    // Every per-row switch off on this row, so the round trip
                     // proves each carries rather than that `true` survives.
+                    enabled: false,
+                    autosave: false,
                     autoscroll: false,
                     items: vec![],
                 },
@@ -632,6 +647,7 @@ mod tests {
         let p = Project::parse(text).expect("parses");
         assert!(p.rows[0].autosave, "autosave should default on");
         assert!(p.rows[0].autoscroll, "a lane should follow the transport by default");
+        assert!(p.rows[0].enabled, "a row saved before the switch existed must still play");
     }
 
     /// A field this build does not know must not stop it loading — that is what
@@ -740,6 +756,7 @@ mod folder_tests {
                 source: TrackSource::LeSynth { file: "Voice.lsft".to_string() },
                 gain: 1.0,
                 lead: Duration::new(0, Fraction::None),
+                enabled: true,
                 autosave: true,
                 autoscroll: true,
                 items: vec![],
@@ -777,6 +794,7 @@ mod folder_tests {
                 source: TrackSource::LeSynth { file: "Voice.lsft".to_string() },
                 gain: 1.0,
                 lead: Duration::new(0, Fraction::None),
+                enabled: true,
                 autosave: true,
                 autoscroll: true,
                 items: vec![],

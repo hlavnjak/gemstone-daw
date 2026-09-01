@@ -500,6 +500,18 @@ struct Row {
     /// deleting the first note cannot take it along — it stays at the head and
     /// leads whichever note is first afterwards. Zero by default.
     lead: Duration,
+    /// Play this row. On by default — a row exists to be heard — and off takes
+    /// it out of the transport and out of an export, while leaving everything
+    /// on it exactly where it is: the notes, the block, the track it plays.
+    ///
+    /// This is how a part is listened to without being deleted: mute the two
+    /// rows that are drowning it, hear the one that is not working, put them
+    /// back. Deleting the row and building it again is the alternative, and it
+    /// loses the work.
+    ///
+    /// The lane is still drawn, and still counts towards the length of the
+    /// composition: it is silent, not gone.
+    enabled: bool,
     /// Re-export this row's LeSynth grid into the project folder on every save.
     /// On by default, so a project saved after an edit carries the edit; off
     /// pins whatever `.lsft` is already there.
@@ -540,6 +552,7 @@ impl Row {
             track_id,
             gain: 1.0,
             lead: Duration::new(0, Fraction::None),
+            enabled: true,
             autosave: true,
             autoscroll: true,
             missing: None,
@@ -1224,11 +1237,16 @@ impl ComposerPanel {
     }
 
     /// Every row that has something to play, resolved to seconds. A row with no
-    /// notes, or with no track behind it, simply is not in the composition.
+    /// notes, with no track behind it, or switched off, simply is not in the
+    /// composition — a disabled row costs no plugin instance either, which is
+    /// what makes muting a heavy track worth doing.
     fn build_plans(&self) -> Vec<RowPlan> {
         let spu = self.secs_per_unit();
         let mut plans = Vec::new();
         for row in &self.rows {
+            if !row.enabled {
+                continue;
+            }
             let Some(source) = row.track_id.and_then(|id| self.registry.playback_source(id)) else {
                 continue;
             };
@@ -1253,7 +1271,7 @@ impl ComposerPanel {
         let spu = self.secs_per_unit();
         self.rows
             .iter()
-            .any(|row| row.track_id.is_some() && !row.planned_notes(spu).is_empty())
+            .any(|row| row.enabled && row.track_id.is_some() && !row.planned_notes(spu).is_empty())
     }
 
     /// The composition as the transport would need it *now*. Cheap by design:
@@ -1265,9 +1283,13 @@ impl ComposerPanel {
         let mut shape = Vec::new();
         let mut rows = Vec::new();
         for row in &self.rows {
-            // Same filter as `build_plans`: a row with no track or no notes is
-            // not in the composition, so it is not in the transport either.
-            if row.track_id.is_none() {
+            // Same filter as `build_plans`: a row with no track, no notes, or
+            // switched off is not in the composition, so it is not in the
+            // transport either. Switching one off while a repeat runs therefore
+            // changes the *shape*, and is reported rather than applied — the
+            // row's voice is a loaded plugin, and dropping it is not something
+            // the audio thread can be asked to do mid-loop.
+            if !row.enabled || row.track_id.is_none() {
                 continue;
             }
             let notes = row.planned_notes(spu);
@@ -1658,6 +1680,32 @@ impl ComposerPanel {
             {
                 self.add_row();
             }
+            // One switch for all of them, next to the button that makes them.
+            // It shows what is true — unticked the moment any row is off — and
+            // a click makes every row agree with it, which is how a part is
+            // soloed by hand and how the rest come back afterwards.
+            let mut all = self.rows.iter().all(|r| r.enabled);
+            if ui
+                .add_enabled(
+                    !self.rows.is_empty(),
+                    egui::Checkbox::new(&mut all, "Enable all"),
+                )
+                .on_hover_text(
+                    "Play every row.\n\nUnticked while any row is switched off; \
+                     ticking it turns them all back on, and unticking it silences \
+                     the composition without touching a note of it.",
+                )
+                .changed()
+            {
+                for row in &mut self.rows {
+                    row.enabled = all;
+                }
+                self.status = if all {
+                    "Every row enabled.".to_string()
+                } else {
+                    "Every row switched off — nothing will play.".to_string()
+                };
+            }
             if tracks.is_empty() {
                 ui.add_space(8.0);
                 ui.label(
@@ -1719,6 +1767,7 @@ impl ComposerPanel {
                     },
                     gain: row.gain,
                     lead: row.lead,
+                    enabled: row.enabled,
                     autosave: row.autosave,
                     autoscroll: row.autoscroll,
                     items: row.items.clone(),
@@ -1748,6 +1797,7 @@ impl ComposerPanel {
             let mut row = Row::new(id, track_id);
             row.gain = prow.gain;
             row.lead = prow.lead;
+            row.enabled = prow.enabled;
             row.autosave = prow.autosave;
             row.autoscroll = prow.autoscroll;
             // Nothing to bind means the source is gone. Keep what it was so the
@@ -2140,18 +2190,38 @@ impl ComposerPanel {
                                                  when it was first written.",
                                             );
                                     });
-                                    ui.checkbox(&mut row.autoscroll, "⏵ follow")
-                                        .on_hover_text(
-                                            "While the transport is playing — including \
-                                             a take — keep this lane scrolled to the \
-                                             frame that is sounding, centred.\n\n\
-                                             On by default: a row of any length is wider \
-                                             than the window, so a lane that does not \
-                                             follow shows the first few seconds and \
-                                             nothing of the rest. Turn it off to keep \
-                                             the lane where you put it while you edit \
-                                             one part of a long row as it plays.",
-                                        );
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut row.enabled, "Enabled")
+                                            .on_hover_text(
+                                                "Play this row. On for every new row — \
+                                                 a lane exists to be heard.\n\n\
+                                                 Off takes the row out of the transport \
+                                                 and out of an exported wav, and leaves \
+                                                 everything on it where it is: the \
+                                                 notes, the block, the track it plays. \
+                                                 That is how a part is listened to \
+                                                 without the two rows drowning it, and \
+                                                 how they come back afterwards.\n\n\
+                                                 Switched while a repeat is running, it \
+                                                 takes effect on the next Play: the \
+                                                 row's voice is a loaded plugin, not a \
+                                                 level.",
+                                            );
+                                        ui.checkbox(&mut row.autoscroll, "⏵ follow")
+                                            .on_hover_text(
+                                                "While the transport is playing — \
+                                                 including a take — keep this lane \
+                                                 scrolled to the frame that is \
+                                                 sounding, centred.\n\n\
+                                                 On by default: a row of any length is \
+                                                 wider than the window, so a lane that \
+                                                 does not follow shows the first few \
+                                                 seconds and nothing of the rest. Turn \
+                                                 it off to keep the lane where you put \
+                                                 it while you edit one part of a long \
+                                                 row as it plays.",
+                                            );
+                                    });
                                 },
                             );
 
@@ -4013,6 +4083,7 @@ mod tests {
                 source: project::TrackSource::LeSynth { file: "Voice.lsft".to_string() },
                 gain: 0.5,
                 lead: Duration::new(0, Fraction::Eighth),
+                enabled: true,
                 autosave: false,
                 autoscroll: true,
                 items: vec![Item {
@@ -4054,6 +4125,7 @@ mod tests {
         assert_eq!(panel.rows[0].track_id, Some(ids[0]));
         let fixed = panel.to_project("Song", |_| project::TrackSource::LeSynthDefault);
         assert_eq!(fixed.rows[0].source, project::TrackSource::LeSynthDefault);
+        assert!(fixed.rows[0].enabled, "a row that plays must be saved as one");
     }
 
     /// Loading replaces the composition, and everything on a row that is not the
@@ -4073,6 +4145,10 @@ mod tests {
                     source: project::TrackSource::LeSynthDefault,
                     gain: 1.5,
                     lead: Duration::new(1, Fraction::Sixteenth),
+                    // Switched off in the saved project: a row that was muted
+                    // must come back muted, or a loaded project plays something
+                    // the user had silenced.
+                    enabled: false,
                     autosave: true,
                     autoscroll: true,
                     items: vec![],
@@ -4082,6 +4158,7 @@ mod tests {
                     source: project::TrackSource::LeSynthDefault,
                     gain: 0.25,
                     lead: Duration::new(0, Fraction::None),
+                    enabled: true,
                     autosave: false,
                     autoscroll: true,
                     items: vec![Item {
@@ -4104,6 +4181,8 @@ mod tests {
         assert_eq!(panel.rows[0].gain, 1.5);
         assert_eq!(panel.rows[0].lead, Duration::new(1, Fraction::Sixteenth));
         assert_eq!(panel.rows[1].track_id, Some(ids[1]));
+        assert!(!panel.rows[0].enabled, "a row saved switched off must load switched off");
+        assert!(panel.rows[1].enabled);
         assert!(!panel.rows[1].autosave);
         assert_eq!(panel.rows[1].items[0].pitch, 70);
         // Row ids stay unique, so two rows never share egui widget state.
@@ -4401,6 +4480,139 @@ mod tests {
             "the block bar does not say what is selected: {texts:?}"
         );
         assert!(texts.iter().any(|t| t == "↔ Span Rows"), "{texts:?}");
+    }
+
+    /// A row switched off is silent, not gone: the transport and an export skip
+    /// it, and everything on it — its notes, its place, the length it gives the
+    /// composition — stays exactly where the user left it. Muting a part to
+    /// hear the one under it must cost nothing to undo.
+    #[test]
+    fn a_row_switched_off_plays_nothing_and_loses_nothing() {
+        let mut panel = panel_with_rows(&[
+            &[
+                (60, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+                (62, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+            ],
+            &[(48, Duration::new(1, Fraction::None), frac(Fraction::None))],
+        ]);
+        // A track behind each row, which is the other half of "has something to
+        // play"; the registry is not asked anything here.
+        for row in &mut panel.rows {
+            row.track_id = Some(7);
+            assert!(row.enabled, "a new row plays");
+        }
+        let length = panel.end_units();
+        assert_eq!(panel.live_snapshot().rows.len(), 2);
+
+        panel.rows[1].enabled = false;
+        assert!(panel.has_playable_rows(), "the row still switched on must still play");
+        assert_eq!(
+            panel.live_snapshot().rows.len(),
+            1,
+            "a switched-off row must be out of the transport, not in it at some level"
+        );
+
+        panel.rows[0].enabled = false;
+        assert!(!panel.has_playable_rows(), "nothing is switched on, so nothing plays");
+
+        // Nothing was taken from the rows themselves.
+        assert_eq!(panel.rows[0].items.len(), 2);
+        assert_eq!(panel.rows[1].items.len(), 1);
+        assert_eq!(panel.end_units(), length, "a silent lane is still part of the timeline");
+
+        // And back on, whole.
+        for row in &mut panel.rows {
+            row.enabled = true;
+        }
+        assert_eq!(panel.live_snapshot().rows.len(), 2);
+    }
+
+    /// “Enable all” beside Add Track Row, through the real widget: it reports
+    /// what is true of the rows, and one click carries every row with it. The
+    /// state is derived rather than stored, which is exactly the sort of switch
+    /// that can be drawn correctly and do nothing.
+    #[test]
+    fn enable_all_carries_every_row_and_reports_what_is_true() {
+        let mut panel = panel_with_rows(&[
+            &[(60, frac(Fraction::Quarter), frac(Fraction::Eighth))],
+            &[(62, frac(Fraction::Quarter), frac(Fraction::Eighth))],
+        ]);
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let run = |panel: &mut ComposerPanel, input: egui::RawInput| -> Vec<(String, egui::Pos2)> {
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+            });
+            let mut texts = Vec::new();
+            fn walk(sh: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+                match sh {
+                    egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos)),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+        let click = |at: egui::Pos2| {
+            let mut i = egui::RawInput::default();
+            i.events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            i
+        };
+        let at = |texts: &[(String, egui::Pos2)], label: &str| -> egui::Pos2 {
+            let (_, p) = texts
+                .iter()
+                .find(|(t, _)| t == label)
+                .unwrap_or_else(|| panic!("no {label:?} in {texts:?}"));
+            egui::pos2(p.x + 4.0, p.y + 6.0)
+        };
+
+        let laid = run(&mut panel, egui::RawInput::default());
+        let all = at(&laid, "Enable all");
+
+        // Every row is on, so one click switches the composition off.
+        run(&mut panel, click(all));
+        run(&mut panel, egui::RawInput::default());
+        assert!(
+            panel.rows.iter().all(|r| !r.enabled),
+            "the switch did not reach the rows"
+        );
+
+        // It now reports that, so the next click turns them back on rather than
+        // switching them off again.
+        run(&mut panel, click(all));
+        run(&mut panel, egui::RawInput::default());
+        assert!(
+            panel.rows.iter().all(|r| r.enabled),
+            "the switch did not come back on with the rows"
+        );
+
+        // And it follows the rows, not the other way round: one row off leaves
+        // it unticked, so a click puts that row back with the rest.
+        panel.rows[1].enabled = false;
+        run(&mut panel, egui::RawInput::default());
+        run(&mut panel, click(all));
+        run(&mut panel, egui::RawInput::default());
+        assert!(
+            panel.rows.iter().all(|r| r.enabled),
+            "unticked while a row was off, it must switch every row on"
+        );
     }
 
     /// Two frames must be selectable on one row, through the real widget: a
