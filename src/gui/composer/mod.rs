@@ -615,6 +615,38 @@ impl Row {
         };
     }
 
+    /// Every frame on the row, as one block — what the select box on the row
+    /// head ticks. Clicking the first frame and shift-clicking the last does
+    /// the same thing, but a row of two hundred frames is a scroll to the end
+    /// and back, and a whole row is the commonest block there is: it is what a
+    /// part *is*, and what gets cloned to repeat it.
+    ///
+    /// Rows stay independent, so ticking the box on several rows builds a block
+    /// across all of them — every frame of each — which is the shape a repeat
+    /// of a whole section wants.
+    fn select_all(&mut self) {
+        self.sel = match (self.items.first(), self.items.last()) {
+            (Some(first), Some(last)) => Some((first.id, last.id)),
+            _ => None,
+        };
+    }
+
+    /// Whether the block on this row is the whole of it — what the row's select
+    /// box shows. Derived rather than stored, so clicking frames unticks it on
+    /// its own the moment the block is no longer everything.
+    fn all_selected(&self) -> bool {
+        !self.items.is_empty() && self.sel_range() == Some((0, self.items.len() - 1))
+    }
+
+    /// Where the transport is *for this lane*: nowhere, while the row is
+    /// switched off. A row that is not playing must not be lit up as though it
+    /// were, and must not drag its lane along under the user's hands — see
+    /// [`Row::enabled`]. This is what turns off the sounding frame and, with
+    /// it, the follow: neither has anything to point at.
+    fn lane_playhead(&self, transport: Option<f64>) -> Option<f64> {
+        transport.filter(|_| self.enabled)
+    }
+
     /// Select the run of items `a..=b`, by position. Used by the block
     /// operations, which know where they put the frames they made.
     fn select_range(&mut self, a: usize, b: usize) {
@@ -2086,6 +2118,10 @@ impl ComposerPanel {
 
         for (idx, row) in self.rows.iter_mut().enumerate() {
             let row_id = row.id;
+            // The transport reaches only the lanes that are playing: a row that
+            // is switched off has no sounding frame to light and nothing to
+            // follow, whatever its own boxes say.
+            let row_playhead = row.lane_playhead(playhead);
             ui.push_id(row_id, |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_gray(30))
@@ -2191,6 +2227,35 @@ impl ComposerPanel {
                                             );
                                     });
                                     ui.horizontal(|ui| {
+                                        // Every frame on the row, in one press.
+                                        // Derived from the block, so clicking a
+                                        // frame unticks it by itself.
+                                        let mut all = row.all_selected();
+                                        if ui
+                                            .add_enabled(
+                                                !row.items.is_empty(),
+                                                egui::Checkbox::new(&mut all, "select all"),
+                                            )
+                                            .on_hover_text(
+                                                "Take every frame on this row into the \
+                                                 block — the whole part, however long \
+                                                 it is.\n\n\
+                                                 Rows are selected independently, so \
+                                                 ticking this on several rows blocks \
+                                                 all of them at once, which is what \
+                                                 “⧉ Clone” repeats. Untick it, or click \
+                                                 any frame's ☐, to let the block go.",
+                                            )
+                                            .changed()
+                                        {
+                                            if all {
+                                                row.select_all();
+                                            } else {
+                                                row.sel = None;
+                                            }
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
                                         ui.checkbox(&mut row.enabled, "Enabled")
                                             .on_hover_text(
                                                 "Play this row. On for every new row — \
@@ -2207,7 +2272,10 @@ impl ComposerPanel {
                                                  row's voice is a loaded plugin, not a \
                                                  level.",
                                             );
-                                        ui.checkbox(&mut row.autoscroll, "⏵ follow")
+                                        ui.add_enabled(
+                                            row.enabled,
+                                            egui::Checkbox::new(&mut row.autoscroll, "⏵ follow"),
+                                        )
                                             .on_hover_text(
                                                 "While the transport is playing — \
                                                  including a take — keep this lane \
@@ -2219,7 +2287,11 @@ impl ComposerPanel {
                                                  seconds and nothing of the rest. Turn \
                                                  it off to keep the lane where you put \
                                                  it while you edit one part of a long \
-                                                 row as it plays.",
+                                                 row as it plays.\n\n\
+                                                 A row that is not Enabled is not \
+                                                 playing, so there is nothing to \
+                                                 follow: this is ignored until it is \
+                                                 switched back on.",
                                             );
                                     });
                                 },
@@ -2235,7 +2307,7 @@ impl ComposerPanel {
                                     Self::chain_ui(
                                         ui,
                                         row,
-                                        playhead,
+                                        row_playhead,
                                         percussion[idx],
                                         wav[idx],
                                         spu,
@@ -2268,9 +2340,10 @@ impl ComposerPanel {
         wav: Option<f32>,
         spu: f64,
     ) {
-        // Follow the transport only while there *is* one, and only if this lane
-        // was asked to: scrolling a lane every frame is exactly what stops the
-        // user scrolling it themselves.
+        // Follow the transport only while there *is* one for this lane — a row
+        // that is switched off is handed no playhead at all — and only if the
+        // lane was asked to: scrolling a lane every frame is exactly what stops
+        // the user scrolling it themselves.
         let follow = row.autoscroll && playhead.is_some();
         // Deferred: removing a frame rewrites the list this loop walks.
         let mut pending_delete: Option<usize> = None;
@@ -4525,6 +4598,158 @@ mod tests {
             row.enabled = true;
         }
         assert_eq!(panel.live_snapshot().rows.len(), 2);
+    }
+
+    /// The whole of a row in one press, on as many rows as you like: what the
+    /// select box on the row head is for. A hundred-frame part is a scroll to
+    /// its end and back to block it by hand, and a whole part is the commonest
+    /// block there is — it is what a repeat repeats.
+    #[test]
+    fn selecting_a_whole_row_blocks_every_frame_on_it_across_rows() {
+        let mut panel = panel_with_rows(&[
+            &[
+                (60, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+                (62, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+                (64, frac(Fraction::Quarter), frac(Fraction::None)),
+            ],
+            &[
+                (48, frac(Fraction::Half), frac(Fraction::None)),
+                (48, frac(Fraction::Half), frac(Fraction::None)),
+            ],
+        ]);
+        assert!(!panel.rows[0].all_selected(), "nothing is selected to begin with");
+
+        panel.rows[0].select_all();
+        assert_eq!(panel.rows[0].sel_range(), Some((0, 2)));
+        assert!(panel.rows[0].all_selected());
+        // Rows are independent: one row's box says nothing about another's.
+        assert_eq!(panel.rows[1].sel_range(), None);
+        assert!(!panel.rows[1].all_selected());
+
+        // Ticked on the second row too, the block spans both, whole.
+        panel.rows[1].select_all();
+        let block = panel.block().expect("a block across both rows");
+        assert_eq!(block.rows.len(), 2);
+        assert_eq!((block.rows[0].first, block.rows[0].last), (0, 2));
+        assert_eq!((block.rows[1].first, block.rows[1].last), (0, 1));
+
+        // Which is what cloning it repeats: every frame of every row, once more.
+        panel.clone_block(1);
+        assert_eq!(panel.rows[0].items.len(), 6, "the whole row, twice");
+        assert_eq!(panel.rows[1].items.len(), 4);
+
+        // The box follows the block rather than remembering a press: the clone
+        // left the copy selected, which is still the tail and not the whole.
+        assert!(!panel.rows[0].all_selected(), "half a row is not a whole row");
+
+        // And an empty row has nothing to select, so its box cannot tick.
+        let mut empty = row_with(&[]);
+        empty.select_all();
+        assert_eq!(empty.sel_range(), None);
+        assert!(!empty.all_selected());
+    }
+
+    /// The row's select box, through the real widget: it is derived from the
+    /// block, which is exactly the sort of switch that draws correctly and does
+    /// nothing. One press blocks the row; a second lets it go.
+    #[test]
+    fn the_row_select_box_blocks_the_row_and_releases_it() {
+        let mut panel = panel_with_rows(&[
+            &[
+                (60, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+                (62, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+            ],
+            &[(48, frac(Fraction::Half), frac(Fraction::None))],
+        ]);
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let run = |panel: &mut ComposerPanel, input: egui::RawInput| -> Vec<(String, egui::Pos2)> {
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+            });
+            let mut texts = Vec::new();
+            fn walk(sh: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+                match sh {
+                    egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos)),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+        let click = |at: egui::Pos2| {
+            let mut i = egui::RawInput::default();
+            i.events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            i
+        };
+
+        let laid = run(&mut panel, egui::RawInput::default());
+        let boxes: Vec<egui::Pos2> = laid
+            .iter()
+            .filter(|(t, _)| t == "select all")
+            .map(|(_, p)| egui::pos2(p.x + 4.0, p.y + 6.0))
+            .collect();
+        assert_eq!(boxes.len(), 2, "one select box per row: {boxes:?}");
+
+        run(&mut panel, click(boxes[0]));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows[0].sel_range(), Some((0, 1)), "the box did not reach the row");
+        assert_eq!(panel.rows[1].sel_range(), None, "and it took no other row with it");
+
+        // The second row's box adds it to the block rather than replacing it:
+        // the block spans rows, which is the point of ticking two.
+        run(&mut panel, click(boxes[1]));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows[0].sel_range(), Some((0, 1)));
+        assert_eq!(panel.rows[1].sel_range(), Some((0, 0)));
+
+        // Ticked, it unticks: the block on that row goes.
+        run(&mut panel, click(boxes[0]));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows[0].sel_range(), None, "the box did not let the block go");
+        assert_eq!(panel.rows[1].sel_range(), Some((0, 0)), "and again, only its own row");
+    }
+
+    /// A row that is switched off is not playing, so nothing in its lane may
+    /// behave as though it were: no frame lit as sounding, and no scrolling the
+    /// lane out from under the user — whatever “⏵ follow” is set to, which is
+    /// why the box is greyed while the row is off.
+    #[test]
+    fn a_row_switched_off_is_left_alone_by_the_transport() {
+        let mut row = row_with(&[(60, frac(Fraction::Quarter), frac(Fraction::Eighth))]);
+        row.autoscroll = true;
+
+        assert_eq!(row.lane_playhead(Some(3.5)), Some(3.5), "a playing row follows the transport");
+        assert_eq!(row.lane_playhead(None), None, "and there is nothing to follow when stopped");
+
+        row.enabled = false;
+        assert_eq!(
+            row.lane_playhead(Some(3.5)),
+            None,
+            "a switched-off lane must not be lit, or scrolled, by a transport it is not in"
+        );
+        // Switching it back on restores it: the follow setting was kept, not
+        // cleared, so the lane goes back to behaving as the user left it.
+        row.enabled = true;
+        assert!(row.autoscroll);
+        assert_eq!(row.lane_playhead(Some(3.5)), Some(3.5));
     }
 
     /// “Enable all” beside Add Track Row, through the real widget: it reports

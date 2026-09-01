@@ -56,7 +56,11 @@ published there as a wav track — and any number of rows may share the same one
   Row", is the same switch for every row at once: it is unticked while any row
   is off, and a click makes them all agree with it. The setting is saved with
   the project; a project written before it existed loads with every row playing,
-  which is what those rows did.
+  which is what those rows did. A switched-off lane is also left alone by the
+  transport: no frame lit as sounding, and no scrolling under your hands —
+  "⏵ follow" has nothing to follow, so it is greyed out until the row is back on.
+  Editing is untouched, blocks and cloning included: the row is silent, not
+  read-only.
 - **A row is a sequence of frames**, laid left to right and simply played one
   after another: nothing is positioned by hand, nothing is dragged, and nothing
   can overlap. Deleting a frame pulls everything behind it forward.
@@ -94,7 +98,9 @@ published there as a wav track — and any number of rows may share the same one
   carries a select box (`☐`): click it to start a **block**, click another frame
   on the row to take everything between them, and click one that is already in
   the block to drop it. Shift-click moves the end last clicked, which is how a
-  block shrinks.
+  block shrinks. The **select all** box on the row head takes the whole row in
+  one press, however long it is — a part of two hundred frames is otherwise a
+  scroll to its end and back, and a whole part is the commonest block there is.
   Rows are selected independently, so a block spans as many of them as you like —
   or mark the phrase on the row you can hear it in and press **↔ Span Rows**,
   which takes *the same stretch of time* out of every other row. That is what
