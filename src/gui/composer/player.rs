@@ -63,7 +63,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use vst3::Steinberg::Vst::{
-    AudioBusBuffers, IAudioProcessorTrait, IEventList,
+    AudioBusBuffers, IAudioProcessorTrait, IEventList, IParameterChanges, ParamID, ParamValue,
     ProcessData, SymbolicSampleSizes_,
 };
 use vst3::{ComPtr, ComWrapper};
@@ -71,7 +71,7 @@ use vst3::{ComPtr, ComWrapper};
 use crate::audio::{decode_audio_file, midi_to_vst3_event, DecodedAudio};
 use crate::gui::registry::PlaybackSource;
 use crate::audio::engine::{bus_buffers, declared_block_size, AudioScratch};
-use crate::vst::{next_instance_token, EventList, PluginInstance, Vst3Module};
+use crate::vst::{next_instance_token, EventList, ParamChanges, PluginInstance, Vst3Module};
 
 /// Velocity every composed note is played at. The Composer has no velocity
 /// control, and a mid-scale value keeps VSTs that map velocity to level audible
@@ -203,6 +203,14 @@ struct PluginSound {
     plugin: Arc<PluginInstance>,
     event_impl: Arc<EventList>,
     event_list: ComPtr<IEventList>,
+    /// What the plugin's own editor changed since the last block, and the list
+    /// `process()` is handed it in. A plugin that is processing audio will not
+    /// write its own parameters — see [`crate::vst::param_changes`] — so an
+    /// editor open over a playing composition is dead without this.
+    param_changes: ParamChanges,
+    param_changes_ptr: ComPtr<IParameterChanges>,
+    /// Drained into once a block, kept here so the mix allocates nothing.
+    edits_this_block: Vec<(ParamID, ParamValue)>,
     /// Total channels across this plugin's audio input buses, which is where its
     /// output channels start in `scratch`.
     in_channels: usize,
@@ -1017,6 +1025,10 @@ fn prepare_voices(
         let event_list = ComWrapper::new((*event_impl).clone())
             .to_com_ptr::<IEventList>()
             .context("Failed to create event list COM ptr")?;
+        let param_changes = ParamChanges::default();
+        let param_changes_ptr = ComWrapper::new(param_changes.clone())
+            .to_com_ptr::<IParameterChanges>()
+            .context("Failed to create parameter changes COM ptr")?;
 
         // The bus layout the plugin settled on in `initialize_audio`. A plugin
         // that declares no output bus still needs somewhere to write, so it gets
@@ -1048,6 +1060,9 @@ fn prepare_voices(
             hits,
             cursor: 0,
             sound: Sound::Plugin(PluginSound {
+                param_changes,
+                param_changes_ptr,
+                edits_this_block: Vec::new(),
                 plugin: inst.clone(),
                 event_impl,
                 event_list,
@@ -1170,6 +1185,13 @@ fn mix_block(
             ..unsafe { std::mem::zeroed() }
         };
         data.inputEvents = sound.event_list.as_ptr() as *mut _;
+        sound
+            .plugin
+            .param_edits()
+            .drain_into(&mut sound.edits_this_block);
+        if sound.param_changes.load(&sound.edits_this_block) {
+            data.inputParameterChanges = sound.param_changes_ptr.as_ptr() as *mut _;
+        }
 
         unsafe {
             sound.plugin.processor.as_com_ref().process(&mut data as *mut _);

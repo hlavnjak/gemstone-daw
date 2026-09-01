@@ -34,6 +34,7 @@ use vst3::Steinberg::Vst::{
 use vst3::{ComPtr, ComRef, ComWrapper, Interface};
 
 use super::handler::ParamChangeHandler;
+use super::param_changes::ParamEdits;
 use super::host_context::{HostApplication, MemoryStream};
 use super::module::{classes, Vst3Module};
 
@@ -306,6 +307,9 @@ pub struct PluginInstance {
     _host_context: ComPtr<FUnknown>,
     /// Ditto for the parameter handler we gave the controller.
     _param_handler: ComPtr<IComponentHandler>,
+    /// What that handler collects: the edits the plugin's own editor made and
+    /// is waiting to be told about in `process()`. See [`ParamEdits`].
+    param_edits: ParamEdits,
     /// True once the controller is a distinct object that we initialised (and so
     /// must terminate) ourselves.
     separate_controller: bool,
@@ -324,6 +328,16 @@ pub struct PluginInstance {
 }
 
 impl PluginInstance {
+    /// The parameter edits the plugin's editor is waiting to be handed back in
+    /// `process()`. Whoever drives the plugin's audio has to drain this into
+    /// [`ProcessData::inputParameterChanges`]; a driver that does not leaves
+    /// every control in the plugin's own editor dead.
+    ///
+    /// [`ProcessData::inputParameterChanges`]: vst3::Steinberg::Vst::ProcessData
+    pub fn param_edits(&self) -> &ParamEdits {
+        &self.param_edits
+    }
+
     /// Load a VST3 plugin and initialize it.
     ///
     /// `plugin_path` may be a bare shared library or a `.vst3` bundle directory;
@@ -420,10 +434,14 @@ impl PluginInstance {
                 transfer_component_state(component.as_com_ref(), controller.as_com_ref());
             }
 
-            // Set component handler for parameter changes
-            let param_handler = ComWrapper::new(ParamChangeHandler)
-                .to_com_ptr::<IComponentHandler>()
-                .context("Failed to create component handler")?;
+            // Set component handler for parameter changes. Its queue is kept
+            // on the instance, because acknowledging an edit is not delivering
+            // it — whoever drives `process()` has to hand it back.
+            let param_edits = ParamEdits::default();
+            let param_handler =
+                ComWrapper::new(ParamChangeHandler { edits: param_edits.clone() })
+                    .to_com_ptr::<IComponentHandler>()
+                    .context("Failed to create component handler")?;
             controller
                 .as_com_ref()
                 .setComponentHandler(param_handler.as_ptr());
@@ -450,6 +468,7 @@ impl PluginInstance {
                 connection,
                 _host_context: host_context,
                 _param_handler: param_handler,
+                param_edits,
                 separate_controller,
                 io: RwLock::new(PluginIo::default()),
                 active: AtomicBool::new(false),
@@ -1430,6 +1449,101 @@ mod tests {
             }
             Some((info.id, ctrl.getParamNormalized(info.id)))
         }
+    }
+
+    /// A control in a plugin's *own* editor only works if the host closes the
+    /// loop. The editor does not write the parameter: it calls the host back on
+    /// `IComponentHandler::performEdit` and waits to be handed the value in
+    /// `process()` — and while it is processing audio it will accept it by no
+    /// other route (nih-plug returns early from `setParamNormalized` too). So a
+    /// host that acknowledges `performEdit` and drops it leaves every slider in
+    /// every plugin editor dead, the handle springing back on the next frame,
+    /// with nothing anywhere to say why.
+    ///
+    /// This drives the whole path the way an editor does: the handler's queue,
+    /// the `IParameterChanges` list, one `process()` call, and the parameter
+    /// read back off the controller.
+    #[test]
+    fn a_plugins_editor_moving_a_knob_reaches_the_plugin() {
+        use crate::vst::param_changes::ParamChanges;
+        use vst3::Steinberg::Vst::{
+            IParameterChanges, ParamID, ParamValue, ProcessData, SymbolicSampleSizes_,
+        };
+
+        let path = internal_plugin();
+        let Ok(plugin) = PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) else {
+            println!("no internal plugin at {} — nothing to test", path.display());
+            return;
+        };
+        let Some((id, original)) = first_parameter(&plugin) else {
+            println!("the plugin exposes no parameters — nothing to test");
+            return;
+        };
+        plugin
+            .initialize_audio(44100.0, 512)
+            .expect("the plugin must set up for audio");
+
+        // What the editor would do: one `performEdit`, no writing of its own.
+        let changed: f64 = if original > 0.5 { 0.125 } else { 0.875 };
+        plugin.param_edits().push(id as ParamID, changed);
+
+        // Nothing has reached it yet — this is the state the bug left it in.
+        let before = unsafe { plugin.controller.as_com_ref().getParamNormalized(id) };
+        assert!(
+            (before - original).abs() < 1e-6,
+            "the plugin took the edit before it was ever handed one ({before})"
+        );
+
+        // One block, with the edits handed over the way a driver must.
+        let changes = ParamChanges::default();
+        let changes_ptr = ComWrapper::new(changes.clone())
+            .to_com_ptr::<IParameterChanges>()
+            .expect("parameter changes COM ptr");
+        let mut edits: Vec<(ParamID, ParamValue)> = Vec::new();
+        plugin.param_edits().drain_into(&mut edits);
+        assert!(changes.load(&edits), "the handler's queue lost the edit");
+
+        let io = plugin.io();
+        let out_channels: Vec<usize> =
+            if io.outputs.is_empty() { vec![2] } else { io.outputs.clone() };
+        let in_channels: usize = io.inputs.iter().sum();
+        let frames = 64usize;
+        let mut scratch =
+            crate::audio::engine::AudioScratch::new(in_channels + out_channels.iter().sum::<usize>(), frames);
+        scratch.reset(frames);
+        let mut in_buses = crate::audio::engine::bus_buffers(
+            &io.inputs,
+            &mut scratch.ptrs_mut()[..in_channels],
+        );
+        let mut out_buses = crate::audio::engine::bus_buffers(
+            &out_channels,
+            &mut scratch.ptrs_mut()[in_channels..],
+        );
+        unsafe {
+            let mut data = ProcessData {
+                numInputs: in_buses.len() as i32,
+                inputs: if in_buses.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    in_buses.as_mut_ptr()
+                },
+                numOutputs: out_buses.len() as i32,
+                outputs: out_buses.as_mut_ptr(),
+                numSamples: frames as i32,
+                processMode: 0,
+                symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+                ..zeroed::<ProcessData>()
+            };
+            data.inputParameterChanges = changes_ptr.as_ptr() as *mut _;
+            let res = plugin.processor.as_com_ref().process(&mut data as *mut _);
+            assert_eq!(res, kResultOk, "the plugin refused the block ({res:#X})");
+        }
+
+        let after = unsafe { plugin.controller.as_com_ref().getParamNormalized(id) };
+        assert!(
+            (after - changed).abs() < 1e-6,
+            "the editor's edit never reached the plugin: it is at {after}, not {changed}"
+        );
     }
 
     /// A plugin's own state is how the host carries the knobs a user set —

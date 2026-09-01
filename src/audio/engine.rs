@@ -19,12 +19,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use vst3::Steinberg::Vst::{
     AudioBusBuffers, AudioBusBuffers__type0, IAudioProcessorTrait,
-    IEventList, ProcessData, SymbolicSampleSizes_,
+    IEventList, IParameterChanges, ParamID, ParamValue, ProcessData, SymbolicSampleSizes_,
 };
 use vst3::Steinberg::Vst::Event_::EventTypes_;
 use vst3::ComWrapper;
 
-use crate::vst::{EventList, PluginInstance};
+use crate::vst::{EventList, ParamChanges, PluginInstance};
 use crate::midi::MidiEventQueue;
 
 /// Audio engine configuration derived from the system audio device.
@@ -92,6 +92,19 @@ impl AudioEngine {
         let event_list_ptr = vst_event_list
             .to_com_ptr::<IEventList>()
             .expect("Failed to create event list COM ptr");
+
+        // What the plugin's own editor changed since the last block. It reaches
+        // the plugin only here: while it is processing it will not write its own
+        // parameters, so a block that leaves `inputParameterChanges` null is a
+        // block in which nothing the user touched in the editor happened.
+        let param_edits = plugin.param_edits().clone();
+        let param_changes = ParamChanges::default();
+        let param_changes_ptr = ComWrapper::new(param_changes.clone())
+            .to_com_ptr::<IParameterChanges>()
+            .expect("Failed to create parameter changes COM ptr");
+        // Drained into once a block; kept out here so the callback allocates
+        // nothing while a knob is being dragged.
+        let mut edits_this_block: Vec<(ParamID, ParamValue)> = Vec::new();
 
         // A plugin that declares no output bus at all still has to be given one
         // to write into; and the main bus is what the device hears.
@@ -175,6 +188,14 @@ impl AudioEngine {
                 }
 
                 data.inputEvents = event_list_ptr.as_ptr() as *mut _;
+
+                // …and what the plugin's editor changed since the last block.
+                // Null when nothing did: an empty list is a list, and a plugin
+                // is entitled to walk one it is handed.
+                param_edits.drain_into(&mut edits_this_block);
+                if param_changes.load(&edits_this_block) {
+                    data.inputParameterChanges = param_changes_ptr.as_ptr() as *mut _;
+                }
 
                 unsafe {
                     plugin.processor.as_com_ref().process(&mut data as *mut _);
