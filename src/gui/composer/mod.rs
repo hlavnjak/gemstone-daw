@@ -559,19 +559,46 @@ impl Row {
         Some((a.min(b), a.max(b)))
     }
 
-    /// A click on a frame's select box. Plain, it starts a block of one — or
-    /// ends the block, when that frame *was* the whole of it, so one box both
-    /// selects and deselects. `extend` (shift) drags the free end of the block
-    /// onto this frame instead, keeping the end it was anchored on.
+    /// A click on a frame's select box. A box is drawn as a checkbox and must
+    /// behave like one: a plain click on a frame **outside** the block grows
+    /// the block to reach it, so clicking two boxes selects both and everything
+    /// between — the block stays one stretch of time, which is the only thing
+    /// it can be. A plain click on a frame already **in** the block drops the
+    /// block, so one box both selects and deselects.
+    ///
+    /// `extend` (shift) instead drags the free end onto this frame, keeping the
+    /// end it was anchored on — the way to shrink a block, or to move an end
+    /// back past the other one.
     ///
     /// Rows are selected independently: clicking on one row never clears
     /// another, because a block that spans rows is built by clicking on each of
     /// them — or, faster, by marking one row and pressing “Span Rows”.
     fn select_item(&mut self, id: u64, extend: bool) {
-        self.sel = match (self.sel, extend) {
-            (Some((anchor, _)), true) => Some((anchor, id)),
-            (Some((a, b)), false) if a == id && b == id => None,
-            _ => Some((id, id)),
+        let Some((anchor, _)) = self.sel else {
+            self.sel = Some((id, id));
+            return;
+        };
+        if extend {
+            self.sel = Some((anchor, id));
+            return;
+        }
+        // Positions, not ids: which side of the block the click landed on is
+        // what decides whether it grows or drops, and `sel_range` is also what
+        // reports a block whose frames have been deleted since.
+        let (Some((a, b)), Some(at)) =
+            (self.sel_range(), self.items.iter().position(|i| i.id == id))
+        else {
+            self.sel = Some((id, id));
+            return;
+        };
+        self.sel = match at {
+            // Inside: the click is the second press on a box that is already
+            // ticked, and lets the block go.
+            _ if (a..=b).contains(&at) => None,
+            // Outside: grow to it, anchored on the end that did not move, so a
+            // shift-click after this one still drags the end just clicked.
+            _ if at < a => Some((self.items[b].id, id)),
+            _ => Some((self.items[a].id, id)),
         };
     }
 
@@ -2357,11 +2384,13 @@ impl ComposerPanel {
                                     )
                                     .on_hover_text(
                                         "Select this frame into the block.\n\n\
-                                         Shift-click another frame on the row to take \
-                                         everything between them; click this one again to \
-                                         drop the block. Rows are selected independently, \
-                                         so a block can span as many as you like — or \
-                                         mark one row and press “↔ Span Rows”.",
+                                         Click another frame on the row to take everything \
+                                         between them; click one that is already in the \
+                                         block to drop it. Shift-click moves the end last \
+                                         clicked, which is how a block shrinks. Rows are \
+                                         selected independently, so a block can span as \
+                                         many as you like — or mark one row and press \
+                                         “↔ Span Rows”.",
                                     )
                                     .clicked()
                             {
@@ -4083,10 +4112,10 @@ mod tests {
         assert_eq!(panel.autosave_track_ids(), vec![ids[0]]);
     }
 
-    /// A block is built by clicking frames: one click starts it, shift-click
-    /// takes everything up to another frame, and the same click on the same
-    /// frame ends it. Rows are independent, because a block that spans rows is
-    /// exactly what this is for.
+    /// A block is built by clicking frames: the boxes are checkboxes, so a
+    /// second box joins the first rather than replacing it, a box already in
+    /// the block lets the block go, and shift moves one end exactly. Rows are
+    /// independent, because a block that spans rows is exactly what this is for.
     #[test]
     fn a_block_is_clicked_open_and_clicked_shut() {
         let mut row = row_with(&[
@@ -4102,7 +4131,28 @@ mod tests {
         row.select_item(ids[1], false);
         assert_eq!(row.sel_range(), None, "the same click again drops the block");
 
+        // Two plain clicks: the second box does not untick the first. This is
+        // the whole of the complaint that changed the rule.
+        row.select_item(ids[0], false);
         row.select_item(ids[2], false);
+        assert_eq!(
+            row.sel_range(),
+            Some((0, 2)),
+            "a plain click on a second box must grow the block, not restart it"
+        );
+
+        // Backwards too: the block grows to a box in front of it.
+        row.select_item(ids[1], false);
+        assert_eq!(row.sel_range(), None, "a box inside the block drops the block");
+        row.select_item(ids[2], false);
+        row.select_item(ids[0], false);
+        assert_eq!(row.sel_range(), Some((0, 2)), "a box in front of the block grows it");
+
+        // Growing anchors on the end that did not move, so shift after a plain
+        // click drags the end just clicked — here, back off the block again.
+        row.select_item(ids[1], true);
+        assert_eq!(row.sel_range(), Some((1, 2)), "shift shrinks from the end last clicked");
+
         row.select_item(ids[0], true);
         assert_eq!(
             row.sel_range(),
@@ -4113,6 +4163,7 @@ mod tests {
 
         // The ends are ids, so a frame deleted in front of the block does not
         // slide the block onto other notes.
+        row.select_item(ids[1], false);
         row.select_item(ids[1], false);
         row.select_item(ids[2], true);
         row.delete_item(0);
@@ -4351,4 +4402,92 @@ mod tests {
         );
         assert!(texts.iter().any(|t| t == "↔ Span Rows"), "{texts:?}");
     }
+
+    /// Two frames must be selectable on one row, through the real widget: a
+    /// second box clicked plainly joins the block rather than unticking the
+    /// first, and shift then drags that end back. The rule is [`Row`]'s, but
+    /// the modifier has to survive the button, which is where it would break
+    /// without anything else failing.
+    #[test]
+    fn a_second_box_joins_the_block_instead_of_unticking_the_first() {
+        let mut panel = panel_with_rows(&[&[
+            (60, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+            (62, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+            (64, frac(Fraction::Quarter), frac(Fraction::Eighth)),
+        ]]);
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let run = |panel: &mut ComposerPanel, input: egui::RawInput| -> Vec<(String, egui::Pos2)> {
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+            });
+            let mut texts = Vec::new();
+            fn walk(sh: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+                match sh {
+                    egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos)),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+        let click = |at: egui::Pos2, shift: bool| {
+            let mods = egui::Modifiers { shift, ..Default::default() };
+            let mut i = egui::RawInput::default();
+            i.modifiers = mods;
+            i.events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: mods,
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: mods,
+                },
+            ];
+            i
+        };
+        let boxes = |texts: &[(String, egui::Pos2)]| -> Vec<egui::Pos2> {
+            texts
+                .iter()
+                .filter(|(t, _)| t == "☐" || t == "☑")
+                .map(|(_, p)| egui::pos2(p.x + 3.0, p.y + 6.0))
+                .collect()
+        };
+
+        let laid = run(&mut panel, egui::RawInput::default());
+        let bx = boxes(&laid);
+        assert_eq!(bx.len(), 3, "three note frames, three select boxes: {bx:?}");
+
+        run(&mut panel, click(bx[0], false));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows[0].sel_range(), Some((0, 0)), "a plain click did not select");
+
+        run(&mut panel, click(bx[2], false));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(
+            panel.rows[0].sel_range(),
+            Some((0, 2)),
+            "a second box unticked the first instead of joining the block"
+        );
+
+        // The block grew forwards, so it is anchored on frame 0 and shift drags
+        // the end just clicked — frame 2 — back onto frame 1.
+        run(&mut panel, click(bx[1], true));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(
+            panel.rows[0].sel_range(),
+            Some((0, 1)),
+            "shift did not reach the button — the block would only ever grow"
+        );
+    }
+
 }

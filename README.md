@@ -80,8 +80,10 @@ published there as a wav track — and any number of rows may share the same one
   two notes together — the frame stays as a placeholder, but adds no time.
 - **Blocks — copying a section across every track at once.** Music repeats, and
   the second time round should not cost what the first did. Each note frame
-  carries a select box (`☐`): click it to start a **block**, shift-click another
-  frame on the row to take everything between them, click it again to drop it.
+  carries a select box (`☐`): click it to start a **block**, click another frame
+  on the row to take everything between them, and click one that is already in
+  the block to drop it. Shift-click moves the end last clicked, which is how a
+  block shrinks.
   Rows are selected independently, so a block spans as many of them as you like —
   or mark the phrase on the row you can hear it in and press **↔ Span Rows**,
   which takes *the same stretch of time* out of every other row. That is what
