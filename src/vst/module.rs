@@ -158,6 +158,8 @@ pub fn validate_module(path: &Path) -> Result<PathBuf> {
 /// What a factory says about one of its classes.
 #[derive(Clone, Debug, Default)]
 pub struct ModuleClass {
+    /// The class id, in the crate's own byte order — see [`platform_cid`], which
+    /// is what turns it back into the order the factory wants.
     pub cid: [i8; 16],
     /// The plugin's own display name.
     pub name: String,
@@ -167,6 +169,48 @@ pub struct ModuleClass {
     /// *is*, and the only precise way to know a drum kit from a synth. Empty
     /// when the factory is too old to be asked (`IPluginFactory2`).
     pub subcategories: String,
+}
+
+/// A class id in the byte order the *factory* uses, from one in the order the
+/// rest of this crate uses — or back again.
+///
+/// VST3 class ids do not have one byte order. On Windows the SDK lays a class id
+/// out as a COM `GUID`, whose first three fields are little-endian; everywhere
+/// else it is the plain 16-byte string. The same plugin, built for the two
+/// platforms, therefore announces two different ids for the same class — which
+/// is why `lesynth_fourier.dll` under Wine answered "the requested plugin class
+/// is not in this factory" to the id `liblesynth_fourier.so` answers to.
+///
+/// So the crate deals in one order — the non-Windows one, which is also the
+/// order [`crate::vst::class_ids`] and a saved project are written in, so a
+/// project stays portable — and converts only here, where a factory is read or
+/// asked to create something. The permutation is its own inverse, so this one
+/// function serves both directions.
+///
+/// A controller class id read from a component (`getControllerClassId`) never
+/// passes through here: it comes from the factory's world and goes straight
+/// back to it.
+#[cfg(target_os = "windows")]
+pub const fn platform_cid(cid: [i8; 16]) -> [i8; 16] {
+    com_cid(cid)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub const fn platform_cid(cid: [i8; 16]) -> [i8; 16] {
+    cid
+}
+
+/// The COM `GUID` reading of a class id: the first three fields byte-swapped
+/// into little-endian, the last eight bytes left alone. Compiled on every
+/// platform so it can be tested anywhere, and applied only on Windows.
+const fn com_cid(cid: [i8; 16]) -> [i8; 16] {
+    let c = cid;
+    [
+        c[3], c[2], c[1], c[0], // Data1: a little-endian u32
+        c[5], c[4], // Data2: a little-endian u16
+        c[7], c[6], // Data3: a little-endian u16
+        c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15], // Data4: plain bytes
+    ]
 }
 
 /// Ask a plugin what it is, without creating an instance of it.
@@ -191,7 +235,7 @@ pub fn classes(factory: ComRef<'_, IPluginFactory>) -> Vec<ModuleClass> {
                     let mut info: PClassInfo2 = std::mem::zeroed();
                     if f2.as_com_ref().getClassInfo2(idx, &mut info) == kResultOk {
                         return Some(ModuleClass {
-                            cid: info.cid,
+                            cid: platform_cid(info.cid),
                             name: c_string(&info.name),
                             category: c_string(&info.category),
                             subcategories: c_string(&info.subCategories),
@@ -201,7 +245,7 @@ pub fn classes(factory: ComRef<'_, IPluginFactory>) -> Vec<ModuleClass> {
                 let mut info: PClassInfo = std::mem::zeroed();
                 if factory.getClassInfo(idx, &mut info) == kResultOk {
                     return Some(ModuleClass {
-                        cid: info.cid,
+                        cid: platform_cid(info.cid),
                         name: c_string(&info.name),
                         category: c_string(&info.category),
                         subcategories: String::new(),
@@ -372,4 +416,29 @@ fn open_library(path: &Path) -> Result<(Library, *mut c_void)> {
 #[cfg(not(unix))]
 fn open_library(path: &Path) -> Result<(Library, *mut c_void)> {
     Ok((unsafe { Library::new(path)? }, std::ptr::null_mut()))
+}
+
+#[cfg(test)]
+mod cid_tests {
+    use super::com_cid;
+
+    /// The layout the VST3 SDK's `INLINE_UID` writes on Windows: the id's first
+    /// three GUID fields are byte-swapped, the trailing eight bytes are not.
+    #[test]
+    fn com_order_swaps_only_the_first_three_fields() {
+        let raw: [i8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(
+            com_cid(raw),
+            [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15],
+        );
+    }
+
+    /// Reading a factory and writing back to it use the same function, which is
+    /// only sound because the permutation is its own inverse.
+    #[test]
+    fn com_order_is_its_own_inverse() {
+        let raw = *b"LeSynthFourier01";
+        let raw: [i8; 16] = std::array::from_fn(|i| raw[i] as i8);
+        assert_eq!(com_cid(com_cid(raw)), raw);
+    }
 }

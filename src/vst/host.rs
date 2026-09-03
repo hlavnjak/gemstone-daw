@@ -36,7 +36,7 @@ use vst3::{ComPtr, ComRef, ComWrapper, Interface};
 use super::handler::ParamChangeHandler;
 use super::param_changes::ParamEdits;
 use super::host_context::{HostApplication, MemoryStream};
-use super::module::{classes, Vst3Module};
+use super::module::{classes, platform_cid, Vst3Module};
 
 // LeSynth Fourier's host-facing analysis C ABI (see lesynth-fourier/src/lib.rs).
 // `contour` (ptr,len) is the per-position fundamental in Hz, uniformly resampled
@@ -1278,6 +1278,11 @@ impl Drop for PluginInstance {
 /// module** class wins — not simply the first class, which in a third-party
 /// bundle is as likely to be the edit-controller class (or an ARA extension) and
 /// would fail to create as an `IComponent`.
+///
+/// `class_id` comes in — and the classes are compared — in the crate's own byte
+/// order; the id returned is in the factory's, ready for `createInstance`. On
+/// every platform but Windows those are the same order. See
+/// [`platform_cid`](crate::vst::module::platform_cid).
 fn select_class(
     factory: ComRef<'_, IPluginFactory>,
     class_id: Option<&[i8; 16]>,
@@ -1293,14 +1298,14 @@ fn select_class(
         );
         if let Some(target) = class_id {
             if class.cid == *target {
-                return Ok((class.cid, class.name));
+                return Ok((platform_cid(class.cid), class.name));
             }
             continue;
         }
         if class.category == AUDIO_MODULE_CLASS {
-            return Ok((class.cid, class.name));
+            return Ok((platform_cid(class.cid), class.name));
         }
-        fallback.get_or_insert((class.cid, class.name));
+        fallback.get_or_insert((platform_cid(class.cid), class.name));
     }
     if class_id.is_some() {
         bail!("the requested plugin class is not in this factory");
