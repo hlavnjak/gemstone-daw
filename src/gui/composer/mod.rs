@@ -122,6 +122,12 @@ const ROW_H: f32 = CARD_H + 10.0;
 /// Width of the fixed row head (track select, add-note, gain).
 const HEAD_W: f32 = 284.0;
 
+/// The loudest a row may be set to. Well past unity: a drum sampled quietly, or
+/// a resynthesised voice analysed well below full scale, has to come up to a
+/// lead rather than the whole rest of the composition coming down to it. The
+/// mix clamps at full scale, which is what limits how much of this is useful.
+const GAIN_MAX: f32 = 8.0;
+
 /// Lowest and highest note offered, C0..B8.
 const PITCH_MIN: u8 = 12;
 const PITCH_MAX: u8 = 119;
@@ -495,6 +501,9 @@ struct Row {
     /// The Track this row plays, by registry id. `None` only while the registry
     /// is empty.
     track_id: Option<u64>,
+    /// How loud the row plays, `1.0` being the track's own level. Up to
+    /// [`GAIN_MAX`], so a quiet source can be lifted rather than every other
+    /// row having to be pulled down around it.
     gain: f32,
     /// The silence before the row's first note. Held by the row, not an item, so
     /// deleting the first note cannot take it along — it stays at the head and
@@ -2211,9 +2220,17 @@ impl ComposerPanel {
                                         ui.label("Gain");
                                         ui.spacing_mut().slider_width = 76.0;
                                         ui.add(
-                                            egui::Slider::new(&mut row.gain, 0.0..=2.0)
+                                            egui::Slider::new(&mut row.gain, 0.0..=GAIN_MAX)
                                                 .fixed_decimals(2)
                                                 .show_value(true),
+                                        )
+                                        .on_hover_text(
+                                            "How loud this row plays in the mix. 1.00 is \
+                                             the track's own level; above it the row is \
+                                             boosted, so a quiet drum can hold its own \
+                                             against a loud lead.\n\nThe mix is clamped \
+                                             at full scale, so a boost that takes the sum \
+                                             past it distorts rather than gets louder.",
                                         );
                                         ui.checkbox(&mut row.autosave, "auto")
                                             .on_hover_text(
