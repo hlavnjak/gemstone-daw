@@ -42,7 +42,14 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 550.0])
             .with_min_inner_size([700.0, 450.0])
-            .with_title("Gemstone DAW"),
+            .with_title("Gemstone DAW")
+            // Windows only: winit registers an OLE drop target per window, and
+            // asserts that RegisterDragDrop succeeded. Under Wine that call
+            // comes back E_NOINTERFACE and the process panics before the first
+            // frame. Nothing here reads `dropped_files`, so the registration
+            // buys us nothing on any platform — turning it off costs no feature
+            // and makes the Windows build run under Wine as well as on Windows.
+            .with_drag_and_drop(false),
         ..Default::default()
     };
 
