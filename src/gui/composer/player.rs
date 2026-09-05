@@ -68,7 +68,7 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::{ComPtr, ComWrapper};
 
-use crate::audio::{decode_audio_file, midi_to_vst3_event, DecodedAudio};
+use crate::audio::{decode_audio_file, midi_to_vst3_event, DecodedAudio, Limiter};
 use crate::gui::registry::PlaybackSource;
 use crate::audio::engine::{bus_buffers, declared_block_size, AudioScratch};
 use crate::vst::{next_instance_token, EventList, ParamChanges, PluginInstance, Vst3Module};
@@ -427,6 +427,10 @@ impl CompositionPlayer {
             .context("No audio output device found")?;
 
         let mut voices = voices;
+        // One bus for the life of the stream: its limiters have to see the
+        // whole thing, not a block at a time.
+        let mut bus = MixBus::new(voices.len(), channels, sample_rate);
+        let bus_latency_us = (bus.latency_frames() as f64 / sample_rate.max(1.0) * 1e6) as u64;
         let position = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
 
@@ -468,7 +472,10 @@ impl CompositionPlayer {
                         .playback
                         .duration_since(&stamp.callback)
                         .map_or(0, |d| d.as_micros() as u64);
-                    cb_latency.store(latency, Ordering::Relaxed);
+                    // Plus the mix's own look-ahead: the limiters hand the
+                    // device audio that is that much older than the clock this
+                    // block was rendered against.
+                    cb_latency.store(latency + bus_latency_us, Ordering::Relaxed);
                 }
                 // One pass per chunk of the device block. Without a repeat there
                 // is exactly one; with one, the block is split at the loop point
@@ -504,6 +511,7 @@ impl CompositionPlayer {
                         pos,
                         n,
                         wraps,
+                        &mut bus,
                     );
 
                     let new_pos = pos + n as u64;
@@ -1087,14 +1095,48 @@ fn prepare_voices(
     })
 }
 
-/// Process one block of every voice and sum it into `out` (interleaved,
-/// `frames * channels`), which is overwritten. Each voice carries its own
-/// per-channel scratch, sized to the bus layout its plugin negotiated.
-///
-/// Shared by the transport's callback and the offline export, so what a `.wav`
-/// contains is what the transport plays — down to the summing and the clamp.
-fn mix_block(
-    voices: &mut [Voice],
+/// Full scale, the level nothing may leave the mix above. Kept at 1.0 rather
+/// than a hair below: a limiter that holds exactly this ceiling gives away no
+/// headroom, and the device's own converter takes it from there.
+const CEILING: f32 = 1.0;
+
+/// The state a mix carries from one block to the next: a scratch buffer for the
+/// voice being rendered, and the limiters. Each voice has its own, so a row
+/// boosted past full scale is turned down by itself instead of ducking the
+/// whole composition every time it peaks; the master's catches what is left
+/// when several loud rows land together.
+struct MixBus {
+    /// One voice's block, summed into the mix once its limiter has seen it.
+    /// Reused across voices and blocks: an audio callback allocates nothing.
+    scratch: Vec<f32>,
+    voices: Vec<Limiter>,
+    master: Limiter,
+}
+
+impl MixBus {
+    fn new(voices: usize, channels: usize, sample_rate: f64) -> Self {
+        Self {
+            scratch: Vec::new(),
+            voices: (0..voices)
+                .map(|_| Limiter::new(channels, sample_rate, CEILING))
+                .collect(),
+            master: Limiter::new(channels, sample_rate, CEILING),
+        }
+    }
+
+    /// How far behind its own clock the mix runs: a voice's limiter looks ahead,
+    /// and then the master's does it again. Every limiter here is built at the
+    /// one rate, so they cost the same.
+    fn latency_frames(&self) -> usize {
+        2 * self.master.latency_frames()
+    }
+}
+
+/// Render one voice's block into `out` (interleaved, `frames * channels`),
+/// which arrives zeroed and holds nothing but this voice on the way out — its
+/// own limiter sees it before the mix does.
+fn render_voice(
+    voice: &mut Voice,
     out: &mut [f32],
     channels: usize,
     block_start: u64,
@@ -1102,118 +1144,150 @@ fn mix_block(
     flush_events: bool,
 ) {
     let block_end = block_start + frames as u64;
-    out.fill(0.0);
-
-    for voice in voices.iter_mut() {
-        let sound = match &mut voice.sound {
-            Sound::Plugin(p) => p,
-            // A file, played from its start for as long as each note lasts.
-            // Nothing to process and no events to send: where a note is in the
-            // file follows from the transport's own clock.
-            Sound::Sample(s) => {
-                // Notes already finished are behind us for good — until a rewind,
-                // which puts the cursor back to the top.
-                while voice
-                    .hits
-                    .get(voice.cursor)
-                    .is_some_and(|h| h.off <= block_start)
-                {
-                    voice.cursor += 1;
-                }
-                for hit in &voice.hits[voice.cursor.min(voice.hits.len())..] {
-                    if hit.on >= block_end {
-                        break;
-                    }
-                    let len = hit.off - hit.on;
-                    // Where the note starts *in the file* — the frame's start
-                    // slider, in the file's own samples.
-                    let skip = hit.start_secs * s.audio.sample_rate as f64;
-                    for pos in hit.on.max(block_start)..hit.off.min(block_end) {
-                        let n = pos - hit.on;
-                        let v =
-                            s.at(skip + n as f64 * s.step) * s.envelope(n, len) * voice.gain;
-                        let frame = (pos - block_start) as usize;
-                        for ch in 0..channels {
-                            out[frame * channels + ch] += v;
-                        }
-                    }
-                }
-                continue;
-            }
-        };
-
-        // Events due in this block, offset to their sample in it.
-        {
-            let mut events = sound.event_impl.events.write().unwrap();
-            events.clear();
-            while let Some(&(at, pitch, on)) = voice.schedule.get(voice.cursor) {
-                // `flush_events` empties the schedule into this block: the caller
-                // is about to rewind, and anything left behind is a note-off that
-                // would never be sent.
-                if at >= block_end && !flush_events {
-                    break;
-                }
-                let status = if on { 0x90 } else { 0x80 };
-                let velocity = if on { NOTE_VELOCITY } else { 0 };
-                if let Some(mut ev) = midi_to_vst3_event([status, pitch, velocity]) {
-                    // Events already due (a late start, or two in the same
-                    // block) land on the block's first sample.
-                    ev.sampleOffset =
-                        at.saturating_sub(block_start).min(frames as u64 - 1) as i32;
-                    events.push(ev);
-                }
+    let sound = match &mut voice.sound {
+        Sound::Plugin(p) => p,
+        // A file, played from its start for as long as each note lasts.
+        // Nothing to process and no events to send: where a note is in the
+        // file follows from the transport's own clock.
+        Sound::Sample(s) => {
+            // Notes already finished are behind us for good — until a rewind,
+            // which puts the cursor back to the top.
+            while voice
+                .hits
+                .get(voice.cursor)
+                .is_some_and(|h| h.off <= block_start)
+            {
                 voice.cursor += 1;
             }
-        }
-
-        // Never more than this instance was set up for (see `PluginIo::max_block`).
-        let frames = frames.min(sound.max_block);
-        sound.scratch.reset(frames);
-
-        let mut data = ProcessData {
-            numInputs: sound.in_buses.len() as i32,
-            inputs: if sound.in_buses.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                sound.in_buses.as_mut_ptr()
-            },
-            numOutputs: sound.out_buses.len() as i32,
-            outputs: sound.out_buses.as_mut_ptr(),
-            numSamples: frames as i32,
-            processMode: 0,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
-            ..unsafe { std::mem::zeroed() }
-        };
-        data.inputEvents = sound.event_list.as_ptr() as *mut _;
-        sound
-            .plugin
-            .param_edits()
-            .drain_into(&mut sound.edits_this_block);
-        if sound.param_changes.load(&sound.edits_this_block) {
-            data.inputParameterChanges = sound.param_changes_ptr.as_ptr() as *mut _;
-        }
-
-        unsafe {
-            sound.plugin.processor.as_com_ref().process(&mut data as *mut _);
-        }
-        sound.event_impl.events.write().unwrap().clear();
-
-        // Main output bus into the mix. Its channel count is the plugin's, not
-        // the device's: a mono plugin repeats, a wider one has the extra dropped.
-        if sound.main_out > 0 {
-            for frame in 0..frames {
-                for ch in 0..channels {
-                    let src = sound.in_channels + ch.min(sound.main_out - 1);
-                    out[frame * channels + ch] += sound.scratch.channel(src)[frame] * voice.gain;
+            for hit in &voice.hits[voice.cursor.min(voice.hits.len())..] {
+                if hit.on >= block_end {
+                    break;
+                }
+                let len = hit.off - hit.on;
+                // Where the note starts *in the file* — the frame's start
+                // slider, in the file's own samples.
+                let skip = hit.start_secs * s.audio.sample_rate as f64;
+                for pos in hit.on.max(block_start)..hit.off.min(block_end) {
+                    let n = pos - hit.on;
+                    let v =
+                        s.at(skip + n as f64 * s.step) * s.envelope(n, len) * voice.gain;
+                    let frame = (pos - block_start) as usize;
+                    for ch in 0..channels {
+                        out[frame * channels + ch] += v;
+                    }
                 }
             }
+            return;
+        }
+    };
+
+    // Events due in this block, offset to their sample in it.
+    {
+        let mut events = sound.event_impl.events.write().unwrap();
+        events.clear();
+        while let Some(&(at, pitch, on)) = voice.schedule.get(voice.cursor) {
+            // `flush_events` empties the schedule into this block: the caller
+            // is about to rewind, and anything left behind is a note-off that
+            // would never be sent.
+            if at >= block_end && !flush_events {
+                break;
+            }
+            let status = if on { 0x90 } else { 0x80 };
+            let velocity = if on { NOTE_VELOCITY } else { 0 };
+            if let Some(mut ev) = midi_to_vst3_event([status, pitch, velocity]) {
+                // Events already due (a late start, or two in the same
+                // block) land on the block's first sample.
+                ev.sampleOffset =
+                    at.saturating_sub(block_start).min(frames as u64 - 1) as i32;
+                events.push(ev);
+            }
+            voice.cursor += 1;
         }
     }
 
-    // The mix is a sum of independent instruments, so clamp rather than let the
-    // device wrap on a loud chord.
+    // Never more than this instance was set up for (see `PluginIo::max_block`).
+    let frames = frames.min(sound.max_block);
+    sound.scratch.reset(frames);
+
+    let mut data = ProcessData {
+        numInputs: sound.in_buses.len() as i32,
+        inputs: if sound.in_buses.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            sound.in_buses.as_mut_ptr()
+        },
+        numOutputs: sound.out_buses.len() as i32,
+        outputs: sound.out_buses.as_mut_ptr(),
+        numSamples: frames as i32,
+        processMode: 0,
+        symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    data.inputEvents = sound.event_list.as_ptr() as *mut _;
+    sound
+        .plugin
+        .param_edits()
+        .drain_into(&mut sound.edits_this_block);
+    if sound.param_changes.load(&sound.edits_this_block) {
+        data.inputParameterChanges = sound.param_changes_ptr.as_ptr() as *mut _;
+    }
+
+    unsafe {
+        sound.plugin.processor.as_com_ref().process(&mut data as *mut _);
+    }
+    sound.event_impl.events.write().unwrap().clear();
+
+    // Main output bus into the mix. Its channel count is the plugin's, not
+    // the device's: a mono plugin repeats, a wider one has the extra dropped.
+    if sound.main_out > 0 {
+        for frame in 0..frames {
+            for ch in 0..channels {
+                let src = sound.in_channels + ch.min(sound.main_out - 1);
+                out[frame * channels + ch] += sound.scratch.channel(src)[frame] * voice.gain;
+            }
+        }
+    }
+}
+
+/// Process one block of every voice and sum it into `out` (interleaved,
+/// `frames * channels`), which is overwritten.
+///
+/// Every voice passes its own limiter on the way in and the sum passes the
+/// master's on the way out, so a gain set past full scale is a level the mix
+/// comes down to rather than a waveform with its top sheared off. `bus` carries
+/// that state — and the delay it costs, [`MixBus::latency_frames`], which the
+/// caller has to allow for.
+///
+/// Shared by the transport's callback and the offline export, so what a `.wav`
+/// contains is what the transport plays — down to the summing and the
+/// limiting.
+fn mix_block(
+    voices: &mut [Voice],
+    out: &mut [f32],
+    channels: usize,
+    block_start: u64,
+    frames: usize,
+    flush_events: bool,
+    bus: &mut MixBus,
+) {
+    out.fill(0.0);
+    bus.scratch.clear();
+    bus.scratch.resize(frames * channels, 0.0);
+
+    for (voice, limiter) in voices.iter_mut().zip(bus.voices.iter_mut()) {
+        bus.scratch.fill(0.0);
+        render_voice(voice, &mut bus.scratch, channels, block_start, frames, flush_events);
+        limiter.process(&mut bus.scratch);
+        for (s, v) in out.iter_mut().zip(bus.scratch.iter()) {
+            *s += v;
+        }
+    }
+
+    bus.master.process(out);
+    // The limiter holds the ceiling on its own; this is the belt to its braces,
+    // and costs a compare on a buffer the device is about to read anyway.
     for s in out.iter_mut() {
-        *s = s.clamp(-1.0, 1.0);
+        *s = s.clamp(-CEILING, CEILING);
     }
 }
 
@@ -1256,16 +1330,25 @@ pub fn render_offline(
         rows_playing,
     } = prepare_voices(plans, sample_rate, BLOCK as i32)?;
 
+    let mut bus = MixBus::new(voices.len(), channels, sample_rate);
+    // The mix's limiters hand back audio a moment older than what they were
+    // given, so the render runs on past the end by exactly that and drops the
+    // same amount off the front: the file starts where the composition does,
+    // and ends with the last of it rather than a silence of look-ahead.
+    let latency = bus.latency_frames() as u64;
+    let render_end = end_sample + latency;
+
     let mut block = vec![0f32; BLOCK * channels];
-    let mut out: Vec<f32> = Vec::with_capacity(end_sample as usize * channels);
+    let mut out: Vec<f32> = Vec::with_capacity(render_end as usize * channels);
     let mut pos = 0u64;
-    while pos < end_sample {
-        let frames = BLOCK.min((end_sample - pos) as usize);
+    while pos < render_end {
+        let frames = BLOCK.min((render_end - pos) as usize);
         let buf = &mut block[..frames * channels];
-        mix_block(&mut voices, buf, channels, pos, frames, false);
+        mix_block(&mut voices, buf, channels, pos, frames, false, &mut bus);
         out.extend_from_slice(buf);
         pos += frames as u64;
     }
+    out.drain(..(latency as usize * channels).min(out.len()));
 
     // Voices hold `ComPtr`s into these libraries: drop them first, in the order
     // the transport tears its stream down in.
@@ -1478,6 +1561,10 @@ mod tests {
 
         // Rendered in blocks of 7, which divides neither note: a voice that kept
         // a position of its own rather than reading the clock would drift here.
+        // Everything comes out `d` frames late — the mix's look-ahead — and,
+        // since a ramp to 0.99 never reaches the ceiling, otherwise untouched.
+        let mut bus = MixBus::new(1, 1, 1000.0);
+        let d = bus.latency_frames();
         let mut out = vec![0f32; 300];
         for start in (0..300).step_by(7) {
             let frames = 7.min(300 - start);
@@ -1489,28 +1576,29 @@ mod tests {
                 start as u64,
                 frames,
                 false,
+                &mut bus,
             );
             out[start..start + frames].copy_from_slice(&block);
         }
 
         // Silence before the first note and between the two.
-        assert!(out[..10].iter().all(|&s| s == 0.0), "{:?}", &out[..10]);
-        assert!(out[110..200].iter().all(|&s| s == 0.0));
-        assert!(out[240..].iter().all(|&s| s == 0.0));
+        assert!(out[..10 + d].iter().all(|&s| s == 0.0), "{:?}", &out[..10 + d]);
+        assert!(out[110 + d..200 + d].iter().all(|&s| s == 0.0));
+        assert!(out[240 + d..].iter().all(|&s| s == 0.0));
         // The body of the first note is the file, sample for sample.
         for n in 3..97 {
             assert!(
-                (out[10 + n] - n as f32 / 100.0).abs() < 1e-6,
+                (out[10 + d + n] - n as f32 / 100.0).abs() < 1e-6,
                 "frame {n} of the note is {}, not the file's {}",
-                out[10 + n],
+                out[10 + d + n],
                 n as f32 / 100.0
             );
         }
         // The second note starts the file again rather than carrying on.
-        assert!((out[200 + 10] - 0.10).abs() < 1e-6, "{}", out[200 + 10]);
+        assert!((out[200 + d + 10] - 0.10).abs() < 1e-6, "{}", out[200 + d + 10]);
         // Faded in at the start and out at the end, both times: the fade is what
         // keeps a cut file from clicking.
-        assert!(out[200] < 0.5 * 0.001 + 0.001);
-        assert!(out[239].abs() < out[220].abs());
+        assert!(out[200 + d] < 0.5 * 0.001 + 0.001);
+        assert!(out[239 + d].abs() < out[220 + d].abs());
     }
 }

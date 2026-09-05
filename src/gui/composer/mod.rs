@@ -126,7 +126,8 @@ const HEAD_W: f32 = 284.0;
 /// quietly, or a resynthesised voice analysed well below full scale, has to
 /// come up to a lead rather than the whole rest of the composition coming down
 /// to it, and a source peaking at -30 dBFS needs more than eight times. The mix
-/// clamps at full scale, which is what limits how much of this is useful.
+/// limits at full scale, which is what limits how much of this is useful — past
+/// the point where the peaks are being held down, more gain only compresses.
 const GAIN_MAX: f32 = 50.0;
 
 /// Where the row gain slider's travel starts, -40 dB. Below it the slider drops
@@ -2241,9 +2242,11 @@ impl ComposerPanel {
                                              logarithmic, a fader rather than a ruler: \
                                              unity sits mid-way and the top is 50.00, \
                                              enough to lift a source analysed thirty \
-                                             decibels down.\n\nThe mix is clamped \
-                                             at full scale, so a boost that takes the sum \
-                                             past it distorts rather than gets louder.",
+                                             decibels down.\n\nA boost that takes the \
+                                             row past full scale is limited rather than \
+                                             clipped: the peaks are turned down smoothly \
+                                             instead of being cut flat, so it stops \
+                                             getting louder without turning to fuzz.",
                                         );
                                         ui.checkbox(&mut row.autosave, "auto")
                                             .on_hover_text(
