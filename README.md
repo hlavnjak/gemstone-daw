@@ -161,11 +161,17 @@ published there as a wav track — and any number of rows may share the same one
   file is simply silent. It is mixed through the same
   voices and the same per-row gain as everything else, so "Export WAV" writes
   exactly what the transport plays.
-- **Custom VST3 sounds are kept.** What a plugin is playing — the knobs set in
+- **Plugin sounds are kept.** What a plugin is playing — the knobs set in
   its own editor — is taken from the instance when its editor closes, handed to
   the Composer's instances, and written into the project folder as a
   `.vststate` beside the manifest. It travels over `IComponent::getState`, the
   mechanism every VST3 has, rather than LeSynth's grid ABI, which only ours does.
+  A **LeSynth** track keeps one too, beside its `.lsft`, and needs both: the
+  `.lsft` is the harmonic grid, and the `.vststate` is every control that drew
+  it — each harmonic's curve type, offset and granularity, and the 32
+  nested-Fourier amplitude/phase sliders and base frequency under them, none of
+  which is in the grid. Saving only the grid reloaded a correct picture over
+  sliders that all read zero.
 - **External VST3 plugins** — "Create Custom VST Track" lists the plugins
   installed in the standard locations (`VST3_PATH`, `~/.vst3`, `/usr/lib/vst3`,
   `/usr/local/lib/vst3`) and can browse for a `.vst3` bundle or a plugin library

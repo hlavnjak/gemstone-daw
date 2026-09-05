@@ -309,13 +309,15 @@ impl TrackRegistry {
                     Ok(s) => live_grid = Some(s),
                     Err(e) => log::debug!("live grid unavailable for '{}': {e}", entry.name),
                 }
-            } else {
-                // Every other VST3 keeps its knobs in its own opaque state.
-                match plugin.component_state() {
-                    Ok(bytes) if !bytes.is_empty() => live_vst = Some(bytes),
-                    Ok(_) => {}
-                    Err(e) => log::debug!("live state unavailable for '{}': {e:#}", entry.name),
-                }
+            }
+            // Every VST3 keeps its knobs in its own opaque state — LeSynth too,
+            // where that is the whole Synth editor: the curve type, offset and
+            // granularity of each harmonic and the nested-Fourier sliders under
+            // them, none of which is in the grid.
+            match plugin.component_state() {
+                Ok(bytes) if !bytes.is_empty() => live_vst = Some(bytes),
+                Ok(_) => {}
+                Err(e) => log::debug!("live state unavailable for '{}': {e:#}", entry.name),
             }
         }
         Some(PlaybackSource {

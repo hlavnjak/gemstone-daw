@@ -54,3 +54,4 @@ winapi = { version = "0.3", features = ["winuser", "libloaderapi", "windef", "mi
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1"

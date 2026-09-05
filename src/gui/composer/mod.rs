@@ -4170,7 +4170,7 @@ mod tests {
             tempo_bpm: 100.0,
             rows: vec![project::ProjectRow {
                 track_name: "Voice".to_string(),
-                source: project::TrackSource::LeSynth { file: "Voice.lsft".to_string() },
+                source: project::TrackSource::LeSynth { file: "Voice.lsft".to_string(), state: None },
                 gain: 0.5,
                 lead: Duration::new(0, Fraction::Eighth),
                 enabled: true,
@@ -4203,7 +4203,7 @@ mod tests {
         let again = panel.to_project("Song", |_| project::TrackSource::None);
         assert_eq!(
             again.rows[0].source,
-            project::TrackSource::LeSynth { file: "Voice.lsft".to_string() },
+            project::TrackSource::LeSynth { file: "Voice.lsft".to_string(), state: None },
             "a re-save lost what the row was looking for"
         );
         assert_eq!(again.rows[0].track_name, "Voice.lsft");

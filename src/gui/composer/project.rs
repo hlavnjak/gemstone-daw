@@ -15,8 +15,11 @@
 //!
 //! A saved project is a **folder**, not a file: `MySong/` holds `MySong.gmstn`,
 //! one `.lsft` per LeSynth Fourier track any row plays, and one `.vststate` per
-//! custom VST3 track — the plugin's own state, which is where it keeps the knobs
-//! the user set. The folder is the unit you move, copy or hand to someone else,
+//! plugin track — the plugin's own state, which is where it keeps the knobs
+//! the user set. A LeSynth track has both, and needs both: the `.lsft` is the
+//! harmonic grid, the `.vststate` is every control that drew it (curve type,
+//! offset, granularity, and the nested-Fourier sliders), which the grid does
+//! not contain. The folder is the unit you move, copy or hand to someone else,
 //! and it carries its own sounds; what is left outside it is a third-party
 //! plugin's *binary*, and the audio file behind a wav track — neither is ours to
 //! copy, and the second is usually larger than the whole rest of the folder.
@@ -38,7 +41,7 @@
 //! [row]
 //! track = LeSynth Fourier 1
 //! source = lesynth voice.lsft
-//! state = Dexed.vststate
+//! state = LeSynth Fourier 1.vststate
 //! gain = 1
 //! lead = 0 none
 //! enabled = 1
@@ -89,7 +92,13 @@ pub const EXTENSION: &str = "gmstn";
 pub enum TrackSource {
     /// A LeSynth Fourier grid saved beside the manifest. The name is relative to
     /// the project folder, so the folder stays portable.
-    LeSynth { file: String },
+    ///
+    /// `state` names the plugin's own `.vststate` beside it. The grid is the
+    /// picture; the state is every control that drew it — each harmonic's curve
+    /// type, offset and granularity, and the nested-Fourier sliders under them,
+    /// none of which is in the grid. `None` is a project saved before this was
+    /// kept, which reloads its curves with the controls at their defaults.
+    LeSynth { file: String, state: Option<String> },
     /// A LeSynth Fourier track carrying no grid — the plugin's own synth mode.
     LeSynthDefault,
     /// A custom VST3, by absolute path. Not portable, and cannot be: the plugin
@@ -117,7 +126,7 @@ impl TrackSource {
     /// before trying to load it. `None` for sources that need nothing.
     pub fn required_path(&self, dir: &Path) -> Option<PathBuf> {
         match self {
-            Self::LeSynth { file } => Some(dir.join(file)),
+            Self::LeSynth { file, .. } => Some(dir.join(file)),
             // The plugin itself. A missing `.vststate` is not fatal — the track
             // loads with the plugin's defaults — so it is not required here.
             Self::Vst { path, .. } => Some(path.clone()),
@@ -131,7 +140,7 @@ impl TrackSource {
     /// How to name this source in a message when it cannot be found.
     pub fn describe(&self) -> String {
         match self {
-            Self::LeSynth { file } => file.clone(),
+            Self::LeSynth { file, .. } => file.clone(),
             Self::Vst { path, .. } | Self::Wav { path } => crate::file_label(path),
             Self::LeSynthDefault => "LeSynth Fourier".to_string(),
             Self::None => "no track".to_string(),
@@ -179,7 +188,9 @@ impl Project {
             s += "\n[row]\n";
             s += &format!("track = {}\n", one_line(&row.track_name));
             s += &format!("source = {}\n", write_source(&row.source));
-            if let TrackSource::Vst { state: Some(file), .. } = &row.source {
+            if let TrackSource::Vst { state: Some(file), .. }
+            | TrackSource::LeSynth { state: Some(file), .. } = &row.source
+            {
                 s += &format!("state = {}\n", one_line(file));
             }
             s += &format!("gain = {}\n", num(row.gain));
@@ -249,7 +260,9 @@ impl Project {
                 // Belongs to the source above it, which is where the writer puts
                 // it. Ignored for any other kind of source.
                 ("state", Some(row)) => {
-                    if let TrackSource::Vst { state, .. } = &mut row.source {
+                    if let TrackSource::Vst { state, .. }
+                    | TrackSource::LeSynth { state, .. } = &mut row.source
+                    {
                         *state = Some(value.to_string());
                     }
                 }
@@ -401,7 +414,7 @@ fn frac_from_token(t: &str) -> Result<(u8, Fraction)> {
 
 fn write_source(s: &TrackSource) -> String {
     match s {
-        TrackSource::LeSynth { file } => format!("lesynth {}", one_line(file)),
+        TrackSource::LeSynth { file, .. } => format!("lesynth {}", one_line(file)),
         TrackSource::LeSynthDefault => "lesynth -".to_string(),
         // The state file, if any, rides on its own `state =` line: the path here
         // is the rest of the line, so nothing can follow it.
@@ -427,7 +440,7 @@ fn read_source(v: &str) -> Result<TrackSource> {
         return Ok(if rest.is_empty() || rest == "-" {
             TrackSource::LeSynthDefault
         } else {
-            TrackSource::LeSynth { file: rest.to_string() }
+            TrackSource::LeSynth { file: rest.to_string(), state: None }
         });
     }
     if let Some(hex) = kind.strip_prefix("vst:") {
@@ -477,7 +490,7 @@ mod tests {
             rows: vec![
                 ProjectRow {
                     track_name: "LeSynth Fourier 1".to_string(),
-                    source: TrackSource::LeSynth { file: "voice.lsft".to_string() },
+                    source: TrackSource::LeSynth { file: "voice.lsft".to_string(), state: None },
                     gain: 0.75,
                     lead: Duration::new(0, Fraction::Eighth),
                     enabled: true,
@@ -676,7 +689,11 @@ mod tests {
         for src in [
             TrackSource::None,
             TrackSource::LeSynthDefault,
-            TrackSource::LeSynth { file: "a b.lsft".to_string() },
+            TrackSource::LeSynth { file: "a b.lsft".to_string(), state: None },
+            TrackSource::LeSynth {
+                file: "a b.lsft".to_string(),
+                state: Some("a b.vststate".to_string()),
+            },
             TrackSource::Vst { path: PathBuf::from("/x/y.so"), class_id: None, state: None },
             TrackSource::Vst {
                 path: PathBuf::from("/x/y.so"),
@@ -696,6 +713,22 @@ mod tests {
             let back = Project::parse(&p.to_text()).expect("parses");
             assert_eq!(back.rows[0].source, src);
         }
+    }
+
+    /// A project written before a LeSynth track kept its plugin state has no
+    /// `state =` line under `source = lesynth …`. It must still load — with the
+    /// grid, and with the controls that drew it left at their defaults — rather
+    /// than being refused or half-read.
+    #[test]
+    fn a_lesynth_row_without_a_state_line_still_loads() {
+        let text = "gemstone-project 1\nname = X\ntempo = 120\n\n[row]\n\
+                    track = LeSynth Fourier 1\nsource = lesynth voice.lsft\n\
+                    gain = 1\nlead = 0 none\n";
+        let p = Project::parse(text).expect("parses");
+        assert_eq!(
+            p.rows[0].source,
+            TrackSource::LeSynth { file: "voice.lsft".to_string(), state: None }
+        );
     }
 
     /// A project name is a folder name, so it must survive being typed.
@@ -753,7 +786,7 @@ mod folder_tests {
             tempo_bpm: 100.0,
             rows: vec![ProjectRow {
                 track_name: "Voice".to_string(),
-                source: TrackSource::LeSynth { file: "Voice.lsft".to_string() },
+                source: TrackSource::LeSynth { file: "Voice.lsft".to_string(), state: None },
                 gain: 1.0,
                 lead: Duration::new(0, Fraction::None),
                 enabled: true,
@@ -791,7 +824,7 @@ mod folder_tests {
             tempo_bpm: 120.0,
             rows: vec![ProjectRow {
                 track_name: "Voice".to_string(),
-                source: TrackSource::LeSynth { file: "Voice.lsft".to_string() },
+                source: TrackSource::LeSynth { file: "Voice.lsft".to_string(), state: None },
                 gain: 1.0,
                 lead: Duration::new(0, Fraction::None),
                 enabled: true,

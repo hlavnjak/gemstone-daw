@@ -312,9 +312,10 @@ impl DawApp {
     }
 
     /// Write the project folder: the manifest, one `.lsft` for every LeSynth
-    /// Fourier track a row plays, and one `.vststate` for every custom VST3 —
-    /// the plugin's own state, which is where its knobs live. Returns how many
-    /// sound files were written.
+    /// Fourier track a row plays, and one `.vststate` for every plugin track —
+    /// the plugin's own state, which is where its knobs live. A LeSynth track
+    /// gets both: the `.lsft` is its harmonic grid, the `.vststate` is every
+    /// control that drew it. Returns how many sound files were written.
     ///
     /// A file is re-written when any row playing that track has autosave on;
     /// otherwise an existing one is left as it is, which is what pins a sound. A
@@ -345,24 +346,27 @@ impl DawApp {
                 sources.insert(id, TrackSource::Wav { path });
                 continue;
             }
-            if !src.is_lesynth {
-                // A third-party plugin's binary stays where it is — but the state
-                // it is playing does not live in the plugin, it lives in the
-                // instance, so the project keeps a copy beside the manifest.
-                let mut state_file = None;
-                if let Some(bytes) = &src.vst_state {
-                    let file = project::unique_file_name(&track_name, "vststate", &taken);
-                    let full = dir.join(&file);
-                    // Same rule as a grid: autosave off with a file already there
-                    // means "keep what is pinned".
-                    if autosave.contains(&id) || !full.exists() {
-                        std::fs::write(&full, bytes)
-                            .with_context(|| format!("write {}", crate::file_label(&full)))?;
-                        written += 1;
-                    }
-                    taken.push(file.clone());
-                    state_file = Some(file);
+            // The plugin's own state, whatever kind of plugin it is. For a
+            // third-party VST3 it is the only thing the project can keep — its
+            // binary stays where it is. For LeSynth it is everything *beside*
+            // the grid: each harmonic's curve type, offset and granularity, and
+            // the nested-Fourier sliders under them. Saving only the grid
+            // reloads the curves with every control that drew them at zero.
+            let mut state_file = None;
+            if let Some(bytes) = &src.vst_state {
+                let file = project::unique_file_name(&track_name, "vststate", &taken);
+                let full = dir.join(&file);
+                // Same rule as a grid: autosave off with a file already there
+                // means "keep what is pinned".
+                if autosave.contains(&id) || !full.exists() {
+                    std::fs::write(&full, bytes)
+                        .with_context(|| format!("write {}", crate::file_label(&full)))?;
+                    written += 1;
                 }
+                taken.push(file.clone());
+                state_file = Some(file);
+            }
+            if !src.is_lesynth {
                 sources.insert(
                     id,
                     TrackSource::Vst {
@@ -389,7 +393,7 @@ impl DawApp {
                 written += 1;
             }
             taken.push(file.clone());
-            sources.insert(id, TrackSource::LeSynth { file });
+            sources.insert(id, TrackSource::LeSynth { file, state: state_file });
         }
 
         let project = self.composer.to_project(name, |track_id| {
@@ -436,7 +440,27 @@ impl DawApp {
         self.composer.apply_project(&project, dir, &resolved);
         Ok(())
     }
+}
 
+/// Read a plugin's saved `.vststate` from the project folder. A state file that
+/// has gone missing is not fatal: the track loads, and the plugin comes up on
+/// its own defaults.
+fn read_state_file(
+    dir: &std::path::Path,
+    file: Option<&str>,
+    track_name: &str,
+) -> Option<Vec<u8>> {
+    let full = dir.join(file?);
+    match std::fs::read(&full) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            log::warn!("'{track_name}': cannot read {} ({e})", full.display());
+            None
+        }
+    }
+}
+
+impl DawApp {
     /// Bind one project source to a track, or `None` when it cannot be found —
     /// a deleted `.lsft`, or a VST that has moved. The row then shows what is
     /// missing and the user picks a replacement.
@@ -449,10 +473,14 @@ impl DawApp {
         let name = if name.is_empty() { "Track" } else { name };
         match source {
             TrackSource::None => None,
-            TrackSource::LeSynthDefault => self.tracks.adopt_lesynth(name, None).ok(),
-            TrackSource::LeSynth { file } => {
-                let state = crate::track_format::TrackState::read(&dir.join(file)).ok()?;
-                self.tracks.adopt_lesynth(name, Some(state)).ok()
+            TrackSource::LeSynthDefault => self.tracks.adopt_lesynth(name, None, None).ok(),
+            TrackSource::LeSynth { file, state } => {
+                let grid = crate::track_format::TrackState::read(&dir.join(file)).ok()?;
+                // The controls that drew the grid. A project saved before these
+                // were kept — or one whose file has gone missing — still loads:
+                // the curves come back, the controls under them read as new.
+                let bytes = read_state_file(dir, state.as_deref(), name);
+                self.tracks.adopt_lesynth(name, Some(grid), bytes).ok()
             }
             TrackSource::Wav { path } => {
                 if !path.exists() {
@@ -477,18 +505,7 @@ impl DawApp {
                 Some(id)
             }
             TrackSource::Vst { path, class_id, state } => {
-                // A state file that has gone missing is not fatal: the track
-                // loads, and the plugin comes up on its own defaults.
-                let bytes = state.as_ref().and_then(|file| {
-                    let full = dir.join(file);
-                    match std::fs::read(&full) {
-                        Ok(b) => Some(b),
-                        Err(e) => {
-                            log::warn!("'{name}': cannot read {} ({e})", full.display());
-                            None
-                        }
-                    }
-                });
+                let bytes = read_state_file(dir, state.as_deref(), name);
                 self.tracks.adopt_vst(name, path.clone(), *class_id, bytes).ok()
             }
         }

@@ -246,23 +246,27 @@ impl PluginTrack {
     /// a custom VST3 whose knobs had just been set by hand.
     fn capture_editor_state(&mut self, registry: &TrackRegistry) {
         let Some(editor) = &self.editor else { return };
-        match self.kind {
-            TrackKind::LeSynth => {
-                // An instance in plain synth mode has no grid to export; that is
-                // not a failure, it is a track with nothing to remember.
-                if let Ok(state) = editor.export_state() {
-                    registry.set_state(self.registry_id, Some(state.clone()));
-                    self.import_state = Some(state);
-                }
+        if let TrackKind::LeSynth = self.kind {
+            // An instance in plain synth mode has no grid to export; that is
+            // not a failure, it is a track with nothing to remember.
+            if let Ok(state) = editor.export_state() {
+                registry.set_state(self.registry_id, Some(state.clone()));
+                self.import_state = Some(state);
             }
-            TrackKind::CustomVst => match editor.plugin().component_state() {
-                Ok(bytes) if !bytes.is_empty() => {
-                    registry.set_vst_state(self.registry_id, Some(bytes.clone()));
-                    self.vst_state = Some(bytes);
-                }
-                Ok(_) => {}
-                Err(e) => log::warn!("'{}' state capture failed: {e:#}", self.name),
-            },
+        }
+        // Every plugin, LeSynth included, also keeps its own state — and for
+        // LeSynth that is where the whole Synth editor lives: the curve type,
+        // offset and granularity of each harmonic, and the nested-Fourier
+        // sliders under them. The grid says what the curves *are*; this says
+        // what drew them, and without it reopening the track shows a correct
+        // picture over controls that all read zero.
+        match editor.plugin().component_state() {
+            Ok(bytes) if !bytes.is_empty() => {
+                registry.set_vst_state(self.registry_id, Some(bytes.clone()));
+                self.vst_state = Some(bytes);
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("'{}' state capture failed: {e:#}", self.name),
         }
     }
 
@@ -614,7 +618,16 @@ impl TracksPanel {
     /// project does for every row that plays one. Returns its registry id.
     ///
     /// `state` is `None` for a plain synth-mode track (no grid to import).
-    pub fn adopt_lesynth(&mut self, name: &str, state: Option<TrackState>) -> Result<u64> {
+    /// `vst_state` is the plugin's own saved state, which is where everything
+    /// *beside* the grid lives — the curve type, offset and granularity of every
+    /// harmonic, and the nested-Fourier sliders under them. The grid alone
+    /// reloads the picture and none of the controls that drew it.
+    pub fn adopt_lesynth(
+        &mut self,
+        name: &str,
+        state: Option<TrackState>,
+        vst_state: Option<Vec<u8>>,
+    ) -> Result<u64> {
         let path = Self::internal_plugin_path()
             .filter(|p| p.exists())
             .context("internal LeSynth Fourier plugin not found")?;
@@ -626,6 +639,7 @@ impl TracksPanel {
             true,
             state.clone(),
         );
+        self.registry.set_vst_state(registry_id, vst_state.clone());
         self.tracks.push(PluginTrack {
             id,
             registry_id,
@@ -634,7 +648,7 @@ impl TracksPanel {
             plugin_path: path,
             class_id: Some(class_ids::FOURIER_SYNTH),
             import_state: state,
-            vst_state: None,
+            vst_state,
             midi_source: None,
             feed: None,
             editor: None,
