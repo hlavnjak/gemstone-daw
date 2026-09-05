@@ -122,11 +122,18 @@ const ROW_H: f32 = CARD_H + 10.0;
 /// Width of the fixed row head (track select, add-note, gain).
 const HEAD_W: f32 = 284.0;
 
-/// The loudest a row may be set to. Well past unity: a drum sampled quietly, or
-/// a resynthesised voice analysed well below full scale, has to come up to a
-/// lead rather than the whole rest of the composition coming down to it. The
-/// mix clamps at full scale, which is what limits how much of this is useful.
-const GAIN_MAX: f32 = 8.0;
+/// The loudest a row may be set to, +34 dB. Well past unity: a drum sampled
+/// quietly, or a resynthesised voice analysed well below full scale, has to
+/// come up to a lead rather than the whole rest of the composition coming down
+/// to it, and a source peaking at -30 dBFS needs more than eight times. The mix
+/// clamps at full scale, which is what limits how much of this is useful.
+const GAIN_MAX: f32 = 50.0;
+
+/// Where the row gain slider's travel starts, -40 dB. Below it the slider drops
+/// to silence: the range spans four decades logarithmically, so unity keeps
+/// half the travel instead of the two percent a linear run to [`GAIN_MAX`]
+/// would leave it.
+const GAIN_MIN_TRAVEL: f64 = 0.01;
 
 /// Lowest and highest note offered, C0..B8.
 const PITCH_MIN: u8 = 12;
@@ -2221,6 +2228,8 @@ impl ComposerPanel {
                                         ui.spacing_mut().slider_width = 76.0;
                                         ui.add(
                                             egui::Slider::new(&mut row.gain, 0.0..=GAIN_MAX)
+                                                .logarithmic(true)
+                                                .smallest_positive(GAIN_MIN_TRAVEL)
                                                 .fixed_decimals(2)
                                                 .show_value(true),
                                         )
@@ -2228,7 +2237,11 @@ impl ComposerPanel {
                                             "How loud this row plays in the mix. 1.00 is \
                                              the track's own level; above it the row is \
                                              boosted, so a quiet drum can hold its own \
-                                             against a loud lead.\n\nThe mix is clamped \
+                                             against a loud lead.\n\nThe travel is \
+                                             logarithmic, a fader rather than a ruler: \
+                                             unity sits mid-way and the top is 50.00, \
+                                             enough to lift a source analysed thirty \
+                                             decibels down.\n\nThe mix is clamped \
                                              at full scale, so a boost that takes the sum \
                                              past it distorts rather than gets louder.",
                                         );
