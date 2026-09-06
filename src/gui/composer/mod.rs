@@ -5074,4 +5074,89 @@ mod tests {
             "the last row is not the new empty one"
         );
     }
+
+    /// TEMPORARY: render a project folder to a wav, offline. Not part of the
+    /// suite (`#[ignore]`); it exists to hear a hand-written manifest.
+    ///
+    ///   GEMSTONE_PROJECT=/path/to/X.gmstn GEMSTONE_OUT=/tmp/x.wav \
+    ///     cargo test --lib render_named_project -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn render_named_project() {
+        let file = std::path::PathBuf::from(std::env::var("GEMSTONE_PROJECT").unwrap());
+        let out = std::env::var("GEMSTONE_OUT").unwrap();
+        let dir = file.parent().unwrap().to_path_buf();
+        let proj = project::Project::read(&file).unwrap();
+        let spu = 60.0 / (proj.tempo_bpm.max(1.0) as f64) / UNITS_PER_BEAT as f64;
+        let internal = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("internal_plugins")
+            .join("liblesynth_fourier.so");
+
+        let mut plans = Vec::new();
+        for (i, prow) in proj.rows.iter().enumerate() {
+            if !prow.enabled {
+                continue;
+            }
+            if let Ok(solo) = std::env::var("GEMSTONE_SOLO") {
+                if solo.parse::<usize>() != Ok(i) {
+                    continue;
+                }
+            }
+            let read_state = |f: &Option<String>| {
+                f.as_ref().and_then(|f| std::fs::read(dir.join(f)).ok())
+            };
+            let source = match &prow.source {
+                project::TrackSource::LeSynth { file, state } => {
+                    crate::gui::registry::PlaybackSource {
+                        name: prow.track_name.clone(),
+                        plugin_path: internal.clone(),
+                        class_id: Some(crate::vst::class_ids::FOURIER_SYNTH),
+                        is_lesynth: true,
+                        state: Some(
+                            crate::track_format::TrackState::read(&dir.join(file)).unwrap(),
+                        ),
+                        vst_state: read_state(state),
+                        wav: None,
+                    }
+                }
+                project::TrackSource::Vst { path, class_id, state } => {
+                    crate::gui::registry::PlaybackSource {
+                        name: prow.track_name.clone(),
+                        plugin_path: path.clone(),
+                        class_id: *class_id,
+                        is_lesynth: false,
+                        state: None,
+                        vst_state: read_state(state),
+                        wav: None,
+                    }
+                }
+                other => panic!("unsupported source {other:?}"),
+            };
+            let mut at = prow.lead.units();
+            let mut notes = Vec::new();
+            for item in &prow.items {
+                let units = item.dur.units();
+                if units > 0 {
+                    notes.push(player::PlannedNote {
+                        at_secs: at as f64 * spu,
+                        dur_secs: units as f64 * spu,
+                        pitch: item.pitch,
+                        start_secs: item.start as f64,
+                    });
+                }
+                at += item.total_units();
+            }
+            println!("row {i}: {} — {} note(s), gain {}", prow.track_name, notes.len(), prow.gain);
+            plans.push(player::RowPlan {
+                row_id: i as u64,
+                source,
+                gain: prow.gain,
+                notes,
+            });
+        }
+
+        let (samples, rows, total) = player::render_offline(plans, 44100.0, 2).unwrap();
+        println!("rendered {rows}/{total} rows, {:.2}s", samples.len() as f64 / 2.0 / 44100.0);
+        crate::audio::write_wav_i16(std::path::Path::new(&out), &samples, 2, 44100).unwrap();
+    }
 }
