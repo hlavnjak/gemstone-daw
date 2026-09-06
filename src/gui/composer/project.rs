@@ -39,6 +39,7 @@
 //! tempo = 120
 //!
 //! [row]
+//! name = lead
 //! track = LeSynth Fourier 1
 //! source = lesynth voice.lsft
 //! state = LeSynth Fourier 1.vststate
@@ -66,6 +67,12 @@
 //! rather than failing — `enabled`, the newest of them, is exactly that: an
 //! older build ignores the key and plays the row, and a project written before
 //! it existed has no key and reads as `enabled`, which is what a row is.
+//!
+//! `name` means two things, told apart by where it is: above the first `[row]`
+//! it is the project's name, and inside a row it is the **row's**. That is not a
+//! collision to work around — it is the same word for the same thing at two
+//! levels — and an older build, whose reader only knows the project's, skips the
+//! row's and loads the row unnamed.
 //!
 //! The version line is checked, so a *newer* format is
 //! refused with a message instead of being half-read. A *source kind* added
@@ -151,6 +158,10 @@ impl TrackSource {
 /// One lane: which sound it plays, how loud, and the chain of frames on it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectRow {
+    /// What the row is called — see [`super::Row::name`]. Empty is a project
+    /// written before rows had names, and reads as "unnamed": the row is given
+    /// a fresh UUID when it is loaded, exactly as a new row would be.
+    pub name: String,
     /// Display name of the track, kept so a row whose source has gone missing
     /// can still say what it was looking for.
     pub track_name: String,
@@ -186,6 +197,12 @@ impl Project {
         s += &format!("tempo = {}\n", num(self.tempo_bpm));
         for row in &self.rows {
             s += "\n[row]\n";
+            // The row's own name first: inside a [row] block `name` is the
+            // row's, and a build too old to know the key skips it and loads the
+            // row it always did.
+            if !row.name.is_empty() {
+                s += &format!("name = {}\n", one_line(&row.name));
+            }
             s += &format!("track = {}\n", one_line(&row.track_name));
             s += &format!("source = {}\n", write_source(&row.source));
             if let TrackSource::Vst { state: Some(file), .. }
@@ -237,6 +254,7 @@ impl Project {
         for line in lines {
             if line == "[row]" {
                 project.rows.push(ProjectRow {
+                    name: String::new(),
                     track_name: String::new(),
                     source: TrackSource::None,
                     gain: 1.0,
@@ -254,6 +272,7 @@ impl Project {
             let (key, value) = (key.trim(), value.trim());
             match (key, project.rows.last_mut()) {
                 ("name", None) => project.name = value.to_string(),
+                ("name", Some(row)) => row.name = value.to_string(),
                 ("tempo", None) => project.tempo_bpm = value.parse().unwrap_or(120.0),
                 ("track", Some(row)) => row.track_name = value.to_string(),
                 ("source", Some(row)) => row.source = read_source(value)?,
@@ -489,6 +508,7 @@ mod tests {
             tempo_bpm: 132.5,
             rows: vec![
                 ProjectRow {
+                    name: "lead".to_string(),
                     track_name: "LeSynth Fourier 1".to_string(),
                     source: TrackSource::LeSynth { file: "voice.lsft".to_string(), state: None },
                     gain: 0.75,
@@ -517,6 +537,9 @@ mod tests {
                     ],
                 },
                 ProjectRow {
+                    // A name with spaces in it, and one that is not a UUID:
+                    // whatever the user typed is what comes back.
+                    name: "the other one".to_string(),
                     track_name: "some-plugin.so".to_string(),
                     source: TrackSource::Vst {
                         path: PathBuf::from("/opt/vst3/some plugin.so"),
@@ -785,6 +808,7 @@ mod folder_tests {
             name: "Song".to_string(),
             tempo_bpm: 100.0,
             rows: vec![ProjectRow {
+                name: "Voice row".to_string(),
                 track_name: "Voice".to_string(),
                 source: TrackSource::LeSynth { file: "Voice.lsft".to_string(), state: None },
                 gain: 1.0,
@@ -823,6 +847,7 @@ mod folder_tests {
             name: "Song".to_string(),
             tempo_bpm: 120.0,
             rows: vec![ProjectRow {
+                name: "Voice row".to_string(),
                 track_name: "Voice".to_string(),
                 source: TrackSource::LeSynth { file: "Voice.lsft".to_string(), state: None },
                 gain: 1.0,

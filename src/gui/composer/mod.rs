@@ -506,6 +506,20 @@ impl Item {
 struct Row {
     /// Stable id, so egui widget state survives rows being removed above them.
     id: u64,
+    /// What this row is **called**. A row nobody has named is named after a
+    /// fresh UUID, so every row has a name from the moment it exists and no two
+    /// rows start out sharing one; the box on the row's head replaces it with
+    /// whatever the user would rather call it.
+    ///
+    /// A name is for reading, not for looking up: nothing addresses a row by it,
+    /// so two rows *may* end up called the same thing, and a renamed row is the
+    /// same row it was. That is deliberate — the id above is what identity is
+    /// made of, and a name the user cannot repeat is a name they have to fight.
+    name: String,
+    /// The name as typed, before Rename commits it. Kept apart from `name` so a
+    /// half-typed name is not yet the row's name, and so a box the user thinks
+    /// better of is abandoned by simply not pressing the button.
+    name_edit: String,
     /// The Track this row plays, by registry id. `None` only while the registry
     /// is empty.
     track_id: Option<u64>,
@@ -564,8 +578,15 @@ struct Row {
 
 impl Row {
     fn new(id: u64, track_id: Option<u64>) -> Self {
+        // Named before it is anything else. A UUID says nothing about the row,
+        // which is the point: it is a name that is already there to be replaced,
+        // rather than a "Row 3" that goes on meaning row 3 after two rows above
+        // it have gone.
+        let name = uuid::Uuid::new_v4().to_string();
         Self {
             id,
+            name: name.clone(),
+            name_edit: name,
             track_id,
             gain: 1.0,
             lead: Duration::new(0, Fraction::None),
@@ -576,6 +597,45 @@ impl Row {
             items: Vec::new(),
             next_item_id: 0,
             sel: None,
+        }
+    }
+
+    /// Name the row outright — the box and the name both, so nothing is left
+    /// looking half-edited. What loading a project and naming a new row use.
+    fn set_name(&mut self, name: String) {
+        self.name_edit = name.clone();
+        self.name = name;
+    }
+
+    /// Take what is in the box as the row's name. Whitespace at either end goes,
+    /// and a box holding nothing but that renames nothing: a row with no name at
+    /// all could not be spoken about, and the UUID it already has is better than
+    /// the blank that would replace it.
+    ///
+    /// Reports whether the name actually changed, which is what the status line
+    /// is written from.
+    fn commit_name(&mut self) -> bool {
+        let name = self.name_edit.trim().to_string();
+        if name.is_empty() || name == self.name {
+            // Put the box back to what the row is called, so a stray space or an
+            // abandoned edit does not sit there looking pending.
+            self.name_edit = self.name.clone();
+            return false;
+        }
+        self.set_name(name);
+        true
+    }
+
+    /// What to call this row in a status line. A row nobody has named is called
+    /// after a UUID, and thirty-six characters of hex tells the reader nothing
+    /// they can use, so it is cut to its first block — enough to tell two rows
+    /// apart in a sentence, while the box on the row still holds all of it.
+    fn label(&self) -> String {
+        let is_uuid = self.name.len() == 36 && uuid::Uuid::parse_str(&self.name).is_ok();
+        if is_uuid {
+            format!("{}…", &self.name[..8])
+        } else {
+            self.name.clone()
         }
     }
 
@@ -967,6 +1027,10 @@ pub struct ComposerPanel {
     /// four times rather than twice, and a repeat that takes one press is the
     /// difference between writing the arrangement and typing it.
     clone_times: u8,
+    /// The name to give the next row, as typed into the box beside either Add
+    /// Track Row button. Empty — which is how it starts and how it is left
+    /// behind every row that takes it — means the row is named after a UUID.
+    new_row_name: String,
 }
 
 impl ComposerPanel {
@@ -991,6 +1055,7 @@ impl ComposerPanel {
             record_track: None,
             clip: None,
             clone_times: 1,
+            new_row_name: String::new(),
         }
     }
 
@@ -1012,10 +1077,20 @@ impl ComposerPanel {
         let id = self.next_row_id;
         self.next_row_id += 1;
         let track = self.registry.first_id();
-        self.rows.insert(at, Row::new(id, track));
+        let mut row = Row::new(id, track);
+        // The box beside the button names the row that button makes, and is
+        // emptied behind it: a name is typed for the row it was typed for, and
+        // the row after it goes back to a UUID rather than quietly becoming a
+        // second row of the same name.
+        let typed = std::mem::take(&mut self.new_row_name).trim().to_string();
+        if !typed.is_empty() {
+            row.set_name(typed);
+        }
+        let label = row.label();
+        self.rows.insert(at, row);
         self.status = match track.and_then(|t| self.registry.name_of(t)) {
-            Some(name) => format!("Added a row playing {name}."),
-            None => "Added a row — no tracks exist yet to assign it to.".to_string(),
+            Some(name) => format!("Added row {label}, playing {name}."),
+            None => format!("Added row {label} — no tracks exist yet to assign it to."),
         };
     }
 
@@ -1669,6 +1744,29 @@ impl ComposerPanel {
         self.export = Some(rx);
     }
 
+    /// The optional name for the next row, beside the button that makes it.
+    ///
+    /// Both Add Track Row buttons are served by the same box: there is one name
+    /// being typed at a time, whichever end of the list the row is going on, so
+    /// a name typed at the bottom is still there if the row is added at the top.
+    /// `salt` only keeps the two boxes' widget state apart.
+    fn new_row_name_ui(&mut self, ui: &mut egui::Ui, salt: &'static str) {
+        ui.label("name");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.new_row_name)
+                .id_salt(salt)
+                .desired_width(150.0)
+                .hint_text("(a UUID)"),
+        )
+        .on_hover_text(
+            "What to call the row this button makes. Optional: a row left \
+             unnamed is named after a UUID, which is unique without anyone \
+             having to think of anything.\n\nThe box empties into the row it \
+             names, so the next row gets a UUID again — and any row can be \
+             renamed afterwards, on the row itself.",
+        );
+    }
+
     fn stop_playback(&mut self) {
         // The take is closed first: the transport is the clock it is placed on,
         // so it cannot be read after the player has gone.
@@ -1738,6 +1836,7 @@ impl ComposerPanel {
             {
                 self.add_row_at(0);
             }
+            self.new_row_name_ui(ui, "new_row_name_top");
             // One switch for all of them, next to the button that makes them.
             // It shows what is true — unticked the moment any row is off — and
             // a click makes every row agree with it, which is how a part is
@@ -1788,13 +1887,18 @@ impl ComposerPanel {
             // lane — then dragging nothing, since rows do not move — is the
             // long way round.
             ui.add_space(2.0);
-            if ui
-                .button("➕ Add Track Row")
-                .on_hover_text("A new lane at the end of the list, playing the first available track")
-                .clicked()
-            {
-                self.add_row();
-            }
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("➕ Add Track Row")
+                    .on_hover_text(
+                        "A new lane at the end of the list, playing the first available track",
+                    )
+                    .clicked()
+                {
+                    self.add_row();
+                }
+                self.new_row_name_ui(ui, "new_row_name_bottom");
+            });
         }
 
         ui.add_space(8.0);
@@ -1824,6 +1928,7 @@ impl ComposerPanel {
                 .rows
                 .iter()
                 .map(|row| project::ProjectRow {
+                    name: row.name.clone(),
                     track_name: row
                         .track_id
                         .and_then(|id| self.registry.name_of(id))
@@ -1865,6 +1970,12 @@ impl ComposerPanel {
             self.next_row_id += 1;
             let track_id = resolved.get(i).copied().flatten();
             let mut row = Row::new(id, track_id);
+            // A project written before rows had names leaves this empty, and the
+            // row keeps the UUID it was just given: unnamed rows are named, not
+            // left blank, however old the file they came out of.
+            if !prow.name.is_empty() {
+                row.set_name(prow.name.clone());
+            }
             row.gain = prow.gain;
             row.lead = prow.lead;
             row.enabled = prow.enabled;
@@ -2134,6 +2245,9 @@ impl ComposerPanel {
 
     fn lanes_ui(&mut self, ui: &mut egui::Ui, tracks: &[(u64, String)]) {
         let mut remove_row: Option<usize> = None;
+        // Deferred like the removal, and for the same reason: the status line
+        // belongs to the panel, and the rows are borrowed for the whole loop.
+        let mut renamed: Option<String> = None;
         let playhead = self.playhead_units();
         // What a grid unit is worth in seconds, for the frames that have to turn
         // a stretch of a recording into a length.
@@ -2171,6 +2285,53 @@ impl ComposerPanel {
                                 egui::vec2(HEAD_W, ROW_H),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
+                                    ui.horizontal(|ui| {
+                                        // The row's own name, and the form that
+                                        // changes it. The box holds a draft:
+                                        // nothing is renamed until Rename is
+                                        // pressed — or Enter, which is the same
+                                        // press for anyone already typing — so a
+                                        // name half typed is not yet the row's,
+                                        // and an edit thought better of is
+                                        // abandoned by leaving it alone.
+                                        let typed = ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut row.name_edit)
+                                                    .id_salt(("row_name", row_id))
+                                                    .desired_width(148.0)
+                                                    .hint_text("row name"),
+                                            )
+                                            .on_hover_text(format!(
+                                                "This row is called “{}”.\n\nType another \
+                                                 name and press Rename. A row's name is \
+                                                 for reading — nothing is looked up by \
+                                                 it, and it is saved with the project.",
+                                                row.name
+                                            ));
+                                        let entered = typed.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        // The button is live only while the box
+                                        // holds a name that would change
+                                        // something, so it says whether there is
+                                        // an edit waiting on it.
+                                        let pending = {
+                                            let want = row.name_edit.trim();
+                                            !want.is_empty() && want != row.name
+                                        };
+                                        let pressed = ui
+                                            .add_enabled(pending, egui::Button::new("✏"))
+                                            .on_hover_text(
+                                                "Rename this row to what is in the box.\n\n\
+                                                 Greyed out while the box holds the name \
+                                                 the row already has, or nothing at all: \
+                                                 a row always has a name, and the UUID it \
+                                                 was given is better than a blank.",
+                                            )
+                                            .clicked();
+                                        if (pressed || entered) && row.commit_name() {
+                                            renamed = Some(row.name.clone());
+                                        }
+                                    });
                                     ui.horizontal(|ui| {
                                         // A row whose loaded source is missing
                                         // says so in the box itself, and says
@@ -2373,10 +2534,13 @@ impl ComposerPanel {
             ui.add_space(4.0);
         }
 
+        if let Some(name) = renamed {
+            self.status = format!("Renamed a row to {name}.");
+        }
         if let Some(idx) = remove_row {
             if idx < self.rows.len() {
-                self.rows.remove(idx);
-                self.status = "Removed a row.".to_string();
+                let row = self.rows.remove(idx);
+                self.status = format!("Removed row {}.", row.label());
             }
         }
     }
@@ -4206,6 +4370,7 @@ mod tests {
             name: "Song".to_string(),
             tempo_bpm: 100.0,
             rows: vec![project::ProjectRow {
+                name: "the voice".to_string(),
                 track_name: "Voice".to_string(),
                 source: project::TrackSource::LeSynth { file: "Voice.lsft".to_string(), state: None },
                 gain: 0.5,
@@ -4268,6 +4433,7 @@ mod tests {
             tempo_bpm: 88.0,
             rows: vec![
                 project::ProjectRow {
+                    name: "first".to_string(),
                     track_name: "a".to_string(),
                     source: project::TrackSource::LeSynthDefault,
                     gain: 1.5,
@@ -4281,6 +4447,10 @@ mod tests {
                     items: vec![],
                 },
                 project::ProjectRow {
+                    // Left unnamed, the way a project saved before rows had
+                    // names has every row: this one must still come back with a
+                    // name of its own.
+                    name: String::new(),
                     track_name: "b".to_string(),
                     source: project::TrackSource::LeSynthDefault,
                     gain: 0.25,
@@ -4314,6 +4484,16 @@ mod tests {
         assert_eq!(panel.rows[1].items[0].pitch, 70);
         // Row ids stay unique, so two rows never share egui widget state.
         assert_ne!(panel.rows[0].id, panel.rows[1].id);
+        // The name the project saved comes back on the row it was saved for…
+        assert_eq!(panel.rows[0].name, "first");
+        assert_eq!(panel.rows[0].name_edit, "first", "the box shows what the row is called");
+        // …and a row that was saved without one is still named, by the UUID it
+        // was given on the way in — an unnamed row is not a blank row.
+        assert!(
+            uuid::Uuid::parse_str(&panel.rows[1].name).is_ok(),
+            "a row loaded from a project with no name should fall back to a UUID, got {:?}",
+            panel.rows[1].name
+        );
         // And only rows with autosave on ask for a fresh grid.
         assert_eq!(panel.autosave_track_ids(), vec![ids[0]]);
     }
@@ -4979,6 +5159,166 @@ mod tests {
             Some((0, 1)),
             "shift did not reach the button — the block would only ever grow"
         );
+    }
+
+    /// Every row has a name from the moment it exists — a UUID unless the box
+    /// beside the button says otherwise — and that box empties into the row it
+    /// names, so the next row is not quietly a second row of the same name.
+    #[test]
+    fn a_new_row_is_named_by_the_box_or_by_a_uuid() {
+        let (registry, _) = registry_with(&["one"]);
+        let mut panel = ComposerPanel::new(registry, crate::midi::new_midi_taps());
+
+        panel.add_row();
+        let auto = panel.rows[0].name.clone();
+        assert!(
+            uuid::Uuid::parse_str(&auto).is_ok(),
+            "an unnamed row should be named after a UUID, got {auto:?}"
+        );
+        assert_eq!(panel.rows[0].name_edit, auto, "the row's box shows its name");
+
+        // Two rows made the same way are not called the same thing — which is
+        // the whole reason the default is a UUID and not "Row 1".
+        panel.add_row();
+        assert_ne!(panel.rows[0].name, panel.rows[1].name);
+
+        // A name in the box goes on the row that button makes…
+        panel.new_row_name = "  bass line  ".to_string();
+        panel.add_row_at(0);
+        assert_eq!(panel.rows[0].name, "bass line", "the name is taken, trimmed");
+        assert_eq!(panel.rows[0].name_edit, "bass line");
+        assert!(
+            panel.status.contains("bass line"),
+            "the status should say what was added: {}",
+            panel.status
+        );
+
+        // …and only on that row: the box is empty behind it.
+        assert_eq!(panel.new_row_name, "");
+        panel.add_row();
+        assert!(
+            uuid::Uuid::parse_str(&panel.rows.last().unwrap().name).is_ok(),
+            "the row after a named one should go back to a UUID"
+        );
+
+        // A status line names the row without reciting thirty-six characters of
+        // hex at the user, while the row itself keeps the whole of it.
+        let row = &panel.rows[3];
+        assert_eq!(row.label(), format!("{}…", &row.name[..8]));
+        assert_eq!(panel.rows[0].label(), "bass line", "a name the user typed is quoted whole");
+    }
+
+    /// The rename form on a row, through the real widgets: a name typed into
+    /// the box is a *draft* until the button is pressed, so an edit thought
+    /// better of costs nothing, and the button says whether there is one
+    /// waiting on it.
+    #[test]
+    fn a_row_is_renamed_by_its_own_box_and_button() {
+        let mut panel = panel_with_rows(&[&[(60, frac(Fraction::Quarter), frac(Fraction::None))]]);
+        panel.rows[0].set_name("old name".to_string());
+
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let run = |panel: &mut ComposerPanel, input: egui::RawInput| -> Vec<(String, egui::Pos2)> {
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+            });
+            let mut texts = Vec::new();
+            fn walk(sh: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+                match sh {
+                    egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos)),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+        let at = |texts: &[(String, egui::Pos2)], want: &str| -> egui::Pos2 {
+            let (_, p) = texts
+                .iter()
+                .find(|(t, _)| t == want)
+                .unwrap_or_else(|| panic!("{want:?} is not drawn: {texts:?}"));
+            egui::pos2(p.x + 4.0, p.y + 6.0)
+        };
+        let click = |at: egui::Pos2| {
+            let mut i = egui::RawInput::default();
+            i.events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            i
+        };
+
+        // The row draws its name in its box, and a rename button beside it.
+        let laid = run(&mut panel, egui::RawInput::default());
+        let box_at = at(&laid, "old name");
+        let button_at = at(&laid, "✏");
+
+        // Type into the box: select what is there, then replace it.
+        run(&mut panel, click(box_at));
+        let mut typing = egui::RawInput::default();
+        typing.events = vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+            egui::Event::Text("new name".to_string()),
+        ];
+        run(&mut panel, typing);
+        assert_eq!(panel.rows[0].name_edit, "new name", "the box did not take the typing");
+        assert_eq!(
+            panel.rows[0].name, "old name",
+            "typing alone must not rename the row — the button is the rename"
+        );
+
+        // Now press it.
+        run(&mut panel, click(button_at));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows[0].name, "new name", "the button did not reach the row");
+        assert!(
+            panel.status.contains("new name"),
+            "the status should say what happened: {}",
+            panel.status
+        );
+    }
+
+    /// The rename form refuses the two edits that are not renames: a box holding
+    /// the name the row already has, and a box holding nothing. A row without a
+    /// name could not be spoken about at all, so the blank is put back rather
+    /// than taken.
+    #[test]
+    fn a_rename_to_nothing_leaves_the_row_named() {
+        let mut row = row_with(&[]);
+        row.set_name("kick".to_string());
+
+        row.name_edit = "   ".to_string();
+        assert!(!row.commit_name(), "whitespace is not a name");
+        assert_eq!(row.name, "kick");
+        assert_eq!(row.name_edit, "kick", "the box is put back to what the row is called");
+
+        row.name_edit = "kick".to_string();
+        assert!(!row.commit_name(), "renaming a row to its own name changes nothing");
+
+        row.name_edit = "  kick 2  ".to_string();
+        assert!(row.commit_name());
+        assert_eq!(row.name, "kick 2", "the name is taken trimmed");
     }
 
     /// The two Add Track Row buttons, through the real widgets: which end of the
