@@ -1000,10 +1000,19 @@ impl ComposerPanel {
     }
 
     fn add_row(&mut self) {
+        self.add_row_at(self.rows.len());
+    }
+
+    /// A new lane at `at` — the top button puts one in front of the list, the
+    /// bottom one behind it. Nothing else in the composition is addressed by
+    /// row position: a clip remembers the row **id** it came off, and a block
+    /// is worked out afresh each frame, so the order is the user's to arrange.
+    fn add_row_at(&mut self, at: usize) {
+        let at = at.min(self.rows.len());
         let id = self.next_row_id;
         self.next_row_id += 1;
         let track = self.registry.first_id();
-        self.rows.push(Row::new(id, track));
+        self.rows.insert(at, Row::new(id, track));
         self.status = match track.and_then(|t| self.registry.name_of(t)) {
             Some(name) => format!("Added a row playing {name}."),
             None => "Added a row — no tracks exist yet to assign it to.".to_string(),
@@ -1724,10 +1733,10 @@ impl ComposerPanel {
         ui.horizontal_wrapped(|ui| {
             if ui
                 .button("➕ Add Track Row")
-                .on_hover_text("A new lane, playing the first available track")
+                .on_hover_text("A new lane at the top of the list, playing the first available track")
                 .clicked()
             {
-                self.add_row();
+                self.add_row_at(0);
             }
             // One switch for all of them, next to the button that makes them.
             // It shows what is true — unticked the moment any row is off — and
@@ -1774,6 +1783,18 @@ impl ComposerPanel {
             self.block_ui(ui);
             ui.add_space(4.0);
             self.lanes_ui(ui, &tracks);
+            // The same button again, where the list ends: a composition is
+            // built downwards, and reaching back to the top to add the next
+            // lane — then dragging nothing, since rows do not move — is the
+            // long way round.
+            ui.add_space(2.0);
+            if ui
+                .button("➕ Add Track Row")
+                .on_hover_text("A new lane at the end of the list, playing the first available track")
+                .clicked()
+            {
+                self.add_row();
+            }
         }
 
         ui.add_space(8.0);
@@ -4960,4 +4981,97 @@ mod tests {
         );
     }
 
+    /// The two Add Track Row buttons, through the real widgets: which end of the
+    /// list a new lane lands on is the whole difference between them, and a
+    /// button that draws in the right place and inserts in the wrong one looks
+    /// identical until the composition is read back.
+    #[test]
+    fn the_top_add_row_button_puts_the_lane_first_and_the_bottom_one_last() {
+        let mut panel = panel_with_rows(&[
+            &[(60, frac(Fraction::Quarter), frac(Fraction::None))],
+            &[(48, frac(Fraction::Half), frac(Fraction::None))],
+        ]);
+        let (first, second) = (panel.rows[0].id, panel.rows[1].id);
+
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let run = |panel: &mut ComposerPanel, input: egui::RawInput| -> Vec<(String, egui::Pos2)> {
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+            });
+            let mut texts = Vec::new();
+            fn walk(sh: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+                match sh {
+                    egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos)),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+        let click = |at: egui::Pos2| {
+            let mut i = egui::RawInput::default();
+            i.events = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            i
+        };
+        // Both buttons, top one first — they are told apart by where they are,
+        // which is the only thing that distinguishes them on screen either.
+        let buttons = |texts: &[(String, egui::Pos2)]| -> Vec<egui::Pos2> {
+            let mut ps: Vec<egui::Pos2> = texts
+                .iter()
+                .filter(|(t, _)| t == "➕ Add Track Row")
+                .map(|(_, p)| egui::pos2(p.x + 4.0, p.y + 6.0))
+                .collect();
+            ps.sort_by(|a, b| a.y.total_cmp(&b.y));
+            ps
+        };
+
+        let laid = buttons(&run(&mut panel, egui::RawInput::default()));
+        assert_eq!(laid.len(), 2, "one button above the lanes and one below");
+
+        run(&mut panel, click(laid[0]));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows.len(), 3, "the top button did not add a row");
+        assert_eq!(
+            panel.rows.iter().map(|r| r.id).skip(1).collect::<Vec<_>>(),
+            vec![first, second],
+            "the new lane did not go in front — the rows it pushed down are out of order"
+        );
+        assert!(
+            panel.rows[0].items.is_empty(),
+            "the first row is not the new empty one"
+        );
+
+        // Laid out again: a row has been added, so the bottom button has moved.
+        let laid = buttons(&run(&mut panel, egui::RawInput::default()));
+        run(&mut panel, click(laid[1]));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows.len(), 4, "the bottom button did not add a row");
+        assert_eq!(
+            panel.rows.iter().map(|r| r.id).collect::<Vec<_>>()[1..3],
+            [first, second],
+            "the bottom button inserted somewhere other than the end"
+        );
+        assert!(
+            panel.rows[3].items.is_empty(),
+            "the last row is not the new empty one"
+        );
+    }
 }
