@@ -40,7 +40,8 @@ use eframe::egui;
 use super::registry::TrackRegistry;
 use super::track::EditorInstance;
 use crate::analysis::{self, build_contour, Subtrack};
-use crate::audio::{decode_audio_file, AudioEngine, DecodedAudio};
+use crate::audio::capture::{self, Recorder, DEFAULT_INPUT};
+use crate::audio::{decode_audio_file, write_wav_i16, AudioEngine, DecodedAudio};
 use crate::midi::new_midi_queue;
 use crate::vst::{class_ids, PluginInstance};
 
@@ -151,7 +152,7 @@ impl AudioFile {
                     .filter(|s| s.is_reasonable(audio.sample_rate))
                     .count();
                 self.status = format!(
-                    "Decoded {:.1}s @ {} Hz → {} subtrack(s), {} reasonable to analyse.",
+                    "Decoded {:.1}s @ {} Hz » {} subtrack(s), {} reasonable to analyse.",
                     audio.duration_secs(),
                     audio.sample_rate as u32,
                     subs.len(),
@@ -204,6 +205,15 @@ pub struct ResynthPanel {
     /// ("Add as Track"), which is what makes resynthesised material available to
     /// the Composer.
     registry: TrackRegistry,
+    /// What the source select box offers. Empty until the panel is first drawn:
+    /// asking the host for its devices wakes the sound system, which is not
+    /// something to do at startup for a panel the user may never open.
+    input_devices: Vec<String>,
+    /// The source the next take records from, by the name in `input_devices`.
+    input_device: String,
+    /// The take in progress. `Some` is the whole recording state there is: the
+    /// button, the clock and the disabled select box all read it.
+    recorder: Option<Recorder>,
 }
 
 impl ResynthPanel {
@@ -214,6 +224,9 @@ impl ResynthPanel {
             status: "Add a .wav, .mp3 or .m4a file to begin.".to_string(),
             ffi_plugin: None,
             registry,
+            input_devices: Vec::new(),
+            input_device: DEFAULT_INPUT.to_string(),
+            recorder: None,
         }
     }
 }
@@ -269,6 +282,72 @@ impl ResynthPanel {
         if let Some(path) = dialog.pick_file() {
             self.open_file(path);
         }
+    }
+
+    /// Start a take from the selected source. Nothing is written yet — a
+    /// recording becomes a file when it is stopped, and is named after the
+    /// moment it began.
+    fn start_recording(&mut self) {
+        match Recorder::start(Some(&self.input_device)) {
+            Ok(rec) => {
+                self.status = format!(
+                    "Recording from {} — press Stop to save the take and analyse it.",
+                    rec.device()
+                );
+                self.recorder = Some(rec);
+            }
+            Err(e) => self.status = format!("Cannot record: {e:#}"),
+        }
+    }
+
+    /// Stop the take, write it, and put it through the same door a file opened
+    /// by hand comes through — decode, segment, and a card per subtrack.
+    fn stop_recording(&mut self) {
+        let Some(rec) = self.recorder.take() else {
+            return;
+        };
+        let take = rec.finish();
+        if take.samples.is_empty() {
+            self.status = format!(
+                "Nothing came from {} — the take is empty, so no file was written.",
+                take.device
+            );
+            return;
+        }
+        let dir = match capture::recordings_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.status = format!(
+                    "Recorded {:.1}s but cannot save it: {e:#}",
+                    take.duration_secs()
+                );
+                return;
+            }
+        };
+        let path = dir.join(take.file_name());
+        if let Err(e) = write_wav_i16(&path, &take.samples, take.channels, take.sample_rate) {
+            self.status = format!(
+                "Recorded {:.1}s but cannot write it: {e:#}",
+                take.duration_secs()
+            );
+            return;
+        }
+        let secs = take.duration_secs();
+        self.open_file(path.clone());
+        // `open_file` sets the status to the analysis result, which is the more
+        // useful half; the take itself is reported in front of it so the file
+        // that was just written can be found.
+        self.status = format!(
+            "Recorded {secs:.1}s from {} » {}{} · {}",
+            take.device,
+            crate::file_label(&path),
+            if take.truncated {
+                " (cut at the length limit)"
+            } else {
+                ""
+            },
+            self.status
+        );
     }
 
     /// Open `path` as an audio file of this panel: decode it, segment it, and
@@ -660,9 +739,98 @@ impl ResynthPanel {
         action
     }
 
+    /// The record button and the source it records from.
+    ///
+    /// One button with two states rather than a Record and a Stop sitting side
+    /// by side: there is one take at a time, so the control that starts it is
+    /// the control that ends it, and it carries the clock so the length of what
+    /// is being captured is on the button being watched.
+    fn recording_ui(&mut self, ui: &mut egui::Ui) {
+        // Asked for once, on the first frame this panel is drawn, rather than at
+        // startup — enumerating devices wakes the sound system.
+        if self.input_devices.is_empty() {
+            self.input_devices = capture::input_device_names();
+        }
+        // Read what the button needs out of the recorder first: stopping takes
+        // `self` mutably, and the label is drawn from the same borrow.
+        let running = self
+            .recorder
+            .as_ref()
+            .map(|rec| (rec.secs(), rec.device().to_string()));
+        match running {
+            Some((secs, device)) => {
+                let mut stop = false;
+                if ui
+                    .button(format!(
+                        "⏹ Stop recording and resynthesise · {}:{:04.1}",
+                        (secs / 60.0) as u64,
+                        secs % 60.0
+                    ))
+                    .on_hover_text(
+                        "Stop the take, save it under the time it started, and \
+                         segment it into subtracks — the same thing that happens \
+                         to a file added by hand.",
+                    )
+                    .clicked()
+                {
+                    stop = true;
+                }
+                ui.label(
+                    egui::RichText::new(format!("🔴 {device}"))
+                        .color(egui::Color32::from_rgb(220, 90, 90)),
+                );
+                if stop {
+                    self.stop_recording();
+                }
+            }
+            None => {
+                if ui
+                    .button("➕ Start recording from source and then resynthesise")
+                    .on_hover_text(format!(
+                        "Record from the selected input and put the take straight \
+                         through the analysis, with no file to name: it is saved \
+                         under the moment it started, to the millisecond, in \
+                         {}.",
+                        capture::recordings_dir()
+                            .map(|d| d.display().to_string())
+                            .unwrap_or_else(|_| "~/GemstoneRecordings".to_string())
+                    ))
+                    .clicked()
+                {
+                    self.start_recording();
+                }
+                ui.label("from");
+                // The id carries the list length: an egui popup measures itself
+                // once per id, so a rescan that finds more devices would open a
+                // box still sized for the shorter list.
+                egui::ComboBox::from_id_salt(("resynth_input", self.input_devices.len()))
+                    .selected_text(&self.input_device)
+                    .width(220.0)
+                    .height(260.0)
+                    .show_ui(ui, |ui| {
+                        for name in &self.input_devices {
+                            ui.selectable_value(&mut self.input_device, name.clone(), name);
+                        }
+                    });
+                if ui
+                    .button("⟳")
+                    .on_hover_text(
+                        "Look for input devices again — for one plugged in since the app started",
+                    )
+                    .clicked()
+                {
+                    self.input_devices = capture::input_device_names();
+                    if !self.input_devices.contains(&self.input_device) {
+                        self.input_device = DEFAULT_INPUT.to_string();
+                    }
+                }
+            }
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            egui::RichText::new(".wav / .mp3 / .m4a → LeSynth Fourier")
+            egui::RichText::new(".wav / .mp3 / .m4a » LeSynth Fourier")
                 .italics()
                 .color(egui::Color32::from_gray(150)),
         );
@@ -671,8 +839,10 @@ impl ResynthPanel {
             if ui.button("➕ Add audio file…").clicked() {
                 self.add_audio_file();
             }
-            ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_gray(170)));
+            self.recording_ui(ui);
         });
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_gray(170)));
         ui.add_space(6.0);
         if !self.files.is_empty() {
             ui.separator();
@@ -845,6 +1015,12 @@ impl ResynthPanel {
         if self.files.iter().any(|f| f.open_editor_count() > 0) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        // A take's clock is the one thing here that moves without the user
+        // touching anything, so while one runs the panel asks to be redrawn.
+        if self.recorder.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }

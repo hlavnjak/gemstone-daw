@@ -11,11 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+pub mod capture;
 pub mod decode;
 pub mod engine;
 pub mod limiter;
 pub mod wav;
 
+pub use capture::{input_device_names, recordings_dir, Recorder, Recording};
 pub use decode::{decode_audio_file, probe_duration_secs, DecodedAudio};
 pub use engine::{AudioEngine, AudioConfig, midi_to_vst3_event};
 pub use limiter::Limiter;
