@@ -2109,6 +2109,32 @@ impl ComposerPanel {
         });
     }
 
+    /// Write the project back where it already is, asking nothing.
+    ///
+    /// This is what a change made *in* a saved project uses — a rename, so far.
+    /// It is deliberately narrower than the Save button: a project that has
+    /// never been saved, or one whose name has been typed over since, is left
+    /// alone rather than made to answer a folder dialog nobody opened. Nothing
+    /// is lost by that — the Save button is still there, and it is the one that
+    /// decides where a folder goes.
+    ///
+    /// A save the user has already asked for this frame is not overwritten
+    /// either: the queue holds one request, and theirs is the one that named a
+    /// folder.
+    fn save_in_place(&mut self) {
+        if self.request.is_some() {
+            return;
+        }
+        let stem = project::sanitize_name(&self.project_name);
+        let saved_here = self
+            .project_dir
+            .clone()
+            .filter(|d| d.file_name().is_some_and(|n| n == std::ffi::OsStr::new(&stem)));
+        if let Some(dir) = saved_here {
+            self.request = Some(ProjectRequest::Save { dir, name: stem });
+        }
+    }
+
     /// One strip per row: the head on the left, the chain of frames scrolling on
     /// the right.
     /// The block bar — what is selected across the rows, and everything that can
@@ -2287,13 +2313,15 @@ impl ComposerPanel {
                                 |ui| {
                                     ui.horizontal(|ui| {
                                         // The row's own name, and the form that
-                                        // changes it. The box holds a draft:
-                                        // nothing is renamed until Rename is
-                                        // pressed — or Enter, which is the same
-                                        // press for anyone already typing — so a
-                                        // name half typed is not yet the row's,
-                                        // and an edit thought better of is
-                                        // abandoned by leaving it alone.
+                                        // changes it. The box holds a draft
+                                        // while it is being typed in, and the
+                                        // draft becomes the name the moment the
+                                        // box is done with: Enter, the button
+                                        // beside it, or simply clicking away.
+                                        // Leaving the box is how most people
+                                        // finish typing, and a name that only
+                                        // counted if you found the button is a
+                                        // name the project would not have.
                                         let typed = ui
                                             .add(
                                                 egui::TextEdit::singleline(&mut row.name_edit)
@@ -2303,13 +2331,28 @@ impl ComposerPanel {
                                             )
                                             .on_hover_text(format!(
                                                 "This row is called “{}”.\n\nType another \
-                                                 name and press Rename. A row's name is \
-                                                 for reading — nothing is looked up by \
-                                                 it, and it is saved with the project.",
+                                                 name and press Enter, or just click away \
+                                                 — either way the row takes it, and a \
+                                                 saved project is written again with it. \
+                                                 Escape puts the box back.\n\nA row's \
+                                                 name is for reading — nothing is looked \
+                                                 up by it.",
                                                 row.name
                                             ));
-                                        let entered = typed.lost_focus()
-                                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                        // One ending covers both: the Enter
+                                        // that gives focus up, and the click
+                                        // somewhere else that takes it away.
+                                        // Escape ends the box too, and is the
+                                        // one ending that means "forget it" —
+                                        // so the draft goes back to the name
+                                        // rather than over it.
+                                        let done = typed.lost_focus();
+                                        let escaped =
+                                            ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                        if done && escaped {
+                                            row.name_edit = row.name.clone();
+                                        }
+                                        let finished = done && !escaped;
                                         // The button is live only while the box
                                         // holds a name that would change
                                         // something, so it says whether there is
@@ -2321,14 +2364,16 @@ impl ComposerPanel {
                                         let pressed = ui
                                             .add_enabled(pending, egui::Button::new("✏"))
                                             .on_hover_text(
-                                                "Rename this row to what is in the box.\n\n\
-                                                 Greyed out while the box holds the name \
-                                                 the row already has, or nothing at all: \
-                                                 a row always has a name, and the UUID it \
-                                                 was given is better than a blank.",
+                                                "Rename this row to what is in the box — \
+                                                 the same as pressing Enter in it, or \
+                                                 clicking away from it.\n\nGreyed out \
+                                                 while the box holds the name the row \
+                                                 already has, or nothing at all: a row \
+                                                 always has a name, and the UUID it was \
+                                                 given is better than a blank.",
                                             )
                                             .clicked();
-                                        if (pressed || entered) && row.commit_name() {
+                                        if (pressed || finished) && row.commit_name() {
                                             renamed = Some(row.name.clone());
                                         }
                                     });
@@ -2536,6 +2581,10 @@ impl ComposerPanel {
 
         if let Some(name) = renamed {
             self.status = format!("Renamed a row to {name}.");
+            // A name the project cannot be closed and reopened with is not the
+            // row's name yet as far as the file is concerned, so the rename is
+            // written straight back to where the project already lives.
+            self.save_in_place();
         }
         if let Some(idx) = remove_row {
             if idx < self.rows.len() {
@@ -5209,9 +5258,9 @@ mod tests {
     }
 
     /// The rename form on a row, through the real widgets: a name typed into
-    /// the box is a *draft* until the button is pressed, so an edit thought
-    /// better of costs nothing, and the button says whether there is one
-    /// waiting on it.
+    /// the box is a *draft* until the box is finished with — the button, or
+    /// clicking away, which is how most people finish typing — and a rename in
+    /// a project that has already been saved goes straight back into its file.
     #[test]
     fn a_row_is_renamed_by_its_own_box_and_button() {
         let mut panel = panel_with_rows(&[&[(60, frac(Fraction::Quarter), frac(Fraction::None))]]);
@@ -5285,7 +5334,7 @@ mod tests {
         assert_eq!(panel.rows[0].name_edit, "new name", "the box did not take the typing");
         assert_eq!(
             panel.rows[0].name, "old name",
-            "typing alone must not rename the row — the button is the rename"
+            "typing alone must not rename the row — the box has to be finished with"
         );
 
         // Now press it.
@@ -5297,6 +5346,102 @@ mod tests {
             "the status should say what happened: {}",
             panel.status
         );
+
+        // The other way out of the box, and the one people actually take: type,
+        // then click somewhere else entirely. The row is renamed all the same —
+        // a name that only counted if you found the button beside it is a name
+        // the project would go on without.
+        let laid = run(&mut panel, egui::RawInput::default());
+        let box_at = at(&laid, "new name");
+        let away = at(&laid, "Project");
+        run(&mut panel, click(box_at));
+        let mut typing = egui::RawInput::default();
+        typing.events = vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+            egui::Event::Text("clicked away".to_string()),
+        ];
+        run(&mut panel, typing);
+        assert_eq!(panel.rows[0].name, "new name", "still a draft while the box has focus");
+
+        // Escape is the way out that keeps the old name: it ends the box like
+        // the others, and puts the draft back rather than over the row.
+        let mut escape = egui::RawInput::default();
+        escape.events = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }];
+        run(&mut panel, escape);
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(panel.rows[0].name, "new name", "Escape must not rename the row");
+        assert_eq!(panel.rows[0].name_edit, "new name", "Escape must put the box back");
+
+        // Type it again, now that Escape has thrown the first attempt away.
+        run(&mut panel, click(box_at));
+        let mut typing = egui::RawInput::default();
+        typing.events = vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+            egui::Event::Text("clicked away".to_string()),
+        ];
+        run(&mut panel, typing);
+
+        // The project has been saved before, so it knows where it lives…
+        panel.set_project_dir(PathBuf::from("/nowhere/Song"), "Song".to_string());
+        panel.take_request();
+        run(&mut panel, click(away));
+        run(&mut panel, egui::RawInput::default());
+        assert_eq!(
+            panel.rows[0].name, "clicked away",
+            "leaving the box must rename the row — otherwise the name is only ever on screen"
+        );
+        // …and the rename is written there, rather than waiting for a press of
+        // Save the user has no reason to think is owed.
+        match panel.take_request() {
+            Some(ProjectRequest::Save { dir, name }) => {
+                assert_eq!(dir, PathBuf::from("/nowhere/Song"));
+                assert_eq!(name, "Song");
+            }
+            other => panic!("a rename should save the project in place, got {other:?}"),
+        }
+    }
+
+    /// Saving a rename in place is for projects that already have a place. One
+    /// that has never been saved is left alone: a folder dialog nobody opened is
+    /// not what "I renamed a row" should mean.
+    #[test]
+    fn a_rename_in_an_unsaved_project_asks_for_nothing() {
+        let mut panel = panel_with_rows(&[&[(60, frac(Fraction::Quarter), frac(Fraction::None))]]);
+        panel.save_in_place();
+        assert!(panel.take_request().is_none(), "an unsaved project must not be given a folder");
+
+        // Nor does it write to the old folder once the name in the box has moved
+        // on: that name belongs to a folder that does not exist yet, and only
+        // Save gets to decide where it goes.
+        panel.set_project_dir(PathBuf::from("/nowhere/Song"), "Song".to_string());
+        panel.project_name = "Song Two".to_string();
+        panel.save_in_place();
+        assert!(
+            panel.take_request().is_none(),
+            "a renamed project must wait for Save, which is what picks the folder"
+        );
+
+        panel.project_name = "Song".to_string();
+        panel.save_in_place();
+        assert!(matches!(panel.take_request(), Some(ProjectRequest::Save { .. })));
     }
 
     /// The rename form refuses the two edits that are not renames: a box holding
