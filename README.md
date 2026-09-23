@@ -133,9 +133,19 @@ published there as a wav track — and any number of rows may share the same one
   note, so the bar structure survives the wrap and releases ring on across it.
   It can be switched on and off while the transport runs; unticking it makes the
   pass in flight the last one.
+- **The loop can be trimmed at either end.** Two more note lengths, on the line
+  under the transport, say where a repeat starts and where it stops — each
+  counted *from the beginning of the composition*, in the same three select
+  boxes a note is written with. Both from the same end so the pair can be read
+  against each other: `1/2` and `7/4` say which is in front of which at a
+  glance. A stop left at zero means the end of the arrangement, and one asked
+  for past the end is held there. Everything in front of the start still plays,
+  once, on the way in; the line reads back what the two lengths came to in
+  seconds, and says so when they leave nothing between them. The window is
+  saved with the project.
 - **A loop follows your edits.** While Repeat is on, changing notes — pitch,
-  length, adding or deleting them — or a row's gain or the tempo is picked up at
-  the next time round, without stopping. Adding a row, pointing one at another
+  length, adding or deleting them — or a row's gain, the tempo or the repeat
+  window is picked up at the next time round, without stopping. Adding a row, pointing one at another
   track, or switching one off is the exception: each changes which plugins are
   loaded, which cannot happen while the audio callback is running, so the panel
   says to press Play again.

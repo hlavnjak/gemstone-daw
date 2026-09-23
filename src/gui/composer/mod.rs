@@ -44,6 +44,15 @@
 //! the time from its first note to the end of its last space — rather than the
 //! frames' own extent; see [`ComposerPanel::clone_block`].
 //!
+//! **A repeat can be trimmed at either end.** "Repeat" loops the whole written
+//! length by default; the two lengths beneath the transport say where it starts
+//! and where it stops, each counted **from the beginning of the composition** —
+//! lengths rather than timestamps, because that is the only vocabulary the
+//! panel has, and from the same end as each other so the pair can be read
+//! against each other at a glance. A stop of zero is the end of the
+//! composition. Everything in front of the start still plays, once, on the way
+//! in. See [`ComposerPanel::repeat_span_units`].
+//!
 //! **Rows can also be played in rather than written.** "Record & Play Once"
 //! plays the composition through once and captures a MIDI keyboard against it,
 //! rounding what was played onto a chosen note value and appending it as new
@@ -61,7 +70,9 @@ use std::time::Instant;
 
 use eframe::egui;
 
-use self::player::{CompositionPlayer, PlannedNote, PreparedComposition, RowEdit, RowPlan};
+use self::player::{
+    CompositionPlayer, LoopSpan, PlannedNote, PreparedComposition, RowEdit, RowPlan,
+};
 use crate::midi::{add_midi_tap, gm_percussion_name, MidiTap, MidiTaps};
 use super::registry::TrackRegistry;
 
@@ -956,7 +967,10 @@ struct LiveSnapshot {
     shape: Vec<(u64, Option<u64>)>,
     /// The part it can: notes and gain, per row.
     rows: Vec<RowEdit>,
-    loop_secs: f64,
+    /// The stretch a repeat runs over — both ends, because either can be moved
+    /// by an edit: the boxes name lengths off a composition that is itself
+    /// being written.
+    span: LoopSpan,
     /// Whether the user has already been told that the shape changed, so the
     /// status line is not rewritten on every frame.
     shape_warned: bool,
@@ -1004,6 +1018,24 @@ pub struct ComposerPanel {
     /// Loop the composition instead of stopping at the end. Shared with the
     /// transport's audio callback, so the checkbox works on a running player.
     repeat: Arc<AtomicBool>,
+    /// Where a repeat starts and where it stops, both as a length **from the
+    /// beginning of the composition**, in the same three select boxes every
+    /// other length in the panel is named by.
+    ///
+    /// Lengths rather than positions because that is the only vocabulary the
+    /// panel has — a row is a chain of lengths, nothing in it sits at a
+    /// timestamp — and from the same end as each other because a window read
+    /// from two directions is a window nobody can check: "1/2" and "3/4" say
+    /// which is in front of which at a glance, where a stop counted backwards
+    /// has to be subtracted from a total before it can be compared with the
+    /// start beside it.
+    ///
+    /// A stop of zero is the box untouched, and means the end of the
+    /// composition — a repeat that stops before it starts is not a thing to
+    /// have, so zero is free to mean the useful thing. See
+    /// [`Self::repeat_to_units`].
+    repeat_from: Duration,
+    repeat_to: Duration,
     /// The composition as the looping transport last received it. What an edit
     /// is compared against, so an untouched frame publishes nothing.
     live_sent: Option<LiveSnapshot>,
@@ -1047,6 +1079,8 @@ impl ComposerPanel {
             player: None,
             preparing: None,
             repeat: Arc::new(AtomicBool::new(false)),
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
             live_sent: None,
             export: None,
             midi_taps,
@@ -1120,6 +1154,58 @@ impl ComposerPanel {
     /// End of the composition in units — the longest row.
     fn end_units(&self) -> i64 {
         self.rows.iter().map(Row::end_units).max().unwrap_or(0)
+    }
+
+    /// Where the stop box lands, in units from the beginning: what it says,
+    /// held inside the composition — and the *end* of the composition when it
+    /// says nothing.
+    ///
+    /// Zero has to mean something, and "stop at the beginning" is not a thing
+    /// anyone wants: a repeat that stops where it starts has nothing in it. So
+    /// an untouched box means the end, which is both the useful reading and the
+    /// one that leaves a fresh panel looping the whole composition, as it always
+    /// has. A stop asked for past the end is held at the end for the same
+    /// reason a start is: there is no music out there to repeat, only silence
+    /// the loop would sit in.
+    fn repeat_to_units(&self) -> i64 {
+        let end = self.end_units();
+        match self.repeat_to.units() {
+            0 => end,
+            asked => asked.min(end),
+        }
+    }
+
+    /// The stretch a repeat loops over, in units — start included, end
+    /// excluded. Both ends are read off the composition as it stands now, so a
+    /// window follows it as it is written.
+    ///
+    /// The two boxes are free to ask for nothing: a start on or past the stop,
+    /// either way round. That is not a short loop — a window of no length is a
+    /// transport with no samples to play — so it is answered with the whole
+    /// composition, which is what a repeat did before there were boxes to ask
+    /// with, and [`Self::repeat_span_ignored`] is what says so on screen.
+    fn repeat_span_units(&self) -> (i64, i64) {
+        let (from, to) = (self.repeat_from.units(), self.repeat_to_units());
+        if from < to {
+            (from, to)
+        } else {
+            (0, self.end_units())
+        }
+    }
+
+    /// Whether the boxes are asking for something and being overruled — a window
+    /// with nothing in it. Says nothing while they are both zero: that is not a
+    /// window being ignored, it is no window at all.
+    fn repeat_span_ignored(&self) -> bool {
+        let asked = self.repeat_from.units() > 0 || self.repeat_to.units() > 0;
+        asked && self.repeat_from.units() >= self.repeat_to_units()
+    }
+
+    /// The same stretch in seconds, which is what the transport loops on.
+    fn repeat_span(&self) -> LoopSpan {
+        let spu = self.secs_per_unit();
+        let (from, to) = self.repeat_span_units();
+        LoopSpan { start_secs: from as f64 * spu, end_secs: to as f64 * spu }
     }
 
     // ── Blocks ────────────────────────────────────────────────────────────
@@ -1439,7 +1525,7 @@ impl ComposerPanel {
         LiveSnapshot {
             shape,
             rows,
-            loop_secs: self.end_units() as f64 * self.secs_per_unit(),
+            span: self.repeat_span(),
             shape_warned: false,
         }
     }
@@ -1469,10 +1555,10 @@ impl ComposerPanel {
             }
             return;
         }
-        if snapshot.rows == sent.rows && snapshot.loop_secs == sent.loop_secs {
+        if snapshot.rows == sent.rows && snapshot.span == sent.span {
             return;
         }
-        player.update_live(&snapshot.rows, snapshot.loop_secs);
+        player.update_live(&snapshot.rows, snapshot.span);
         // One instance has one output, so rows sharing one are at one level. The
         // transport keeps the first row's; saying so beats a slider that visibly
         // moves and audibly does nothing.
@@ -1545,8 +1631,8 @@ impl ComposerPanel {
         let instances = prepared.instances();
         // The length may have been edited while the rows were loading; the loop
         // follows what is on screen now, as a live edit would.
-        let loop_secs = self.end_units() as f64 * self.secs_per_unit();
-        match CompositionPlayer::start_prepared(prepared, loop_secs, self.repeat.clone()) {
+        let span = self.repeat_span();
+        match CompositionPlayer::start_prepared(prepared, span, self.repeat.clone()) {
             Ok(player) => {
                 // Say when rows are sharing: it explains both the memory and why
                 // one of them cannot be given its own level while it plays.
@@ -1924,6 +2010,8 @@ impl ComposerPanel {
         project::Project {
             name: name.to_string(),
             tempo_bpm: self.tempo_bpm,
+            repeat_from: self.repeat_from,
+            repeat_to: self.repeat_to,
             rows: self
                 .rows
                 .iter()
@@ -1962,6 +2050,8 @@ impl ComposerPanel {
     ) {
         self.stop_playback();
         self.tempo_bpm = project.tempo_bpm;
+        self.repeat_from = project.repeat_from;
+        self.repeat_to = project.repeat_to;
         self.project_name = project.name.clone();
         self.project_dir = Some(dir);
         self.rows.clear();
@@ -3002,6 +3092,100 @@ impl ComposerPanel {
         }
     }
 
+    /// Where a repeat starts and where it stops — both a length from the
+    /// beginning of the composition.
+    ///
+    /// **Why lengths and not positions.** It is the only vocabulary the panel
+    /// has: a row is a chain of lengths, nothing in it sits at a timestamp, and
+    /// a repeat marked in seconds would be a second way of saying when.
+    ///
+    /// **Why both from the same end.** So the two can be read against each
+    /// other. `1/2` and `3/4` say which is in front of which at a glance; a stop
+    /// counted back from the end has to be subtracted from a total nobody has in
+    /// their head before it can be compared with the start sitting next to it.
+    ///
+    /// **Why a line of its own.** Six select boxes do not fit in a transport bar
+    /// that already carries three buttons, a tempo and two recording controls —
+    /// and the pair belong together, read as one window. Read apart, a start gets
+    /// moved onto a stop nobody looked at, which is the mistake the seconds at
+    /// the end of the line are there to catch.
+    fn repeat_window_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            // Greyed out during a take, exactly as Repeat is: a take is one
+            // pass, so there is no window for it to run in.
+            let recording = self.recording.is_some();
+            // A horizontal region inside the greying-out, or every box in it
+            // sits a few pixels below the labels — see `length_boxes`.
+            ui.add_enabled_ui(!recording, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("🔁 Repeat from").on_hover_text(
+                        "How far into the composition a repeat starts — a length \
+                         from the beginning, in the same three boxes a note is \
+                         written with.\n\nLeave it at zero to loop from the top. \
+                         Everything in front of the start still plays, once, on \
+                         the way in: it is an intro, not something to be skipped.",
+                    );
+                    length_boxes(ui, "repeat_from", &mut self.repeat_from);
+
+                    ui.add_space(8.0);
+                    ui.label("to").on_hover_text(
+                        "Where a repeat stops — also a length from the beginning \
+                         of the composition, so the two boxes can be read against \
+                         each other rather than off opposite ends.\n\nZero means \
+                         the end of the composition, which is what a repeat loops \
+                         to until it is told otherwise; a stop past the end is \
+                         held there, since out that far there is only silence to \
+                         repeat. Releases ring on across the wrap either way.",
+                    );
+                    length_boxes(ui, "repeat_to", &mut self.repeat_to);
+                });
+            });
+
+            // What the two lengths actually came to, which is the whole reason
+            // they are next to each other: a window is two boxes and a
+            // composition, and only this says what the three of them make.
+            ui.add_space(10.0);
+            let spu = self.secs_per_unit();
+            let (from, to) = self.repeat_span_units();
+            let (from_secs, to_secs) = (from as f64 * spu, to as f64 * spu);
+            if self.repeat_span_ignored() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ nothing between them — looping all {:.1} s",
+                        to_secs - from_secs
+                    ))
+                    .color(RECORD),
+                )
+                .on_hover_text(
+                    "The start is not in front of the stop: a window of no length \
+                     is not a short loop, it is a transport with nothing to play. \
+                     The whole composition is looped until one of the two boxes \
+                     leaves room for the other.",
+                );
+            } else {
+                // An untouched stop box says nothing on its own, so the reading
+                // says what it came to mean. It is the one thing about the line
+                // that has to be learned rather than read, and this is where it
+                // is cheapest to learn it.
+                let end = if self.repeat_to.units() == 0 { ", to the end" } else { "" };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "loops {from_secs:.1} – {to_secs:.1} s ({:.1} s{end})",
+                        to_secs - from_secs
+                    ))
+                    .color(egui::Color32::from_gray(160)),
+                )
+                .on_hover_text(
+                    "Where the two lengths land in the composition as it stands \
+                     now. It follows the tempo, and a stop left at zero follows \
+                     the music: write another bar and the loop reaches it.\n\n\
+                     A window can be changed while a repeat is playing — like a \
+                     note edit, it comes in at the next wrap.",
+                );
+            }
+        });
+    }
+
     /// Play / stop, tempo, and where the transport currently is.
     fn transport_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
@@ -3053,11 +3237,12 @@ impl ComposerPanel {
                 .add_enabled_ui(!recording, |ui| ui.checkbox(&mut repeat, "🔁 Repeat"))
                 .inner
                 .on_hover_text(
-                    "Play the composition over and over, looping on its written \
-                     length. Releases ring on across the loop, and it can be \
-                     switched on and off while it plays — untick it and the \
-                     current pass is the last one.\n\nUnavailable while recording: \
-                     a take is one pass.",
+                    "Play the composition over and over. By default the loop is \
+                     the whole written length; the two lengths on the line below \
+                     trim it at either end.\n\nReleases ring on across the loop, \
+                     and it can be switched on and off while it plays — untick it \
+                     and the current pass is the last one.\n\nUnavailable while \
+                     recording: a take is one pass.",
                 )
                 .changed()
             {
@@ -3153,14 +3338,21 @@ impl ComposerPanel {
             match &self.player {
                 // While looping, the length that means anything is the loop's,
                 // not "last note plus release".
-                Some(p) if self.repeat.load(Ordering::Relaxed) => ui.label(
-                    egui::RichText::new(format!(
-                        "🔁 {:.1} s / {:.1} s",
-                        p.position_secs(),
-                        p.loop_secs()
-                    ))
-                    .color(PLAYHEAD),
-                ),
+                Some(p) if self.repeat.load(Ordering::Relaxed) => {
+                    // Both ends when the loop is a window, so the readout says
+                    // what is being repeated rather than only how far through
+                    // the composition the playhead is.
+                    let (start, end) = (p.loop_start_secs(), p.loop_secs());
+                    let of = if start > 0.0 {
+                        format!("{start:.1} – {end:.1} s")
+                    } else {
+                        format!("{end:.1} s")
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("🔁 {:.1} s / {of}", p.position_secs()))
+                            .color(PLAYHEAD),
+                    )
+                }
                 Some(p) => ui.label(
                     egui::RichText::new(format!(
                         "▶ {:.1} s / {:.1} s",
@@ -3176,6 +3368,8 @@ impl ComposerPanel {
             };
         });
         ui.add_space(4.0);
+        self.repeat_window_ui(ui);
+        ui.add_space(4.0);
         ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_gray(170)));
 
         // While playing, repaint fast enough for the sounding frame to light up
@@ -3190,6 +3384,76 @@ impl ComposerPanel {
                 .request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
+}
+
+/// The three select boxes that name a length — whole notes, how many of a
+/// fraction, and which fraction — laid along a line. Answers whether they
+/// changed it.
+///
+/// The same three a frame carries, in the same order and saying the same
+/// things, because a length is a length wherever it is asked for: anyone who
+/// can write a dotted quarter into a row can write one into a repeat's start
+/// without learning a second way to say it. Only the layout differs — a card
+/// stacks them, a toolbar lays them out — which is why this is a function of
+/// its own rather than a call into [`ComposerPanel::frame_ui`].
+///
+/// Change is reported by comparing the length rather than by asking the boxes:
+/// a combo answers `changed()` for the *button*, not for the popup (see the
+/// track select box above), and picking the value that was already there is not
+/// a change to anything but the widget.
+fn length_boxes(ui: &mut egui::Ui, salt: &'static str, dur: &mut Duration) -> bool {
+    let before = *dur;
+    egui::ComboBox::from_id_salt((salt, "wholes"))
+        .width(84.0)
+        .height(260.0)
+        .selected_text(format!("{} whole", dur.wholes))
+        .show_ui(ui, |ui| {
+            for w in 0..=MAX_WHOLES {
+                ui.selectable_value(&mut dur.wholes, w, format!("{w} whole"));
+            }
+        })
+        .response
+        .on_hover_text("Whole notes — the whole part of the length");
+    // The greying-out gets a horizontal region of its own: a scope nested in a
+    // line inherits the *line's* full height and centres what is in it there, so
+    // one wrapped straight round a box drops it a few pixels below its
+    // neighbours — which on a row of six boxes reads as a staircase.
+    ui.add_enabled_ui(dur.frac != Fraction::None, |ui| {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt((salt, "num"))
+                .width(60.0)
+                .height(260.0)
+                .selected_text(format!("× {}", dur.num))
+                .show_ui(ui, |ui| {
+                    for n in 1..=MAX_NUM {
+                        ui.selectable_value(&mut dur.num, n, format!("× {n}"));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How many of the fraction beside it — three of a 1/8 is 3/8, \
+                     the dotted quarter the fraction box cannot name on its \
+                     own.\n\nNeeds a fraction to count: pick one first.",
+                );
+        });
+    });
+    egui::ComboBox::from_id_salt((salt, "frac"))
+        .width(72.0)
+        .selected_text(dur.frac.label())
+        .show_ui(ui, |ui| {
+            for f in Fraction::ALL {
+                ui.selectable_value(&mut dur.frac, f, f.label());
+            }
+        })
+        .response
+        .on_hover_text(
+            "Fractional part of the length, down to a 1/256 — taken as many times \
+             as the nominator says, and added to the whole notes",
+        );
+    // The boxes are free to leave the nominator counting a fraction that is no
+    // longer there; the length is not.
+    dur.canonicalise();
+    *dur != before
 }
 
 /// Widget id of a row's lead space frame. Item ids count up from zero and are
@@ -3506,7 +3770,7 @@ mod tests {
         let after = faster.live_snapshot();
         assert_eq!(after.shape, before.shape, "tempo is not structural");
         assert_ne!(after.rows, before.rows, "the tempo change did not move the notes");
-        assert_ne!(after.loop_secs, before.loop_secs, "the loop length did not follow");
+        assert_ne!(after.span, before.span, "the loop length did not follow");
 
         // A different track means a different plugin, which an audio callback
         // cannot load: structural, and reported rather than applied.
@@ -4418,6 +4682,8 @@ mod tests {
         let loaded = project::Project {
             name: "Song".to_string(),
             tempo_bpm: 100.0,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
             rows: vec![project::ProjectRow {
                 name: "the voice".to_string(),
                 track_name: "Voice".to_string(),
@@ -4480,6 +4746,8 @@ mod tests {
         let loaded = project::Project {
             name: "Two".to_string(),
             tempo_bpm: 88.0,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
             rows: vec![
                 project::ProjectRow {
                     name: "first".to_string(),
@@ -5255,6 +5523,152 @@ mod tests {
         let row = &panel.rows[3];
         assert_eq!(row.label(), format!("{}…", &row.name[..8]));
         assert_eq!(panel.rows[0].label(), "bass line", "a name the user typed is quoted whole");
+    }
+
+    /// A repeat's window is two *lengths*, both counted from the beginning of
+    /// the composition — so the pair can be read against each other, and a stop
+    /// left at zero means the end rather than the impossible.
+    #[test]
+    fn a_repeat_window_is_two_lengths_from_the_beginning() {
+        // Eight quarter notes, back to back: two whole notes of composition.
+        let items = [(60u8, frac(Fraction::Quarter), frac(Fraction::None)); 8];
+        let mut panel = panel_with_rows(&[&items]);
+        let end = panel.end_units();
+        assert_eq!(end, 2 * UNITS_PER_WHOLE, "two whole notes of quarters");
+
+        // Untouched, the window is the whole composition — what a repeat looped
+        // over before there were boxes to trim it with. A stop of zero is not
+        // "stop where you started"; it is the box nobody has touched, and it
+        // means the end.
+        assert_eq!(panel.repeat_to_units(), end);
+        assert_eq!(panel.repeat_span_units(), (0, end));
+        assert!(!panel.repeat_span_ignored(), "zero boxes are not a window being ignored");
+
+        // From a half note in, to a whole note and three quarters in.
+        panel.repeat_from = Duration::new(0, Fraction::Half);
+        panel.repeat_to = Duration::with_num(0, 7, Fraction::Quarter);
+        assert_eq!(
+            panel.repeat_span_units(),
+            (UNITS_PER_WHOLE / 2, 7 * UNITS_PER_WHOLE / 4)
+        );
+        // …in seconds, which is what the transport is handed. 120 BPM, so a
+        // whole note is two seconds.
+        let span = panel.repeat_span();
+        assert!(
+            (span.start_secs - 1.0).abs() < 1e-9 && (span.end_secs - 3.5).abs() < 1e-9,
+            "{span:?}"
+        );
+
+        // Both ends are positions in the composition now, so writing more music
+        // leaves a stop that was asked for exactly where it was asked for. Only
+        // a stop of zero follows the music.
+        panel.rows[0].add_note(60);
+        let grown = panel.end_units();
+        assert_eq!(grown, 2 * UNITS_PER_WHOLE + UNITS_PER_WHOLE / 4, "nine quarters");
+        assert_eq!(panel.repeat_span_units(), (UNITS_PER_WHOLE / 2, 7 * UNITS_PER_WHOLE / 4));
+        panel.repeat_to = Duration::new(0, Fraction::None);
+        assert_eq!(panel.repeat_span_units(), (UNITS_PER_WHOLE / 2, grown));
+
+        // A stop past the end is held at the end: out there is silence, not
+        // music to repeat.
+        panel.repeat_to = Duration::new(MAX_WHOLES, Fraction::None);
+        assert_eq!(panel.repeat_to_units(), grown);
+        assert_eq!(panel.repeat_span_units(), (UNITS_PER_WHOLE / 2, grown));
+        assert!(!panel.repeat_span_ignored(), "reaching the end is not a collapsed window");
+
+        // A start on or past the stop asks for a window with nothing in it. That
+        // is not a short loop — it is a transport with no samples to play — so
+        // the whole composition is looped and the panel says the boxes are being
+        // overruled.
+        panel.repeat_to = Duration::new(0, Fraction::Half);
+        panel.repeat_from = Duration::new(0, Fraction::Half);
+        assert_eq!(panel.repeat_span_units(), (0, grown), "a window has to have something in it");
+        assert!(panel.repeat_span_ignored());
+
+        panel.repeat_from = Duration::new(MAX_WHOLES, Fraction::None);
+        assert_eq!(panel.repeat_span_units(), (0, grown));
+        assert!(panel.repeat_span_ignored(), "a start past the stop is the same collapse");
+    }
+
+    /// The window travels to the transport the way a note edit does — in the
+    /// live snapshot — so moving a box while a repeat is playing takes effect at
+    /// the next wrap instead of needing Play pressed again.
+    #[test]
+    fn moving_a_repeat_window_is_a_live_edit_not_a_restart() {
+        let items = [(60u8, frac(Fraction::Quarter), frac(Fraction::None)); 8];
+        let mut panel = panel_with_rows(&[&items]);
+        panel.rows[0].track_id = Some(7);
+        let before = panel.live_snapshot();
+
+        panel.repeat_from = Duration::new(0, Fraction::Half);
+        let after = panel.live_snapshot();
+        assert_eq!(after.shape, before.shape, "a window is not a row or a track");
+        assert_eq!(after.rows, before.rows, "…and it moves no notes");
+        assert_ne!(after.span, before.span, "the window did not reach the transport");
+    }
+
+    /// The window is on screen as two sets of the same three length boxes the
+    /// rest of the panel is written with, and beside them what the two lengths
+    /// actually came to — which is the whole reason they are next to each other.
+    #[test]
+    fn the_repeat_window_reads_back_what_the_two_lengths_come_to() {
+        let items = [(60u8, frac(Fraction::Quarter), frac(Fraction::None)); 8];
+        let mut panel = panel_with_rows(&[&items]);
+
+        let ctx = egui::Context::default();
+        crate::gui::app::DawApp::configure_style(&ctx);
+        let mut draw = |panel: &mut ComposerPanel| -> Vec<String> {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| panel.ui(ui));
+            });
+            let mut texts = Vec::new();
+            fn walk(sh: &egui::Shape, out: &mut Vec<String>) {
+                match sh {
+                    egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            texts
+        };
+
+        // Untouched, the stop box says nothing on its own, so the reading says
+        // what it came to mean — the one thing about the line that has to be
+        // learned rather than read.
+        let texts = draw(&mut panel);
+        // "from … to …" and nothing else: a word saying the pair are counted
+        // off the beginning would sit behind the second set of boxes and read
+        // as if it qualified only those. The seconds beside them do that job —
+        // they are the composition's own clock — and the hovers say it outright.
+        for label in ["🔁 Repeat from", "to"] {
+            assert!(texts.iter().any(|t| t == label), "{label:?} is not drawn: {texts:?}");
+        }
+        assert!(
+            texts.iter().any(|t| t == "loops 0.0 – 4.0 s (4.0 s, to the end)"),
+            "an untouched stop must read as the end: {texts:?}"
+        );
+
+        // Two whole notes at 120 BPM is four seconds; from a half note in to
+        // seven quarters in is 1.0 s to 3.5 s.
+        panel.repeat_from = Duration::new(0, Fraction::Half);
+        panel.repeat_to = Duration::with_num(0, 7, Fraction::Quarter);
+        let texts = draw(&mut panel);
+        assert!(
+            texts.iter().any(|t| t == "loops 1.0 – 3.5 s (2.5 s)"),
+            "the window is not read back: {texts:?}"
+        );
+
+        // Overruled, the line says so rather than showing a window that is not
+        // the one playing.
+        panel.repeat_from = Duration::new(MAX_WHOLES, Fraction::None);
+        let texts = draw(&mut panel);
+        assert!(
+            texts.iter().any(|t| t.starts_with("⚠ nothing between them")),
+            "a collapsed window must say so: {texts:?}"
+        );
     }
 
     /// The rename form on a row, through the real widgets: a name typed into

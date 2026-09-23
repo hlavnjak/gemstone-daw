@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //! **Repeat**: the transport loops the composition instead of stopping at the
-//! end, it picks up edits made while it is looping, and unticking it lets the
-//! pass in flight finish.
+//! end, it picks up edits made while it is looping, unticking it lets the pass
+//! in flight finish — and the loop can be *windowed*, trimmed at either end by
+//! the two note lengths the panel names it with.
 //!
 //! The loop lives inside the audio callback, so this drives a real output
 //! stream. With no audio device there is nothing to drive and the test says so
@@ -24,7 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gemstone_daw::gui::composer::player::{CompositionPlayer, PlannedNote, RowEdit, RowPlan};
+use gemstone_daw::gui::composer::player::{
+    CompositionPlayer, LoopSpan, PlannedNote, RowEdit, RowPlan,
+};
 use gemstone_daw::gui::registry::PlaybackSource;
 use gemstone_daw::track_format::TrackState;
 use gemstone_daw::vst::class_ids;
@@ -77,6 +80,71 @@ fn lesynth_source() -> PlaybackSource {
 }
 
 
+/// A repeat trimmed at both ends: everything in front of the start plays once,
+/// on the way in, and from then on the transport stays inside the window.
+///
+/// The window is where the audio callback's own arithmetic lives — it splits
+/// every device block at the wrap and puts each voice's cursor back by hand —
+/// so it is worth watching a real stream do it rather than trusting the two
+/// numbers that go in.
+#[test]
+fn a_repeat_can_be_windowed_at_both_ends() {
+    let plans = vec![RowPlan {
+        row_id: 0,
+        source: lesynth_source(),
+        gain: 1.0,
+        notes: vec![
+            // One note per quarter of the composition, so a pass that wrapped
+            // in the wrong place would be audible as well as measurable.
+            PlannedNote { at_secs: 0.0, dur_secs: 0.2, pitch: 60, start_secs: 0.0 },
+            PlannedNote { at_secs: 0.5, dur_secs: 0.2, pitch: 64, start_secs: 0.0 },
+            PlannedNote { at_secs: 1.0, dur_secs: 0.2, pitch: 67, start_secs: 0.0 },
+            PlannedNote { at_secs: 1.5, dur_secs: 0.2, pitch: 72, start_secs: 0.0 },
+        ],
+    }];
+    let window = LoopSpan { start_secs: 0.5, end_secs: 1.5 };
+
+    let repeat = Arc::new(AtomicBool::new(true));
+    let player = match CompositionPlayer::start(plans, window, repeat.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("no audio device to play through ({e:#}) — nothing to test");
+            return;
+        }
+    };
+    assert!((player.loop_start_secs() - window.start_secs).abs() < 0.01);
+    assert!((player.loop_secs() - window.end_secs).abs() < 0.01);
+
+    // One device block of tolerance at each end: the position is read between
+    // blocks, never inside one.
+    const SLACK: f64 = 0.25;
+    let mut wrapped = false;
+    let mut previous = 0.0;
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+        let position = player.position_secs();
+        assert!(
+            position <= window.end_secs + SLACK,
+            "position {position:.2}s ran past the {:.2}s window",
+            window.end_secs
+        );
+        if position < previous {
+            // It wrapped. From here on it must never fall back to the top of
+            // the composition: what is in front of the start is an intro, and
+            // it is played once.
+            wrapped = true;
+        }
+        assert!(
+            !wrapped || position >= window.start_secs - SLACK,
+            "position {position:.2}s fell in front of the {:.2}s start after a wrap",
+            window.start_secs
+        );
+        previous = position;
+    }
+    assert!(wrapped, "never wrapped in 6s of a 1s window");
+}
+
 #[test]
 fn repeat_loops_the_composition_until_it_is_switched_off() {
     let plans = vec![RowPlan {
@@ -90,7 +158,7 @@ fn repeat_loops_the_composition_until_it_is_switched_off() {
     }];
 
     let repeat = Arc::new(AtomicBool::new(true));
-    let player = match CompositionPlayer::start(plans, LOOP_SECS, repeat.clone()) {
+    let player = match CompositionPlayer::start(plans, LoopSpan::whole(LOOP_SECS), repeat.clone()) {
         Ok(p) => p,
         Err(e) => {
             println!("no audio device to play through ({e:#}) — nothing to test");
@@ -141,7 +209,7 @@ fn repeat_loops_the_composition_until_it_is_switched_off() {
                 PlannedNote { at_secs: 1.2, dur_secs: 0.4, pitch: 72, start_secs: 0.0 },
             ],
         }],
-        edited,
+        LoopSpan::whole(edited),
     );
     let deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < deadline && (player.loop_secs() - edited).abs() > 0.01 {

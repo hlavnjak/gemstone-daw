@@ -142,9 +142,31 @@ pub struct RowEdit {
     pub notes: Vec<PlannedNote>,
 }
 
+/// The stretch of the composition a repeat plays over, in seconds from its
+/// start: `[start_secs, end_secs)`.
+///
+/// The panel names both ends as *note lengths* from the beginning of the
+/// composition, because that is the vocabulary the rest of it is written in —
+/// a bar is a length rather than a timestamp. By the time it reaches here they
+/// are seconds, like every other time in this module.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoopSpan {
+    pub start_secs: f64,
+    pub end_secs: f64,
+}
+
+impl LoopSpan {
+    /// The whole composition — what a repeat looped over before it could be
+    /// given a window, and what a pair of untouched boxes still means.
+    pub fn whole(end_secs: f64) -> Self {
+        Self { start_secs: 0.0, end_secs }
+    }
+}
+
 /// A composition edited mid-flight, waiting for the next loop point.
 struct LiveUpdate {
     rows: Vec<VoiceEdit>,
+    loop_start: u64,
     loop_sample: u64,
     /// Set by the audio callback once it has taken this. What is left in `rows`
     /// afterwards is the *old* schedules, swapped out rather than dropped —
@@ -284,6 +306,9 @@ pub struct CompositionPlayer {
     _plugins: Vec<Arc<PluginInstance>>,
     position: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
+    /// Where a repeat goes back to, in samples — the start of the window the
+    /// panel's two length boxes name. Zero is the top of the composition.
+    loop_start: Arc<AtomicU64>,
     /// Where a repeat wraps, in samples. Owned by the callback (it is the one
     /// that adopts a live edit's new length) and read here for the transport
     /// readout.
@@ -349,12 +374,13 @@ impl CompositionPlayer {
     /// A row whose plugin fails to load is logged and skipped rather than
     /// aborting the transport — the rest of the composition still plays, and the
     /// caller reports the shortfall through [`Self::loaded_rows`].
-    /// `loop_secs` is the composition's written length — what a repeat loops on,
-    /// which is not the same as where playback ends when it does not (that is the
-    /// last note-off plus [`TAIL_SECS`]). `repeat` is read every block, so the
-    /// checkbox takes effect on a running transport.
-    pub fn start(plans: Vec<RowPlan>, loop_secs: f64, repeat: Arc<AtomicBool>) -> Result<Self> {
-        Self::start_prepared(Self::prepare(plans)?, loop_secs, repeat)
+    /// `span` is the stretch a repeat loops over — by default the composition's
+    /// whole written length, which is not the same as where playback ends when
+    /// it does *not* repeat (that is the last note-off plus [`TAIL_SECS`]).
+    /// `repeat` is read every block, so the checkbox takes effect on a running
+    /// transport.
+    pub fn start(plans: Vec<RowPlan>, span: LoopSpan, repeat: Arc<AtomicBool>) -> Result<Self> {
+        Self::start_prepared(Self::prepare(plans)?, span, repeat)
     }
 
     /// Load every row's plugin and resolve its schedule — the slow half of
@@ -404,7 +430,7 @@ impl CompositionPlayer {
     /// `cpal::Stream` has to live anyway.
     pub fn start_prepared(
         prepared: PreparedComposition,
-        loop_secs: f64,
+        span: LoopSpan,
         repeat: Arc<AtomicBool>,
     ) -> Result<Self> {
         let PreparedComposition {
@@ -434,17 +460,17 @@ impl CompositionPlayer {
         let position = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
 
-        // Where a repeat wraps. Never before the last event: a length that
-        // rounds down a hair must not cut the note it lands on.
+        // Where a repeat runs between — see `loop_window`.
         let last_event = end_sample.saturating_sub((TAIL_SECS * sample_rate).round() as u64);
-        let loop_sample = Arc::new(AtomicU64::new(
-            loop_sample_for(loop_secs, sample_rate, last_event),
-        ));
+        let (start, end) = loop_window(span, sample_rate, last_event);
+        let loop_start = Arc::new(AtomicU64::new(start));
+        let loop_sample = Arc::new(AtomicU64::new(end));
         let live: Arc<Mutex<Option<LiveUpdate>>> = Arc::new(Mutex::new(None));
 
         let cb_position = position.clone();
         let cb_finished = finished.clone();
         let cb_loop = loop_sample.clone();
+        let cb_loop_start = loop_start.clone();
         let cb_live = live.clone();
         let cb_repeat = repeat;
         let started = Arc::new(OnceLock::new());
@@ -485,12 +511,19 @@ impl CompositionPlayer {
                     let pos = cb_position.load(Ordering::Relaxed);
                     let repeat = cb_repeat.load(Ordering::Relaxed);
                     let loop_sample = cb_loop.load(Ordering::Relaxed);
+                    let loop_start = cb_loop_start.load(Ordering::Relaxed);
 
                     // Ticking Repeat on during the release tail: the loop point
                     // is already behind us and will not come round again, so go
                     // back now rather than play on to the end.
+                    //
+                    // Before the window rather than past it, the pass simply
+                    // plays on into it: what is in front of a repeat's start is
+                    // an intro, and cutting to the loop under a sound the user
+                    // is already hearing would be the one thing a transport
+                    // must not do.
                     if repeat && pos >= loop_sample {
-                        rewind(&mut voices, &cb_position);
+                        rewind(&mut voices, &cb_position, loop_start);
                         continue;
                     }
 
@@ -521,11 +554,17 @@ impl CompositionPlayer {
                     if wraps {
                         // Straight into the next pass: nothing is reset on the
                         // plugins, so releases ring on over the loop.
-                        rewind(&mut voices, &cb_position);
+                        rewind(&mut voices, &cb_position, loop_start);
                         // The loop point is also where an edit made while this
                         // was playing comes in, so a pass is never rearranged
                         // underneath itself.
-                        take_live_update(&cb_live, &mut voices, &cb_loop);
+                        take_live_update(
+                            &cb_live,
+                            &mut voices,
+                            &cb_loop_start,
+                            &cb_loop,
+                            &cb_position,
+                        );
                     } else if !repeat && new_pos >= end_sample {
                         cb_finished.store(true, Ordering::Relaxed);
                     }
@@ -548,6 +587,7 @@ impl CompositionPlayer {
             _plugins: plugins,
             position,
             finished,
+            loop_start,
             loop_sample,
             live,
             started,
@@ -568,6 +608,12 @@ impl CompositionPlayer {
         self.loop_sample.load(Ordering::Relaxed) as f64 / self.sample_rate.max(1.0)
     }
 
+    /// Where it goes back to, in seconds. Zero unless the panel's window says
+    /// otherwise.
+    pub fn loop_start_secs(&self) -> f64 {
+        self.loop_start.load(Ordering::Relaxed) as f64 / self.sample_rate.max(1.0)
+    }
+
     /// Hand the transport a composition edited while it plays. It is taken up
     /// whole at the next loop point; until then the pass in flight is untouched.
     ///
@@ -580,7 +626,7 @@ impl CompositionPlayer {
     /// started with — that cannot be revisited either, for the same reason. If an
     /// edit gives two of them different gains, the instance keeps the first row's
     /// and [`Self::gains_diverged`] says so: one output cannot be at two levels.
-    pub fn update_live(&self, rows: &[RowEdit], loop_secs: f64) {
+    pub fn update_live(&self, rows: &[RowEdit], span: LoopSpan) {
         let mut last_event = 0u64;
         let mut diverged = false;
         let rows: Vec<VoiceEdit> = self
@@ -608,9 +654,11 @@ impl CompositionPlayer {
             })
             .collect();
         self.gains_diverged.store(diverged, Ordering::Relaxed);
+        let (loop_start, loop_sample) = loop_window(span, self.sample_rate, last_event);
         let update = LiveUpdate {
             rows,
-            loop_sample: loop_sample_for(loop_secs, self.sample_rate, last_event),
+            loop_start,
+            loop_sample,
             applied: false,
         };
         // Blocking is fine here: the audio callback only ever tries the lock, and
@@ -663,10 +711,37 @@ impl CompositionPlayer {
     }
 }
 
-/// Where a repeat wraps, in samples: the written length, but never before the
-/// last event — a length that rounds down a hair must not cut the note on it.
+/// How far past the last event a wrap may still be pulled back to it, in
+/// samples. The composition's written length and its last note-off are worked
+/// out from the same units by two different roundings, so they can disagree by
+/// a sample or so; a stop the user *asked* for is never this close.
+const ROUNDING_SLACK: u64 = 4;
+
+/// Where a repeat runs between, in samples — start included, end excluded.
+///
+/// The end is the written length, except that a wrap landing a hair before the
+/// last event is pulled back onto it: rounding must not cut the note the
+/// composition ends on. A [`LoopSpan`] that stops early on purpose is a whole
+/// note value short of that, so it keeps the end it asked for.
+///
+/// The start is then held at least one sample in front of the end, whatever the
+/// boxes say. A window of no length is not a short loop — it is an audio
+/// callback with no samples to fill its block with, going round forever.
+fn loop_window(span: LoopSpan, sample_rate: f64, last_event: u64) -> (u64, u64) {
+    let end = loop_sample_for(span.end_secs, sample_rate, last_event);
+    let start = (span.start_secs * sample_rate).round().max(0.0) as u64;
+    (start.min(end - 1), end)
+}
+
+/// Where a repeat wraps, in samples: the written length, but never a hair
+/// before the last event — see [`ROUNDING_SLACK`].
 fn loop_sample_for(loop_secs: f64, sample_rate: f64, last_event: u64) -> u64 {
-    ((loop_secs * sample_rate).round().max(1.0) as u64).max(last_event)
+    let asked = (loop_secs * sample_rate).round().max(1.0) as u64;
+    if asked < last_event && last_event - asked <= ROUNDING_SLACK {
+        last_event
+    } else {
+        asked
+    }
 }
 
 /// A row's notes, resolved to sample times two ways: the sorted
@@ -704,7 +779,9 @@ fn schedule_from(
 fn take_live_update(
     live: &Mutex<Option<LiveUpdate>>,
     voices: &mut [Voice],
+    loop_start: &AtomicU64,
     loop_sample: &AtomicU64,
+    position: &AtomicU64,
 ) {
     let Ok(mut slot) = live.try_lock() else {
         // The GUI is mid-write; next pass, then.
@@ -732,20 +809,54 @@ fn take_live_update(
                 voice.hits.clear();
             }
         }
-        voice.cursor = 0;
+        // The rewind just before this seeked to the *old* window's start; the
+        // edit may have moved it, and a cursor left pointing into the schedule
+        // it no longer belongs to is the one thing a swap must not leave behind.
+        seek(voice, update.loop_start);
     }
+    loop_start.store(update.loop_start, Ordering::Relaxed);
     loop_sample.store(update.loop_sample, Ordering::Relaxed);
+    position.store(update.loop_start, Ordering::Relaxed);
     update.applied = true;
 }
 
-/// Back to the top of the composition: every row plays its schedule again from
-/// the first event. The plugins are left alone — a note still releasing carries
-/// over into the next pass, which is what makes a loop sound like a loop.
-fn rewind(voices: &mut [Voice], position: &AtomicU64) {
+/// Back to `from`, where the next pass begins: every row plays its schedule
+/// again from the first event at or after it. The plugins are left alone — a
+/// note still releasing carries over into the next pass, which is what makes a
+/// loop sound like a loop.
+fn rewind(voices: &mut [Voice], position: &AtomicU64, from: u64) {
     for voice in voices.iter_mut() {
-        voice.cursor = 0;
+        seek(voice, from);
     }
-    position.store(0, Ordering::Relaxed);
+    position.store(from, Ordering::Relaxed);
+}
+
+/// Put one voice's cursor where playback is about to resume.
+///
+/// The cursor is what stops an event being sent twice, so a pass that starts
+/// part-way in has to *skip* what is behind it rather than let the next block
+/// find it due. Left at zero, every note-on and note-off in front of the
+/// window would be handed to the plugin at once, on the loop's first sample:
+/// not the composition played from there, but a click and whatever notes the
+/// pairing happened to leave hanging.
+///
+/// A note straddling the start is simply not begun again — a repeat resumes the
+/// written composition, it does not retrigger what was already sounding — and a
+/// sample voice needs no help at all: [`render_voice`] walks its hits past the
+/// block it is filling on its own, which also leaves one straddling the start
+/// playing from the middle, where the transport's clock says it is.
+fn seek(voice: &mut Voice, from: u64) {
+    voice.cursor = match &voice.sound {
+        Sound::Plugin(_) => first_event_at(&voice.schedule, from),
+        Sound::Sample(_) => 0,
+    };
+}
+
+/// Where a pass beginning at `from` picks a schedule up: the first event at or
+/// after it. A schedule is sorted by time, so this is a search rather than a
+/// walk — and an event landing exactly on the start belongs to the pass.
+fn first_event_at(schedule: &[(u64, u8, bool)], from: u64) -> usize {
+    schedule.partition_point(|&(at, _, _)| at < from)
 }
 
 /// Which rows can be played by one plugin instance, as groups of indices into
@@ -1410,6 +1521,79 @@ mod tests {
             plan(2, source("/x.so"), 1.0, vec![note(0.0, 1.0, 67)]),
         ];
         assert_eq!(share_groups(&plans), vec![vec![0, 1, 2]]);
+    }
+
+    /// The window a repeat runs between, in samples.
+    ///
+    /// Two things have to hold at once, and they pull opposite ways: a wrap must
+    /// not land a rounding hair before the composition's last note-off and cut
+    /// it, and a stop the user *asked* for — which is a whole note value early,
+    /// never a hair — must be left exactly where they put it. The clamp is
+    /// therefore a tolerance rather than an unbounded pull; before this it was
+    /// `max(last_event)`, which would have quietly undone every early stop the
+    /// panel can name.
+    #[test]
+    fn a_loop_window_keeps_a_deliberate_stop_and_still_covers_a_rounding_hair() {
+        let rate = 48_000.0;
+        let last_event = 96_000; // two seconds of composition
+
+        // A hair short of the last event: rounding, so it is pulled back onto it.
+        let (_, end) = loop_window(LoopSpan::whole(1.99999), rate, last_event);
+        assert_eq!(end, last_event, "a wrap a sample early must not cut the last note");
+
+        // Half a second short: a stop that was asked for, and is kept.
+        let asked = LoopSpan { start_secs: 0.5, end_secs: 1.5 };
+        assert_eq!(loop_window(asked, rate, last_event), (24_000, 72_000));
+
+        // A window with nothing in it is not a short loop — it is a callback
+        // with no samples to fill its block with, going round forever. The
+        // start is held in front of the end whatever it asks for.
+        let (start, end) = loop_window(LoopSpan { start_secs: 9.0, end_secs: 1.0 }, rate, 0);
+        assert!(start < end, "start {start} must stay in front of end {end}");
+        let (start, end) = loop_window(LoopSpan { start_secs: 0.0, end_secs: 0.0 }, rate, 0);
+        assert!(start < end, "an empty composition still needs a sample to play");
+    }
+
+    /// A pass that starts part-way in has to *skip* the events behind it. Left
+    /// at zero, the cursor would hand the plugin every note-on and note-off in
+    /// front of the window at once, on the loop's first sample: not the
+    /// composition played from there, but a click and whatever notes the
+    /// pairing happened to leave hanging.
+    #[test]
+    fn seeking_a_voice_skips_the_events_in_front_of_the_window() {
+        let (schedule, hits, _) = schedule_from(
+            &[note(0.0, 0.5, 60), note(1.0, 0.5, 64), note(2.0, 0.5, 67)],
+            48_000.0,
+        );
+        // At 1.0 s the first note's on *and* off are behind the window; the
+        // second note's on falls exactly on it and belongs to the pass.
+        assert_eq!(first_event_at(&schedule, 48_000), 2, "the first note's pair is behind us");
+        assert_eq!(schedule[2].0, 48_000, "…and the second note's on is due");
+        assert_eq!(first_event_at(&schedule, 0), 0, "a window at the top skips nothing");
+        assert_eq!(
+            first_event_at(&schedule, u64::MAX),
+            schedule.len(),
+            "a window past everything skips everything"
+        );
+
+        // A sample voice needs no seek at all: `render_voice` walks its hits
+        // past the block it is filling on its own, which also leaves one
+        // straddling the start playing from where the transport's clock says it
+        // is rather than beginning it again.
+        let mut voice = Voice {
+            row_ids: vec![0],
+            gain: 1.0,
+            schedule,
+            hits,
+            cursor: 7,
+            sound: Sound::Sample(SampleSound {
+                audio: Arc::new(DecodedAudio { samples: vec![0.0; 16], sample_rate: 48_000.0 }),
+                step: 1.0,
+                fade: 1,
+            }),
+        };
+        seek(&mut voice, 96_000);
+        assert_eq!(voice.cursor, 0);
     }
 
     /// A different sound is a different instance, however alike the rows look.

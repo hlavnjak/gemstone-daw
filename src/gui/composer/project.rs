@@ -37,6 +37,8 @@
 //! gemstone-project 1
 //! name = My Song
 //! tempo = 120
+//! repeat-from = 1 none
+//! repeat-to = 2 1/2
 //!
 //! [row]
 //! name = lead
@@ -62,6 +64,13 @@
 //! always did, so files that do not use one are unchanged and load in any build;
 //! one that does is refused by a build too old to know `3/8`, which is a message
 //! rather than a silent misreading.
+//!
+//! The two `repeat-` keys are the window a repeat loops over, each a length
+//! **from the beginning** of the composition. `repeat-to` of zero — which is
+//! how it is written when it is absent — is the end of the composition. Both
+//! are written only when they are not zero, so a project that loops the whole
+//! composition, which is every project that has not been told otherwise, is
+//! byte for byte the file it always was.
 //!
 //! Unknown keys are skipped, so a field added later loads in an older build
 //! rather than failing — `enabled`, the newest of them, is exactly that: an
@@ -187,6 +196,12 @@ pub struct ProjectRow {
 pub struct Project {
     pub name: String,
     pub tempo_bpm: f32,
+    /// The repeat window: where a repeat starts and where it stops, each a
+    /// length from the beginning of the composition. A stop of zero is the end
+    /// of the composition, which is what a repeat loops to without being told
+    /// otherwise.
+    pub repeat_from: Duration,
+    pub repeat_to: Duration,
     pub rows: Vec<ProjectRow>,
 }
 
@@ -195,6 +210,16 @@ impl Project {
         let mut s = format!("{MAGIC} {VERSION}\n");
         s += &format!("name = {}\n", one_line(&self.name));
         s += &format!("tempo = {}\n", num(self.tempo_bpm));
+        // Only when there is a window to record. A repeat that loops the whole
+        // composition writes nothing, so files that do not use one are
+        // unchanged — and an older build, which skips keys it does not know,
+        // loads one that does and simply loops the whole thing.
+        if self.repeat_from.units() > 0 {
+            s += &format!("repeat-from = {}\n", write_duration(self.repeat_from));
+        }
+        if self.repeat_to.units() > 0 {
+            s += &format!("repeat-to = {}\n", write_duration(self.repeat_to));
+        }
         for row in &self.rows {
             s += "\n[row]\n";
             // The row's own name first: inside a [row] block `name` is the
@@ -250,7 +275,13 @@ impl Project {
             );
         }
 
-        let mut project = Project { name: String::new(), tempo_bpm: 120.0, rows: Vec::new() };
+        let mut project = Project {
+            name: String::new(),
+            tempo_bpm: 120.0,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
+            rows: Vec::new(),
+        };
         for line in lines {
             if line == "[row]" {
                 project.rows.push(ProjectRow {
@@ -274,6 +305,8 @@ impl Project {
                 ("name", None) => project.name = value.to_string(),
                 ("name", Some(row)) => row.name = value.to_string(),
                 ("tempo", None) => project.tempo_bpm = value.parse().unwrap_or(120.0),
+                ("repeat-from", None) => project.repeat_from = read_duration(value)?,
+                ("repeat-to", None) => project.repeat_to = read_duration(value)?,
                 ("track", Some(row)) => row.track_name = value.to_string(),
                 ("source", Some(row)) => row.source = read_source(value)?,
                 // Belongs to the source above it, which is where the writer puts
@@ -506,6 +539,8 @@ mod tests {
         Project {
             name: "My Song".to_string(),
             tempo_bpm: 132.5,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
             rows: vec![
                 ProjectRow {
                     name: "lead".to_string(),
@@ -626,6 +661,40 @@ mod tests {
         let p = sample();
         let back = Project::parse(&p.to_text()).expect("parses");
         assert_eq!(back, p);
+    }
+
+    /// A repeat's window is two lengths from the beginning of the composition,
+    /// and it is saved with it: a loop the user set up is part of the project,
+    /// not of the session that happened to be open.
+    ///
+    /// Written only when there *is* a window, so a project that loops the whole
+    /// composition — which is every project that has not been told otherwise —
+    /// is byte for byte the file it always was, and an older build, which skips
+    /// keys it does not know, loads one that does and loops the whole thing.
+    #[test]
+    fn a_repeat_window_is_saved_and_only_when_there_is_one() {
+        let plain = sample();
+        assert!(
+            !plain.to_text().contains("repeat-"),
+            "a project with no window must write no window: {}",
+            plain.to_text()
+        );
+
+        let mut p = sample();
+        p.repeat_from = Duration::new(1, Fraction::None);
+        p.repeat_to = Duration::with_num(2, 3, Fraction::Eighth);
+        let text = p.to_text();
+        assert!(text.contains("repeat-from = 1 none"), "{text}");
+        assert!(text.contains("repeat-to = 2 3/8"), "{text}");
+        assert_eq!(Project::parse(&text).expect("parses"), p);
+
+        // A file written before the keys existed reads as the whole composition,
+        // which is what those projects were played as: no start, and a stop of
+        // zero, which the panel reads as the end.
+        let old = "gemstone-project 1\nname = X\ntempo = 120\n";
+        let back = Project::parse(old).expect("parses");
+        assert_eq!(back.repeat_from.units(), 0);
+        assert_eq!(back.repeat_to.units(), 0);
     }
 
     /// Paths are the one thing this format exists to carry, and they contain
@@ -807,6 +876,8 @@ mod folder_tests {
         let p = Project {
             name: "Song".to_string(),
             tempo_bpm: 100.0,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
             rows: vec![ProjectRow {
                 name: "Voice row".to_string(),
                 track_name: "Voice".to_string(),
@@ -846,6 +917,8 @@ mod folder_tests {
         let p = Project {
             name: "Song".to_string(),
             tempo_bpm: 120.0,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
             rows: vec![ProjectRow {
                 name: "Voice row".to_string(),
                 track_name: "Voice".to_string(),
