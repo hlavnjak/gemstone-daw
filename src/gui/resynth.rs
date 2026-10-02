@@ -233,16 +233,7 @@ impl ResynthPanel {
 
 impl ResynthPanel {
     fn internal_plugin_path() -> Option<PathBuf> {
-        #[cfg(target_os = "linux")]
-        let lib_name = "liblesynth_fourier.so";
-        #[cfg(target_os = "macos")]
-        let lib_name = "liblesynth_fourier.dylib";
-        #[cfg(target_os = "windows")]
-        let lib_name = "lesynth_fourier.dll";
-
-        std::env::current_dir()
-            .ok()
-            .map(|cwd| cwd.join("internal_plugins").join(lib_name))
+        crate::internal_plugin_path()
     }
 
     /// Load (once) a plugin instance whose shared object backs the analysis

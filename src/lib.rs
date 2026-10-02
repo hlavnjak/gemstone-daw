@@ -18,7 +18,41 @@ pub mod midi;
 pub mod track_format;
 pub mod vst;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// File name of the embedded LeSynth Fourier plugin on this platform.
+#[cfg(target_os = "linux")]
+pub const INTERNAL_PLUGIN_LIB: &str = "liblesynth_fourier.so";
+#[cfg(target_os = "macos")]
+pub const INTERNAL_PLUGIN_LIB: &str = "liblesynth_fourier.dylib";
+#[cfg(target_os = "windows")]
+pub const INTERNAL_PLUGIN_LIB: &str = "lesynth_fourier.dll";
+
+/// Where the embedded plugin lives: `internal_plugins/` in the working
+/// directory (a checkout run with `make run`), else beside the executable, else
+/// in a macOS `.app`'s `Contents/PlugIns/` — an app started from Finder runs
+/// with `/` as its working directory, so the first place alone never finds it
+/// there. When none exists the working-directory path is returned, so the error
+/// the caller reports names the place a checkout expects.
+pub fn internal_plugin_path() -> Option<PathBuf> {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|d| d.join("internal_plugins").join(INTERNAL_PLUGIN_LIB));
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf));
+    let beside_exe = exe_dir.iter().flat_map(|d| {
+        [
+            d.join("internal_plugins"),
+            d.join("../PlugIns"),
+        ]
+    });
+    cwd.iter()
+        .cloned()
+        .chain(beside_exe.map(|d| d.join(INTERNAL_PLUGIN_LIB)))
+        .find(|p| p.is_file())
+        .or(cwd)
+}
 
 /// What a path is called on screen: its last component, never the whole thing.
 ///

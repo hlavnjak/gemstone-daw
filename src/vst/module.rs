@@ -25,7 +25,9 @@
 //!     `GetPluginFactory` alone: the host must call `ModuleEntry(handle)` after
 //!     `dlopen` and `ModuleExit()` before `dlclose`. JUCE initialises its whole
 //!     runtime there, so a JUCE plugin whose `ModuleEntry` was skipped hands back
-//!     a factory that crashes or an editor that never draws.
+//!     a factory that crashes or an editor that never draws. macOS spells the
+//!     pair `bundleEntry(CFBundleRef)` / `bundleExit()`, and SDK plugins find
+//!     their resources through that bundle, so it has to be a real one.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -46,6 +48,9 @@ type ModuleExitProc = unsafe extern "C" fn() -> bool;
 /// Windows' spelling of the same pair (no handle argument).
 #[cfg(target_os = "windows")]
 type InitDllProc = unsafe extern "C" fn() -> bool;
+/// macOS' spelling: `bool bundleEntry(CFBundleRef)`.
+#[cfg(target_os = "macos")]
+type BundleEntryProc = unsafe extern "C" fn(*mut c_void) -> bool;
 
 /// Architecture subdirectories of `Contents/`, in the order we try them.
 #[cfg(target_os = "linux")]
@@ -119,9 +124,11 @@ fn pick_module_in(dir: &Path, bundle: &Path) -> Option<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .filter(|p| {
+            // A macOS bundle's executable, `Contents/MacOS/Foo`, has no
+            // extension at all.
             p.extension()
                 .map(|e| MODULE_EXTS.iter().any(|m| e.eq_ignore_ascii_case(m)))
-                .unwrap_or(false)
+                .unwrap_or(cfg!(target_os = "macos"))
         })
         .collect();
     candidates.sort();
@@ -274,6 +281,10 @@ pub struct Vst3Module {
     path: PathBuf,
     /// Whether `ModuleEntry` succeeded, so `Drop` knows to call `ModuleExit`.
     entered: bool,
+    /// macOS: the `CFBundleRef` handed to `bundleEntry`, released after
+    /// `bundleExit`. Null for a bare `.dylib` (our internal plugin).
+    #[cfg(target_os = "macos")]
+    bundle: *mut c_void,
 }
 
 // The library and everything reached through it is used from the GUI thread, the
@@ -299,6 +310,8 @@ impl Vst3Module {
             handle,
             path: resolved,
             entered: false,
+            #[cfg(target_os = "macos")]
+            bundle: std::ptr::null_mut(),
         };
         module.enter()?;
         module.check_is_vst3()?;
@@ -339,6 +352,17 @@ impl Vst3Module {
                 return Ok(());
             }
 
+            #[cfg(target_os = "macos")]
+            if let Ok(entry) = self.library.get::<BundleEntryProc>(b"bundleEntry\0") {
+                self.bundle = macos::bundle_of(&self.path);
+                anyhow::ensure!(
+                    entry(self.bundle),
+                    "the plugin's bundleEntry() returned false — it declined to load"
+                );
+                self.entered = true;
+                return Ok(());
+            }
+
             if let Ok(entry) = self.library.get::<ModuleEntryProc>(b"ModuleEntry\0") {
                 anyhow::ensure!(
                     entry(self.handle),
@@ -371,12 +395,19 @@ impl Vst3Module {
 
 impl Drop for Vst3Module {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        let _bundle = macos::Owned(self.bundle);
         if !self.entered {
             return;
         }
         unsafe {
             #[cfg(target_os = "windows")]
             if let Ok(exit) = self.library.get::<ModuleExitProc>(b"ExitDll\0") {
+                exit();
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            if let Ok(exit) = self.library.get::<ModuleExitProc>(b"bundleExit\0") {
                 exit();
                 return;
             }
@@ -411,6 +442,63 @@ fn open_library(path: &Path) -> Result<(Library, *mut c_void)> {
     let handle = lib.into_raw();
     let lib = unsafe { UnixLibrary::from_raw(handle) };
     Ok((Library::from(lib), handle))
+}
+
+/// Just enough CoreFoundation to hand `bundleEntry` the plugin's own bundle.
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ffi::c_void;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: *const c_void,
+            buffer: *const u8,
+            length: isize,
+            is_directory: u8,
+        ) -> *mut c_void;
+        fn CFBundleCreate(allocator: *const c_void, url: *mut c_void) -> *mut c_void;
+        fn CFRelease(cf: *mut c_void);
+    }
+
+    /// The `CFBundleRef` of the `.vst3` bundle `Foo.vst3/Contents/MacOS/Foo`
+    /// lives in, or null when the library is not inside one.
+    pub fn bundle_of(library: &Path) -> *mut c_void {
+        let Some(bundle) = library.ancestors().nth(3) else {
+            return std::ptr::null_mut();
+        };
+        if !bundle.extension().is_some_and(|e| e.eq_ignore_ascii_case("vst3")) {
+            return std::ptr::null_mut();
+        }
+        let bytes = bundle.as_os_str().as_bytes();
+        unsafe {
+            let url = CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as isize,
+                1,
+            );
+            if url.is_null() {
+                return std::ptr::null_mut();
+            }
+            let bundle = CFBundleCreate(std::ptr::null(), url);
+            CFRelease(url);
+            bundle
+        }
+    }
+
+    /// Releases a CF object (if any) when dropped — after `bundleExit` ran.
+    pub struct Owned(pub *mut c_void);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]

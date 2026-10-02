@@ -426,17 +426,8 @@ impl TracksPanel {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    const INTERNAL_LIB: &'static str = "liblesynth_fourier.so";
-    #[cfg(target_os = "macos")]
-    const INTERNAL_LIB: &'static str = "liblesynth_fourier.dylib";
-    #[cfg(target_os = "windows")]
-    const INTERNAL_LIB: &'static str = "lesynth_fourier.dll";
-
     fn internal_plugin_path() -> Option<PathBuf> {
-        std::env::current_dir()
-            .ok()
-            .map(|cwd| cwd.join("internal_plugins").join(Self::INTERNAL_LIB))
+        crate::internal_plugin_path()
     }
 
     /// Add a LeSynth Fourier track (internal plugin, plain synth mode).

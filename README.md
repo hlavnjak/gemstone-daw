@@ -202,6 +202,8 @@ published there as a wav track — and any number of rows may share the same one
 Cargo.toml          # egui/eframe app crate
 Makefile            # builds the app; (re)builds + embeds the VST3 when its source is present
 .cargo/config.toml  # Windows cross linker
+packaging/macos/    # Info.plist template for the macOS app bundle
+tools/zig-macos-cc.sh  # macOS cross linker (zig, honouring the minimum macOS)
 internal_plugins/   # the embedded LeSynth Fourier VST3 (committed precompiled)
 src/
   main.rs                                 # eframe entry point
@@ -266,6 +268,35 @@ make fourier-windows  # build only the VST3 plugin for Windows
 ```
 
 Output: `target/x86_64-pc-windows-gnu/release/gemstone-daw.exe`.
+
+## macOS cross build (from Linux via zig)
+
+Builds one **universal** binary — an `x86_64` slice for Intel Macs (macOS 10.13+)
+and an `arm64` slice for Apple silicon (macOS 11+) — and wraps it in an app
+bundle with the embedded plugin (also universal) in `Contents/PlugIns/`.
+
+Requirements, none of which need root:
+
+- [zig](https://ziglang.org/download/) on `PATH` (tested with 0.15.2) and
+  `cargo install cargo-zigbuild` — zig is the Mach-O linker.
+- `rustup target add x86_64-apple-darwin aarch64-apple-darwin`.
+- `llvm-lipo` (ships with LLVM; override with `LIPO=...`).
+- A macOS SDK for the framework headers and link stubs, unpacked at
+  `~/.local/opt/MacOSX26.1.sdk` or passed as `MACOS_SDK=/path/to/MacOSX.sdk`.
+  Apple's SDK licence allows its use only on Apple hardware; take it from your
+  own Xcode where that matters.
+
+```sh
+make build-macos    # build both slices, lipo them, assemble the .app
+make fourier-macos  # build only the universal VST3 plugin .dylib
+```
+
+Output: `target/universal-apple-darwin/release/Gemstone DAW.app` (and the bare
+universal binary beside it). The arm64 slice is ad-hoc signed by the linker,
+which is what Apple silicon requires to run it at all; the app is not notarised,
+so a downloaded copy needs `xattr -cr "Gemstone DAW.app"` (or right-click → Open)
+the first time. Embedding a plugin's own editor window is not implemented on
+macOS yet — the editor button reports that instead of opening one.
 
 ## License
 

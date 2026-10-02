@@ -42,6 +42,21 @@ make fourier-windows  # build only the VST3 plugin for Windows
 
 Output: `target/x86_64-pc-windows-gnu/release/gemstone-daw.exe`.
 
+### macOS cross build (from Linux via zig)
+
+Requires `zig` + `cargo install cargo-zigbuild`, `rustup target add
+x86_64-apple-darwin aarch64-apple-darwin`, `llvm-lipo`, and a macOS SDK at
+`~/.local/opt/MacOSX26.1.sdk` (or `MACOS_SDK=...`).
+
+```sh
+make build-macos    # universal (x86_64 10.13+ / arm64 11+) binary + .app bundle
+make fourier-macos  # build only the universal VST3 plugin .dylib
+```
+
+Output: `target/universal-apple-darwin/release/Gemstone DAW.app`. Linking goes
+through `tools/zig-macos-cc.sh`, because plain `cargo zigbuild` stamps every
+binary "minimum macOS 13" whatever `MACOSX_DEPLOYMENT_TARGET` says.
+
 ## Commits
 
 - **Never** add a Claude signature, watermark, or "Generated with Claude Code" /

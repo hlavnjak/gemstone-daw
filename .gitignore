@@ -10,6 +10,7 @@
 !/internal_plugins/.gitkeep
 !/internal_plugins/liblesynth_fourier.so
 !/internal_plugins/lesynth_fourier.dll
+!/internal_plugins/liblesynth_fourier.dylib
 
 # Local scratch / recordings — not part of the repo.
 /my_voice.m4a
