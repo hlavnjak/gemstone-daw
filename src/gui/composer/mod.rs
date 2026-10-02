@@ -2863,6 +2863,11 @@ impl ComposerPanel {
                         ui.set_min_height(CARD_H - 10.0);
                         ui.spacing_mut().item_spacing.y = 3.0;
                         ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                        // egui's own row height, which the card's height was
+                        // measured against: the app's is a full-padding button
+                        // tall, and would push the card past CARD_H.
+                        ui.spacing_mut().interact_size.y =
+                            egui::style::Spacing::default().interact_size.y;
 
                         // Header: what the frame is and how long. The note frame
                         // also carries the delete button, laid out from the

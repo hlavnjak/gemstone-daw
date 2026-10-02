@@ -101,6 +101,10 @@ impl DawApp {
         let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        // A line starts this tall, and a button padded as above is 28 px: start
+        // it any shorter and each thing on it is centred on a line still
+        // growing, so select boxes drift down below the buttons beside them.
+        style.spacing.interact_size.y = 28.0;
         style.spacing.indent = 16.0;
         // Bump the default body/heading text a touch for legibility.
         use egui::{FontFamily::Proportional, FontId, TextStyle};
@@ -682,5 +686,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A line of labels, buttons and select boxes reads as one line. egui
+    /// centres each thing on the line as tall as it is *so far*, and a line
+    /// starts at `interact_size.y`; under egui's 18 px default a padded button
+    /// grows it, so every box after the first sits a little lower than the one
+    /// before — the repeat window's six boxes, and the input picker beside the
+    /// recording button, both read as a staircase. Starting the line at a
+    /// button's full height leaves nothing to grow.
+    #[test]
+    fn labels_buttons_and_select_boxes_share_one_line() {
+        let ctx = egui::Context::default();
+        DawApp::configure_style(&ctx);
+        let mut centres = Vec::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    centres.push(("label", ui.label("from").rect.center().y));
+                    centres.push(("button", ui.button("Record").rect.center().y));
+                    for salt in ["first box", "second box"] {
+                        let r = egui::ComboBox::from_id_salt(salt)
+                            .selected_text(salt)
+                            .show_ui(ui, |_| {})
+                            .response;
+                        centres.push((salt, r.rect.center().y));
+                    }
+                    centres.push(("last label", ui.label("to").rect.center().y));
+                });
+            });
+        });
+        let line = centres[0].1;
+        for (what, y) in &centres {
+            assert!((y - line).abs() < 0.5, "the {what} is off the line: {centres:?}");
+        }
     }
 }
