@@ -7,13 +7,14 @@ edition = "2021"
 default-run = "gemstone-daw"
 authors = ["Jakub Hlavnicka <hlavnickajakub@gmail.com>"]
 license = "Apache-2.0"
-description = "A Rust DAW (egui/eframe) that hosts VST3 plugins and resynthesizes arbitrary audio through an embedded LeSynth Fourier additive synth."
+description = "A Rust DAW (egui/eframe) that hosts VST3, CLAP, VST2, LV2 and AU plugins and resynthesizes arbitrary audio through an embedded LeSynth Fourier additive synth."
 readme = "README.md"
-keywords = ["daw", "vst3", "audio", "synthesizer", "resynthesis"]
+keywords = ["daw", "vst3", "clap", "audio", "resynthesis"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-# VST3 hosting
+# Plugin hosting: VST3 through the `vst3` crate, CLAP through `clap-sys`.
+# VST2, LV2 and Audio Units need no crate — see src/plugin/.
 vst3 = "0.3.0"
 libloading = "0.7"
 
@@ -41,12 +42,15 @@ log = "0.4"
 fern = "0.6"
 chrono = { version = "0.4", features = ["clock"] }
 uuid = { version = "1.25.0", features = ["v4"] }
+clap-sys = "0.5.0"
 
 # Plugin editor window — raw X11 on Linux, raw Win32 on Windows.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-dl = "2.21"
-# `poll(2)`, so the editor window can wait on the file descriptors a hosted
-# plugin registers with our run loop instead of spinning.
+
+# `poll(2)`, so the editor window — and a CLAP plugin's own main thread — can
+# wait on the file descriptors a hosted plugin registers instead of spinning.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]

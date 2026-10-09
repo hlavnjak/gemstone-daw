@@ -15,6 +15,7 @@ pub mod analysis;
 pub mod audio;
 pub mod gui;
 pub mod midi;
+pub mod plugin;
 pub mod track_format;
 pub mod vst;
 

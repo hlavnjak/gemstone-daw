@@ -62,16 +62,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use vst3::Steinberg::Vst::{
-    AudioBusBuffers, IAudioProcessorTrait, IEventList, IParameterChanges, ParamID, ParamValue,
-    ProcessData, SymbolicSampleSizes_,
-};
-use vst3::{ComPtr, ComWrapper};
-
-use crate::audio::{decode_audio_file, midi_to_vst3_event, DecodedAudio, Limiter};
+use crate::audio::{decode_audio_file, DecodedAudio, Limiter};
 use crate::gui::registry::PlaybackSource;
-use crate::audio::engine::{bus_buffers, declared_block_size, AudioScratch};
-use crate::vst::{next_instance_token, EventList, ParamChanges, PluginInstance, Vst3Module};
+use crate::audio::engine::declared_block_size;
+use crate::plugin::{detect_format, BlockProcessor, PluginFormat, PluginInstance};
+use crate::vst::{next_instance_token, Vst3Instance, Vst3Module};
 
 /// Velocity every composed note is played at. The Composer has no velocity
 /// control, and a mid-scale value keeps VSTs that map velocity to level audible
@@ -217,36 +212,12 @@ enum Sound {
     Sample(SampleSound),
 }
 
-/// A plugin instance and everything `process()` needs pointed at it.
+/// A plugin instance and everything `process()` needs pointed at it. The
+/// processor holds the instance, so the plugin cannot be terminated or its
+/// library unloaded while the callback that calls `process()` on it still
+/// exists.
 struct PluginSound {
-    /// The instance this voice plays. Held here, not just in the player, so the
-    /// plugin cannot be terminated or its library unloaded while the callback
-    /// that calls `process()` on it still exists.
-    plugin: Arc<PluginInstance>,
-    event_impl: Arc<EventList>,
-    event_list: ComPtr<IEventList>,
-    /// What the plugin's own editor changed since the last block, and the list
-    /// `process()` is handed it in. A plugin that is processing audio will not
-    /// write its own parameters — see [`crate::vst::param_changes`] — so an
-    /// editor open over a playing composition is dead without this.
-    param_changes: ParamChanges,
-    param_changes_ptr: ComPtr<IParameterChanges>,
-    /// Drained into once a block, kept here so the mix allocates nothing.
-    edits_this_block: Vec<(ParamID, ParamValue)>,
-    /// Total channels across this plugin's audio input buses, which is where its
-    /// output channels start in `scratch`.
-    in_channels: usize,
-    /// Channels on the main output bus — the ones that are mixed down.
-    main_out: usize,
-    /// The block size this instance was set up for; it must never be handed more.
-    max_block: usize,
-    /// Per-channel buffers (inputs then outputs) and the pointer table
-    /// `process()` reads them through, owned so the mix allocates nothing per
-    /// block and one voice's layout cannot disturb another's.
-    scratch: AudioScratch,
-    /// The bus descriptors, laid out over `scratch` once.
-    in_buses: Vec<AudioBusBuffers>,
-    out_buses: Vec<AudioBusBuffers>,
+    processor: BlockProcessor,
 }
 
 /// A decoded audio file, played from its start for as long as the note lasts.
@@ -922,6 +893,7 @@ fn share_groups(plans: &[RowPlan]) -> Vec<Vec<usize>> {
 fn same_recipe(a: &PlaybackSource, b: &PlaybackSource) -> bool {
     a.plugin_path == b.plugin_path
         && a.class_id == b.class_id
+        && a.plugin_id == b.plugin_id
         && a.is_lesynth == b.is_lesynth
         && a.state == b.state
         && a.vst_state == b.vst_state
@@ -965,11 +937,19 @@ fn load_instances(
     sample_rate: f64,
     max_block: i32,
 ) -> Vec<Option<Arc<PluginInstance>>> {
-    // One module per distinct library rather than one per group: that is what a
-    // VST3 module is for, and it saves a `dlopen` and a `ModuleEntry` each time.
+    // One module per distinct VST3 library rather than one per group: that is
+    // what a VST3 module is for, and it saves a `dlopen` and a `ModuleEntry`
+    // each time. Every other format loads its own library per instance.
     let mut modules: HashMap<PathBuf, Option<Arc<Vst3Module>>> = HashMap::new();
     // A wav row has no library to open — its `plugin_path` is the audio file.
     for plan in plans.iter().filter(|p| p.source.wav.is_none()) {
+        let is_vst3 = matches!(
+            detect_format(&plan.source.plugin_path, plan.source.plugin_id.as_deref()),
+            Ok(PluginFormat::Vst3)
+        );
+        if !is_vst3 {
+            continue;
+        }
         modules
             .entry(plan.source.plugin_path.clone())
             .or_insert_with(|| match Vst3Module::open(&plan.source.plugin_path) {
@@ -1032,11 +1012,24 @@ fn load_one(
     sample_rate: f64,
     max_block: i32,
 ) -> Option<Arc<PluginInstance>> {
-    let module = module?;
     // Only LeSynth exposes the state ABI, and only a tagged instance can be
     // addressed by it.
     let token = plan.source.is_lesynth.then(next_instance_token);
-    let inst = match PluginInstance::from_module(module, plan.source.class_id.as_ref(), token) {
+    // A VST3 is made from the module opened once above; any other format is
+    // loaded whole.
+    let loaded = match module {
+        Some(module) => {
+            Vst3Instance::from_module(module, plan.source.class_id.as_ref(), token)
+                .map(PluginInstance::from_vst3)
+        }
+        None => PluginInstance::load(
+            &plan.source.plugin_path,
+            plan.source.class_id.as_ref(),
+            plan.source.plugin_id.as_deref(),
+            token,
+        ),
+    };
+    let inst = match loaded {
         Ok(i) => Arc::new(i),
         Err(e) => {
             log::warn!("Composer: '{}' failed to load: {e:#}", plan.source.name);
@@ -1054,10 +1047,10 @@ fn load_one(
         // `setState` whether the kit changed or not — 430 ms a row, against a
         // fraction of a millisecond to ask what state it is in.
         let unchanged = inst
-            .component_state()
+            .save_state()
             .is_ok_and(|current| current == *bytes);
         if !unchanged {
-            if let Err(e) = inst.set_component_state(bytes) {
+            if let Err(e) = inst.restore_state(bytes) {
                 log::warn!("Composer: '{}' state restore failed: {e:#}", plan.source.name);
             }
         }
@@ -1140,37 +1133,16 @@ fn prepare_voices(
         last_event = last_event.max(group_last_event);
         rows_playing += group.len();
 
-        let event_impl = Arc::new(EventList::default());
-        let event_list = ComWrapper::new((*event_impl).clone())
-            .to_com_ptr::<IEventList>()
-            .context("Failed to create event list COM ptr")?;
-        let param_changes = ParamChanges::default();
-        let param_changes_ptr = ComWrapper::new(param_changes.clone())
-            .to_com_ptr::<IParameterChanges>()
-            .context("Failed to create parameter changes COM ptr")?;
-
-        // The bus layout the plugin settled on in `initialize_audio`. A plugin
-        // that declares no output bus still needs somewhere to write, so it gets
-        // a stereo one; anything else is taken as declared.
-        let io = inst.io();
-        let out_channels_per_bus = if io.outputs.is_empty() {
-            vec![2usize]
-        } else {
-            io.outputs.clone()
+        // The buffers for the bus layout the plugin settled on in
+        // `initialize_audio`, and whatever its format's `process()` needs
+        // pointed at them.
+        let processor = match BlockProcessor::new(inst.clone(), max_block.max(0) as usize) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Composer: '{}' cannot be processed: {e:#}", host.source.name);
+                continue;
+            }
         };
-        let in_channels: usize = io.inputs.iter().sum();
-        let out_channels: usize = out_channels_per_bus.iter().sum();
-        let voice_max_block = if io.max_block > 0 {
-            io.max_block
-        } else {
-            max_block.max(0) as usize
-        };
-        let mut scratch = AudioScratch::new(in_channels + out_channels, voice_max_block);
-        let in_buses = bus_buffers(&io.inputs, &mut scratch.ptrs_mut()[..in_channels]);
-        let out_buses = bus_buffers(
-            &out_channels_per_bus,
-            &mut scratch.ptrs_mut()[in_channels..],
-        );
 
         voices.push(Voice {
             row_ids: group.iter().map(|&i| plans[i].row_id).collect(),
@@ -1178,20 +1150,7 @@ fn prepare_voices(
             schedule,
             hits,
             cursor: 0,
-            sound: Sound::Plugin(PluginSound {
-                param_changes,
-                param_changes_ptr,
-                edits_this_block: Vec::new(),
-                plugin: inst.clone(),
-                event_impl,
-                event_list,
-                in_channels,
-                main_out: out_channels_per_bus[0],
-                max_block: voice_max_block,
-                scratch,
-                in_buses,
-                out_buses,
-            }),
+            sound: Sound::Plugin(PluginSound { processor }),
         });
         plugins.push(inst);
     }
@@ -1293,68 +1252,37 @@ fn render_voice(
     };
 
     // Events due in this block, offset to their sample in it.
-    {
-        let mut events = sound.event_impl.events.write().unwrap();
-        events.clear();
-        while let Some(&(at, pitch, on)) = voice.schedule.get(voice.cursor) {
-            // `flush_events` empties the schedule into this block: the caller
-            // is about to rewind, and anything left behind is a note-off that
-            // would never be sent.
-            if at >= block_end && !flush_events {
-                break;
-            }
-            let status = if on { 0x90 } else { 0x80 };
-            let velocity = if on { NOTE_VELOCITY } else { 0 };
-            if let Some(mut ev) = midi_to_vst3_event([status, pitch, velocity]) {
-                // Events already due (a late start, or two in the same
-                // block) land on the block's first sample.
-                ev.sampleOffset =
-                    at.saturating_sub(block_start).min(frames as u64 - 1) as i32;
-                events.push(ev);
-            }
-            voice.cursor += 1;
+    let processor = &mut sound.processor;
+    while let Some(&(at, pitch, on)) = voice.schedule.get(voice.cursor) {
+        // `flush_events` empties the schedule into this block: the caller is
+        // about to rewind, and anything left behind is a note-off that would
+        // never be sent.
+        if at >= block_end && !flush_events {
+            break;
         }
+        let status = if on { 0x90 } else { 0x80 };
+        let velocity = if on { NOTE_VELOCITY } else { 0 };
+        // Events already due (a late start, or two in the same block) land on
+        // the block's first sample; the processor puts anything past its end
+        // on the last.
+        let offset = at.saturating_sub(block_start).min(u32::MAX as u64) as u32;
+        if !processor.push_event(offset, [status, pitch, velocity]) {
+            // The block is full; the rest wait for the next one.
+            break;
+        }
+        voice.cursor += 1;
     }
 
     // Never more than this instance was set up for (see `PluginIo::max_block`).
-    let frames = frames.min(sound.max_block);
-    sound.scratch.reset(frames);
-
-    let mut data = ProcessData {
-        numInputs: sound.in_buses.len() as i32,
-        inputs: if sound.in_buses.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            sound.in_buses.as_mut_ptr()
-        },
-        numOutputs: sound.out_buses.len() as i32,
-        outputs: sound.out_buses.as_mut_ptr(),
-        numSamples: frames as i32,
-        processMode: 0,
-        symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
-        ..unsafe { std::mem::zeroed() }
-    };
-    data.inputEvents = sound.event_list.as_ptr() as *mut _;
-    sound
-        .plugin
-        .param_edits()
-        .drain_into(&mut sound.edits_this_block);
-    if sound.param_changes.load(&sound.edits_this_block) {
-        data.inputParameterChanges = sound.param_changes_ptr.as_ptr() as *mut _;
-    }
-
-    unsafe {
-        sound.plugin.processor.as_com_ref().process(&mut data as *mut _);
-    }
-    sound.event_impl.events.write().unwrap().clear();
+    let frames = processor.process(frames);
 
     // Main output bus into the mix. Its channel count is the plugin's, not
     // the device's: a mono plugin repeats, a wider one has the extra dropped.
-    if sound.main_out > 0 {
-        for frame in 0..frames {
-            for ch in 0..channels {
-                let src = sound.in_channels + ch.min(sound.main_out - 1);
-                out[frame * channels + ch] += sound.scratch.channel(src)[frame] * voice.gain;
+    if processor.main_out() > 0 {
+        for ch in 0..channels {
+            let src = processor.output(ch);
+            for frame in 0..frames {
+                out[frame * channels + ch] += src[frame] * voice.gain;
             }
         }
     }
@@ -1495,6 +1423,7 @@ mod tests {
             name: path.to_string(),
             plugin_path: PathBuf::from(path),
             class_id: None,
+            plugin_id: None,
             is_lesynth: false,
             state: None,
             vst_state: None,

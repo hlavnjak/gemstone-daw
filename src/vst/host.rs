@@ -33,6 +33,8 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::{ComPtr, ComRef, ComWrapper, Interface};
 
+use crate::plugin::PluginIo;
+
 use super::handler::ParamChangeHandler;
 use super::param_changes::ParamEdits;
 use super::host_context::{HostApplication, MemoryStream};
@@ -189,13 +191,13 @@ type ImportFlagsProc = unsafe extern "C" fn(u64, u32, *const u8, *const u8) -> i
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// A process-unique token used to tag a plugin instance for state export/import.
-/// Pass it to [`PluginInstance::load`] right before creating the instance.
+/// Pass it to [`Vst3Instance::load`] right before creating the instance.
 pub fn next_instance_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The complete harmonic grid the plugin extracts from one subtrack — what
-/// [`PluginInstance::analyze_full`] returns and [`PluginInstance::resynthesize`]
+/// [`Vst3Instance::analyze_full`] returns and [`Vst3Instance::resynthesize`]
 /// consumes. `amplitude`/`phase` are row-major `[h * num_buckets + b]`.
 #[derive(Debug, Clone)]
 pub struct AnalysisGrid {
@@ -207,7 +209,7 @@ pub struct AnalysisGrid {
     pub pitch_ratio: Vec<f32>,
     /// Per-bucket length in **whole source samples** — the length of the inverse
     /// FFT that reproduces that bucket. These sum to the analysed subtrack, which
-    /// is what makes [`PluginInstance::resynthesize_exact`] exact.
+    /// is what makes [`Vst3Instance::resynthesize_exact`] exact.
     pub bucket_periods: Vec<f32>,
     /// Per-bucket DC (bin 0) and Nyquist (bin `N/2`) terms. Neither is a harmonic
     /// so neither has a row in the grid or a curve on the charts, but the inverse
@@ -217,7 +219,7 @@ pub struct AnalysisGrid {
     pub nyquist: Vec<f32>,
     /// Gain the plugin's display normalisation applied to this grid
     /// (`grid_amplitude = source_amplitude × display_gain`). Pass it to
-    /// [`PluginInstance::resynthesize`] to get audio back at the analysed
+    /// [`Vst3Instance::resynthesize`] to get audio back at the analysed
     /// source's own level; the grid itself is scaled for chart legibility, which
     /// on a quiet recording is a boost of ~19 dB.
     pub display_gain: f32,
@@ -270,33 +272,8 @@ impl AnalysisGrid {
     }
 }
 
-/// The audio bus layout a plugin settled on, so the engine can hand `process()`
-/// buffers that match what it negotiated. Getting this wrong is not cosmetic: a
-/// plugin with an audio input bus reads `ProcessData::inputs` unconditionally, so
-/// an effect handed `numInputs = 0` crashes the audio thread.
-#[derive(Clone, Debug, Default)]
-pub struct PluginIo {
-    /// Channel count of each activated audio input bus, in bus order.
-    pub inputs: Vec<usize>,
-    /// Channel count of each activated audio output bus, in bus order.
-    pub outputs: Vec<usize>,
-    /// The largest block the plugin was set up for, in frames — a promise it
-    /// sizes its own buffers to. Handing it a bigger one writes past them, and
-    /// the corruption surfaces later as a crash somewhere else entirely, so
-    /// whoever drives `process()` clamps to this. Zero before initialisation.
-    pub max_block: usize,
-}
-
-impl PluginIo {
-    /// Channels on the main (first) output bus — what actually reaches the
-    /// speakers. Zero when the plugin has no audio output at all.
-    pub fn main_output_channels(&self) -> usize {
-        self.outputs.first().copied().unwrap_or(0)
-    }
-}
-
 /// Represents a loaded and initialized VST3 plugin instance.
-pub struct PluginInstance {
+pub struct Vst3Instance {
     pub component: ComPtr<IComponent>,
     pub processor: ComPtr<IAudioProcessor>,
     pub controller: ComPtr<IEditController>,
@@ -327,7 +304,7 @@ pub struct PluginInstance {
     module: Arc<Vst3Module>,
 }
 
-impl PluginInstance {
+impl Vst3Instance {
     /// The parameter edits the plugin's editor is waiting to be handed back in
     /// `process()`. Whoever drives the plugin's audio has to drain this into
     /// [`ProcessData::inputParameterChanges`]; a driver that does not leaves
@@ -461,7 +438,7 @@ impl PluginInstance {
 
             log::info!("Loaded '{}' from {}", name, module.path().display());
 
-            Ok(PluginInstance {
+            Ok(Vst3Instance {
                 component,
                 processor,
                 controller,
@@ -1249,7 +1226,7 @@ impl PluginInstance {
     }
 }
 
-impl Drop for PluginInstance {
+impl Drop for Vst3Instance {
     /// Shut the plugin down in the order the spec lays out. Skipping this is not
     /// harmless: a JUCE plugin that is still active when its library is unloaded
     /// takes the process with it.
@@ -1445,7 +1422,7 @@ mod tests {
     }
 
     /// `(id, normalized value)` of the plugin's first parameter.
-    fn first_parameter(plugin: &PluginInstance) -> Option<(u32, f64)> {
+    fn first_parameter(plugin: &Vst3Instance) -> Option<(u32, f64)> {
         unsafe {
             let ctrl = plugin.controller.as_com_ref();
             let mut info: ParameterInfo = zeroed();
@@ -1476,7 +1453,7 @@ mod tests {
         };
 
         let path = internal_plugin();
-        let Ok(plugin) = PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) else {
+        let Ok(plugin) = Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) else {
             println!("no internal plugin at {} — nothing to test", path.display());
             return;
         };
@@ -1514,13 +1491,13 @@ mod tests {
         let in_channels: usize = io.inputs.iter().sum();
         let frames = 64usize;
         let mut scratch =
-            crate::audio::engine::AudioScratch::new(in_channels + out_channels.iter().sum::<usize>(), frames);
+            crate::plugin::processor::AudioScratch::new(in_channels + out_channels.iter().sum::<usize>(), frames);
         scratch.reset(frames);
-        let mut in_buses = crate::audio::engine::bus_buffers(
+        let mut in_buses = crate::vst::realtime::bus_buffers(
             &io.inputs,
             &mut scratch.ptrs_mut()[..in_channels],
         );
-        let mut out_buses = crate::audio::engine::bus_buffers(
+        let mut out_buses = crate::vst::realtime::bus_buffers(
             &out_channels,
             &mut scratch.ptrs_mut()[in_channels..],
         );
@@ -1560,7 +1537,7 @@ mod tests {
     #[test]
     fn a_plugins_own_state_carries_its_parameters_to_another_instance() {
         let path = internal_plugin();
-        let Ok(edited) = PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) else {
+        let Ok(edited) = Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) else {
             println!("no internal plugin at {} — nothing to test", path.display());
             return;
         };
@@ -1578,7 +1555,7 @@ mod tests {
         assert!(!state.is_empty(), "the plugin saved an empty state");
 
         // A second instance starts where the first one did, not where it ended.
-        let fresh = PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None)
+        let fresh = Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None)
             .expect("load a second instance");
         let (_, before) = first_parameter(&fresh).expect("parameters");
         assert!(

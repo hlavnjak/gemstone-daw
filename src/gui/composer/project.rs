@@ -117,14 +117,23 @@ pub enum TrackSource {
     LeSynth { file: String, state: Option<String> },
     /// A LeSynth Fourier track carrying no grid — the plugin's own synth mode.
     LeSynthDefault,
-    /// A custom VST3, by absolute path. Not portable, and cannot be: the plugin
-    /// is not ours to copy into the folder. What *is* saved beside the manifest
-    /// is `state` — the plugin's own `IComponent` state, named relative to the
-    /// project folder. `None` means the project was saved before the plugin had
-    /// any state to keep, or by a build that did not save it.
+    /// A custom plugin — of any format, despite the name, which is the one
+    /// the manifest has always used — by absolute path. Not portable, and
+    /// cannot be: the plugin is not ours to copy into the folder. What *is*
+    /// saved beside the manifest is `state` — the plugin's own saved state,
+    /// named relative to the project folder. `None` means the project was saved
+    /// before the plugin had any state to keep, or by a build that did not save
+    /// it.
+    ///
+    /// `plugin_id` names the plugin inside the file where one file holds
+    /// several (a CLAP plugin id, an LV2 URI) or there is no file at all (an
+    /// Audio Unit's codes). It rides on its own `plugin-id =` line, which an
+    /// older build skips — and then loads the first plugin in the file, which
+    /// for a file holding one is the same thing.
     Vst {
         path: PathBuf,
         class_id: Option<[i8; 16]>,
+        plugin_id: Option<String>,
         state: Option<String>,
     },
     /// An audio file played whole, as one note, by absolute path. Like a VST3's
@@ -145,7 +154,8 @@ impl TrackSource {
             Self::LeSynth { file, .. } => Some(dir.join(file)),
             // The plugin itself. A missing `.vststate` is not fatal — the track
             // loads with the plugin's defaults — so it is not required here.
-            Self::Vst { path, .. } => Some(path.clone()),
+            Self::Vst { path, plugin_id, .. } => crate::plugin::has_file(path, plugin_id.as_deref())
+                .then(|| path.clone()),
             // The whole sound of the row: without the file there is nothing to
             // play at all.
             Self::Wav { path } => Some(path.clone()),
@@ -235,6 +245,9 @@ impl Project {
             {
                 s += &format!("state = {}\n", one_line(file));
             }
+            if let TrackSource::Vst { plugin_id: Some(id), .. } = &row.source {
+                s += &format!("plugin-id = {}\n", one_line(id));
+            }
             s += &format!("gain = {}\n", num(row.gain));
             s += &format!("lead = {}\n", write_duration(row.lead));
             s += &format!("enabled = {}\n", u8::from(row.enabled));
@@ -316,6 +329,12 @@ impl Project {
                     | TrackSource::LeSynth { state, .. } = &mut row.source
                     {
                         *state = Some(value.to_string());
+                    }
+                }
+                // The same: the plugin inside the file the source names.
+                ("plugin-id", Some(row)) => {
+                    if let TrackSource::Vst { plugin_id, .. } = &mut row.source {
+                        *plugin_id = Some(value.to_string());
                     }
                 }
                 ("gain", Some(row)) => row.gain = value.parse().unwrap_or(1.0),
@@ -499,6 +518,7 @@ fn read_source(v: &str) -> Result<TrackSource> {
         return Ok(TrackSource::Vst {
             path: PathBuf::from(rest),
             class_id: Some(class_from_hex(hex)?),
+            plugin_id: None,
             state: None,
         });
     }
@@ -509,6 +529,7 @@ fn read_source(v: &str) -> Result<TrackSource> {
         return Ok(TrackSource::Vst {
             path: PathBuf::from(rest),
             class_id: None,
+            plugin_id: None,
             state: None,
         });
     }
@@ -579,6 +600,7 @@ mod tests {
                     source: TrackSource::Vst {
                         path: PathBuf::from("/opt/vst3/some plugin.so"),
                         class_id: Some([1, 2, 3, -4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, -16]),
+                        plugin_id: None,
                         state: Some("some plugin.vststate".to_string()),
                     },
                     gain: 1.0,
@@ -706,6 +728,7 @@ mod tests {
         p.rows[1].source = TrackSource::Vst {
             path: PathBuf::from("/opt/vst3/weird = name (v2) [x86].so"),
             class_id: None,
+            plugin_id: None,
             state: Some("weird = name.vststate".to_string()),
         };
         p.name = "Song = 2".to_string();
@@ -786,16 +809,37 @@ mod tests {
                 file: "a b.lsft".to_string(),
                 state: Some("a b.vststate".to_string()),
             },
-            TrackSource::Vst { path: PathBuf::from("/x/y.so"), class_id: None, state: None },
+            TrackSource::Vst {
+                path: PathBuf::from("/x/y.so"),
+                class_id: None,
+                plugin_id: None,
+                state: None,
+            },
             TrackSource::Vst {
                 path: PathBuf::from("/x/y.so"),
                 class_id: Some([-1i8; 16]),
+                plugin_id: None,
                 state: None,
             },
             TrackSource::Vst {
                 path: PathBuf::from("/x/y.so"),
                 class_id: None,
+                plugin_id: None,
                 state: Some("y.vststate".to_string()),
+            },
+            // A CLAP file holding several plugins, and an LV2 bundle: the
+            // plugin inside rides on its own line, `=` and spaces and all.
+            TrackSource::Vst {
+                path: PathBuf::from("/x/Surge XT.clap"),
+                class_id: None,
+                plugin_id: Some("org.surge-synth-team.surge-xt".to_string()),
+                state: Some("Surge XT.vststate".to_string()),
+            },
+            TrackSource::Vst {
+                path: PathBuf::from("/x/Kars.lv2"),
+                class_id: None,
+                plugin_id: Some("http://distrho.sf.net/plugins/Kars?a=b c".to_string()),
+                state: None,
             },
             TrackSource::Wav { path: PathBuf::from("/x/a whole take.wav") },
         ] {
@@ -949,9 +993,23 @@ mod folder_tests {
         let src = TrackSource::Vst {
             path: PathBuf::from("/nowhere/plugin.so"),
             class_id: None,
+            plugin_id: None,
             state: Some("plugin.vststate".to_string()),
         };
         assert_eq!(src.required_path(Path::new("/x")).unwrap(), PathBuf::from("/nowhere/plugin.so"));
         assert!(src.describe().contains("plugin.so"));
+    }
+
+    /// An Audio Unit has no file a project could find missing: the system's
+    /// component registry is what finds it, by the codes in its id.
+    #[test]
+    fn an_audio_unit_needs_no_file() {
+        let src = TrackSource::Vst {
+            path: PathBuf::from(crate::plugin::AU_PATH),
+            class_id: None,
+            plugin_id: Some("au:aumu:dls :appl".to_string()),
+            state: None,
+        };
+        assert_eq!(src.required_path(Path::new("/x")), None);
     }
 }

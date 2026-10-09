@@ -376,6 +376,7 @@ impl DawApp {
                     TrackSource::Vst {
                         path: src.plugin_path,
                         class_id: src.class_id,
+                        plugin_id: src.plugin_id,
                         state: state_file,
                     },
                 );
@@ -508,9 +509,11 @@ impl DawApp {
                 self.adopted_wavs.push(id);
                 Some(id)
             }
-            TrackSource::Vst { path, class_id, state } => {
+            TrackSource::Vst { path, class_id, plugin_id, state } => {
                 let bytes = read_state_file(dir, state.as_deref(), name);
-                self.tracks.adopt_vst(name, path.clone(), *class_id, bytes).ok()
+                self.tracks
+                    .adopt_vst(name, path.clone(), *class_id, plugin_id.clone(), bytes)
+                    .ok()
             }
         }
     }

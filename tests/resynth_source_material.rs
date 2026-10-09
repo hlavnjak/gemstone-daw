@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 
 use gemstone_daw::analysis;
 use gemstone_daw::audio::{decode_audio_file, DecodedAudio};
-use gemstone_daw::vst::{class_ids, PluginInstance};
+use gemstone_daw::vst::{class_ids, Vst3Instance};
 
 const NUM_HARMONICS: usize = 256;
 
@@ -61,10 +61,10 @@ fn internal_plugin_path() -> PathBuf {
         .join("liblesynth_fourier.so")
 }
 
-fn load_plugin() -> PluginInstance {
+fn load_plugin() -> Vst3Instance {
     let path = internal_plugin_path();
     assert!(path.exists(), "internal plugin not built: {path:?}");
-    PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None)
+    Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None)
         .expect("load internal LeSynth Fourier")
 }
 
@@ -186,7 +186,7 @@ fn median(v: &mut Vec<f32>) -> f32 {
     v[v.len() / 2]
 }
 
-fn analyse(label: &str, audio: &DecodedAudio, plugin: &PluginInstance) -> Report {
+fn analyse(label: &str, audio: &DecodedAudio, plugin: &Vst3Instance) -> Report {
     let sr = audio.sample_rate;
     let subs = analysis::segment(&audio.samples, sr);
     let usable: Vec<_> = subs.iter().filter(|s| s.is_reasonable(sr)).collect();

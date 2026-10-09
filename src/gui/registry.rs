@@ -36,7 +36,7 @@ use std::rc::Rc;
 use std::sync::Weak;
 
 use crate::track_format::TrackState;
-use crate::vst::PluginInstance;
+use crate::plugin::PluginInstance;
 
 /// One registered Track.
 pub struct TrackEntry {
@@ -48,6 +48,10 @@ pub struct TrackEntry {
     pub plugin_path: PathBuf,
     /// Class to select from the factory; `None` takes the first.
     pub class_id: Option<[i8; 16]>,
+    /// Which plugin inside the file, for formats where one file holds several:
+    /// a CLAP plugin id, an LV2 plugin URI, or an Audio Unit's codes. `None`
+    /// takes the first. See [`crate::plugin`].
+    pub plugin_id: Option<String>,
     /// LeSynth tracks can carry a grid and be tagged for state import/export.
     pub is_lesynth: bool,
     /// This track plays a drum kit, so its notes are named after what they hit
@@ -84,6 +88,7 @@ pub struct PlaybackSource {
     pub name: String,
     pub plugin_path: PathBuf,
     pub class_id: Option<[i8; 16]>,
+    pub plugin_id: Option<String>,
     pub is_lesynth: bool,
     pub state: Option<TrackState>,
     pub vst_state: Option<Vec<u8>>,
@@ -128,6 +133,7 @@ impl TrackRegistry {
             name: name.into(),
             plugin_path,
             class_id,
+            plugin_id: None,
             is_lesynth,
             percussion: false,
             wav: None,
@@ -154,6 +160,7 @@ impl TrackRegistry {
             // naming it here is what lets a message about the track say so.
             plugin_path: path.clone(),
             class_id: None,
+            plugin_id: None,
             is_lesynth: false,
             percussion: false,
             wav: Some(path),
@@ -212,9 +219,16 @@ impl TrackRegistry {
             .is_some_and(|e| e.percussion)
     }
 
+    /// Name the plugin inside the track's file — see [`TrackEntry::plugin_id`].
+    pub fn set_plugin_id(&self, id: u64, plugin_id: Option<String>) {
+        if let Some(e) = self.0.borrow_mut().entries.iter_mut().find(|e| e.id == id) {
+            e.plugin_id = plugin_id;
+        }
+    }
+
     /// Remember a plugin's own state for this track — what a freshly loaded
     /// instance is given, and what a project save writes out. Set when a custom
-    /// VST3 editor closes, and when a project is loaded.
+    /// plugin's editor closes, and when a project is loaded.
     pub fn set_vst_state(&self, id: u64, state: Option<Vec<u8>>) {
         if let Some(e) = self.0.borrow_mut().entries.iter_mut().find(|e| e.id == id) {
             e.vst_state = state;
@@ -292,6 +306,7 @@ impl TrackRegistry {
                 name: entry.name.clone(),
                 plugin_path: entry.plugin_path.clone(),
                 class_id: None,
+                plugin_id: None,
                 is_lesynth: false,
                 state: None,
                 vst_state: None,
@@ -310,11 +325,11 @@ impl TrackRegistry {
                     Err(e) => log::debug!("live grid unavailable for '{}': {e}", entry.name),
                 }
             }
-            // Every VST3 keeps its knobs in its own opaque state — LeSynth too,
+            // Every plugin keeps its knobs in its own opaque state — LeSynth too,
             // where that is the whole Synth editor: the curve type, offset and
             // granularity of each harmonic and the nested-Fourier sliders under
             // them, none of which is in the grid.
-            match plugin.component_state() {
+            match plugin.save_state() {
                 Ok(bytes) if !bytes.is_empty() => live_vst = Some(bytes),
                 Ok(_) => {}
                 Err(e) => log::debug!("live state unavailable for '{}': {e:#}", entry.name),
@@ -324,6 +339,7 @@ impl TrackRegistry {
             name: entry.name.clone(),
             plugin_path: entry.plugin_path.clone(),
             class_id: entry.class_id,
+            plugin_id: entry.plugin_id.clone(),
             is_lesynth: entry.is_lesynth,
             state: live_grid.or_else(|| entry.state.clone()),
             vst_state: live_vst.or_else(|| entry.vst_state.clone()),

@@ -14,7 +14,7 @@
 use anyhow::{bail, Result};
 
 use super::EditorHandle;
-use crate::vst::PluginInstance;
+use crate::plugin::PluginInstance;
 
 /// Editor embedding is not implemented for this platform.
 pub fn open_editor_in_thread(_plugin: &PluginInstance) -> Result<EditorHandle> {

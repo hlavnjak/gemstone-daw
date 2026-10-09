@@ -67,6 +67,7 @@ fn lesynth_source() -> PlaybackSource {
             .join("internal_plugins")
             .join("liblesynth_fourier.so"),
         class_id: Some(class_ids::FOURIER_SYNTH),
+        plugin_id: None,
         is_lesynth: true,
         state: Some(grid()),
         vst_state: None,

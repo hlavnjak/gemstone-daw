@@ -26,14 +26,14 @@
 
 use std::path::PathBuf;
 
-use gemstone_daw::vst::{class_ids, next_instance_token, PluginInstance};
+use gemstone_daw::vst::{class_ids, next_instance_token, Vst3Instance};
 use serde_json::Value;
 
-fn load_tagged() -> PluginInstance {
+fn load_tagged() -> Vst3Instance {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("internal_plugins")
         .join("liblesynth_fourier.so");
-    PluginInstance::load(
+    Vst3Instance::load(
         &path,
         Some(&class_ids::FOURIER_SYNTH),
         Some(next_instance_token()),

@@ -6,15 +6,15 @@ use std::path::{Path, PathBuf};
 
 use gemstone_daw::analysis;
 use gemstone_daw::audio::decode_audio_file;
-use gemstone_daw::vst::{class_ids, PluginInstance};
+use gemstone_daw::vst::{class_ids, Vst3Instance};
 
 const NUM_HARMONICS: usize = 256;
 
-fn load_plugin() -> PluginInstance {
+fn load_plugin() -> Vst3Instance {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("internal_plugins")
         .join("liblesynth_fourier.so");
-    PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None).expect("load plugin")
+    Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None).expect("load plugin")
 }
 
 fn db(x: f32) -> f32 {

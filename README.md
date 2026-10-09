@@ -5,7 +5,8 @@
 > — additive **resynthesis** of arbitrary audio.
 
 Gemstone DAW is a small DAW written in **Rust** with an `egui`/`eframe` GUI. It
-hosts **VST3** plugins and ships with an embedded **LeSynth Fourier** additive
+hosts **VST3, CLAP, VST2 and LV2** plugins (and **Audio Units** on macOS) and
+ships with an embedded **LeSynth Fourier** additive
 synthesizer, which powers its headline feature: turning any audio file into a
 playable, editable additive-synthesis instrument.
 
@@ -38,7 +39,7 @@ so the file stays where it is rather than being copied into the project folder.
 ## Track Composer
 
 Arrange the tracks in rows of frames and play them together. Each row plays
-exactly one Track — a LeSynth Fourier track, a custom VST3 track, a subtrack
+exactly one Track — a LeSynth Fourier track, a custom plugin track, a subtrack
 published from the Resynthesis panel with "Add as Track", or a whole audio file
 published there as a wav track — and any number of rows may share the same one.
 
@@ -182,17 +183,49 @@ published there as a wav track — and any number of rows may share the same one
   nested-Fourier amplitude/phase sliders and base frequency under them, none of
   which is in the grid. Saving only the grid reloaded a correct picture over
   sliders that all read zero.
-- **External VST3 plugins** — "Create Custom VST Track" lists the plugins
-  installed in the standard locations (`VST3_PATH`, `~/.vst3`, `/usr/lib/vst3`,
-  `/usr/local/lib/vst3`) and can browse for a `.vst3` bundle or a plugin library
-  anywhere else. A bundle is resolved to the library inside it
-  (`Foo.vst3/Contents/x86_64-linux/Foo.so`), the module's `ModuleEntry` is run,
-  its component and edit controller are initialised against a host context and
-  connected, and the plugin's own GUI is shown in a native window (raw X11 on
-  Linux, raw Win32 on Windows). The X11 window provides the `IPlugFrame` and
-  `Linux::IRunLoop` a JUCE or Steinberg-SDK editor needs in order to draw at all.
-  Anything that is not a loadable VST3 — a VST2 `.so`, a library with a missing
-  dependency — is reported when the plugin is picked, not when its editor opens.
+- **External plugins, in every common format** — "Create Custom Plugin Track"
+  lists what is installed, filterable by format, and can browse for a bundle or
+  a plugin file anywhere else. Every format plays notes, renders in the
+  Composer and an exported `.wav`, keeps its knobs in the track (and in a saved
+  project, as the plugin's own state beside the manifest), and shows its own
+  editor in a native window (raw X11 on Linux, raw Win32 on Windows):
+
+  | Format | Linux | Windows | macOS | Looked for in |
+  |---|---|---|---|---|
+  | **VST3** | ✓ | ✓ | ✓ (no editor yet) | `VST3_PATH`, `~/.vst3`, `/usr/lib/vst3`; `%CommonProgramFiles%\VST3`; `~/Library/Audio/Plug-Ins/VST3` |
+  | **CLAP** | ✓ | ✓ | ✓ (no editor yet) | `CLAP_PATH`, `~/.clap`, `/usr/lib/clap`; `%CommonProgramFiles%\CLAP`; `~/Library/Audio/Plug-Ins/CLAP` |
+  | **VST2** | ✓ | ✓ | ✓ (no editor yet) | `VST_PATH`, `~/.vst`, `/usr/lib/vst`, `/usr/lib/lxvst`; `%ProgramFiles%\VSTPlugins`, `…\Steinberg\VSTPlugins`; `~/Library/Audio/Plug-Ins/VST` |
+  | **LV2** | ✓ | ✓ | ✓ (no editor yet) | `LV2_PATH`, `~/.lv2`, `/usr/lib/lv2`; `%APPDATA%\LV2`; `~/Library/Audio/Plug-Ins/LV2` |
+  | **Audio Unit** (v2) | — | — | ✓ (no editor yet) | the system's component registry |
+
+  Each format is in `src/plugin/` (VST3 in `src/vst/`), behind one
+  `PluginInstance`, one `BlockProcessor` that drives any of them a block at a
+  time, and one `PluginEditor` the editor window embeds. What each needed that
+  is easy to get wrong:
+  - **VST3** — a bundle is resolved to the library inside it, `ModuleEntry` is
+    run, and the X11 window provides the `IPlugFrame` and `Linux::IRunLoop` a
+    JUCE or Steinberg-SDK editor needs in order to draw at all.
+  - **CLAP** — every instance has a main thread of its own: JUCE-built CLAPs
+    (Surge XT) deadlock if a GUI call comes from any thread but the one that
+    created them. That thread also fires the plugin's timers, watches its file
+    descriptors and, on Windows, pumps its windows' messages.
+  - **VST2** — no SDK: the `AEffect` ABI is declared clean-room. State is the
+    plugin's chunk where it has one, every parameter's value otherwise.
+  - **LV2** — no lilv: a small Turtle reader (`src/plugin/lv2/turtle.rs`) reads
+    the bundle, so the Windows and macOS builds carry no C libraries. URID map,
+    options, a worker and a log are provided; a plugin requiring anything else
+    is refused by name. Editors are the plugin's own UI library (X11UI /
+    WindowsUI), given instance access only when they ask for it.
+  - **Audio Unit** — found by its type/subtype/manufacturer codes, which a
+    track records as its plugin id (`au:aumu:dls :appl`); state is the unit's
+    `ClassInfo` property list.
+
+  Anything that is not loadable — a library with a missing dependency, a VST2
+  shell, an LV2 needing an unsupported feature — is reported when the plugin is
+  picked, not when its editor opens. `cargo run --bin plugin_probe -- <plugin>`
+  says what the host sees in any plugin (`--list` prints everything the picker
+  would offer); `tests/third_party_plugins.rs` loads and renders what is
+  installed, in every format.
 - **MIDI input** — pick a USB keyboard / port, connect, refresh.
 - **Logging** to `gemstone-daw.log`.
 
@@ -208,8 +241,12 @@ internal_plugins/   # the embedded LeSynth Fourier VST3 (committed precompiled)
 src/
   main.rs                                 # eframe entry point
   lib.rs
-  vst/{host,module,host_context,handler,event_list,mod}.rs  # VST3 hosting
-  bin/vst3_probe.rs                       # `cargo run --bin vst3_probe -- <plugin>`:
+  plugin/                                 # one plugin, any format:
+    mod.rs, processor.rs, editor.rs, scan.rs  #   instance, block driver, editor, scan
+    clap.rs, vst2.rs, au.rs               #   CLAP, VST2, Audio Unit (macOS) hosting
+    lv2/{mod,ui,turtle}.rs                #   LV2 hosting, its UIs, its Turtle reader
+  vst/{host,module,editor,realtime,…}.rs  # VST3 hosting
+  bin/plugin_probe.rs                     # `cargo run --bin plugin_probe -- <plugin>`:
                                           #   what the host sees in a plugin, and why
                                           #   one will not load
   audio/{engine,decode,mod}.rs            # cpal audio engine + audio file decoding

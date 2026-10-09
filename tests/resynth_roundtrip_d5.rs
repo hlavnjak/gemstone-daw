@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 use gemstone_daw::analysis;
 use gemstone_daw::audio::decode_audio_file;
-use gemstone_daw::vst::{class_ids, PluginInstance};
+use gemstone_daw::vst::{class_ids, Vst3Instance};
 
 /// The plugin's own harmonic count (`lesynth_fourier::constants::NUM_HARMONICS`).
 const NUM_HARMONICS: usize = 256;
@@ -66,14 +66,14 @@ fn internal_plugin_path() -> PathBuf {
         .join("liblesynth_fourier.so")
 }
 
-fn load_plugin() -> PluginInstance {
+fn load_plugin() -> Vst3Instance {
     let path = internal_plugin_path();
     assert!(
         path.exists(),
         "internal plugin not built: {:?} (run `make build`)",
         path
     );
-    PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None)
+    Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None)
         .expect("load internal LeSynth Fourier")
 }
 

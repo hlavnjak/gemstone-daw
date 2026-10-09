@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! Plugin editor window — hosts the VST3 plugin's own GUI in a native
+//! Plugin editor window — hosts a plugin's own GUI, of any format, in a native
 //! top-level window and embeds the plugin view via the platform handle.
 //!
 //! Every backend exposes `open_editor_in_thread(&PluginInstance) ->

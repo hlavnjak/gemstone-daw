@@ -11,13 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! Instrument tracks — a hosted VST3 plugin with an open/close editor, but no
+//! Instrument tracks — a hosted plugin with an open/close editor, but no
 //! audio-file analysis. Two flavours are offered:
 //!
 //!   * **LeSynth Fourier** — the embedded internal plugin, opened in its plain
 //!     (non-analysis, empty) synth mode. No `push_analysis`, so no bucket grid.
-//!   * **Custom VST** — any third-party VST3, picked in [`PluginBrowser`] from
-//!     the plugins installed on this machine or browsed for by hand.
+//!   * **Custom plugin** — any third-party VST3, CLAP, VST2 or LV2 (or, on
+//!     macOS, Audio Unit), picked in [`PluginBrowser`] from the plugins
+//!     installed on this machine or browsed for by hand.
 //!
 //! A track is lightweight metadata (name + plugin path); the heavy plugin
 //! instance, its audio stream and its editor window live in [`EditorInstance`]
@@ -38,7 +39,8 @@ use crate::audio::AudioEngine;
 use crate::midi::{MidiEventQueue, MidiFeed, MidiRouter};
 use crate::track_format::TrackState;
 use crate::midi::plays_a_drum_kit;
-use crate::vst::{class_ids, next_instance_token, scan_classes, validate_module, PluginInstance};
+use crate::plugin::{scan_installed, FoundPlugin, PluginFormat, PluginInstance};
+use crate::vst::{class_ids, next_instance_token};
 
 /// A live plugin editor: the loaded instance, its editor-window thread and an
 /// audio stream driving `process()` so the plugin's in-GUI piano is audible.
@@ -139,7 +141,7 @@ impl Drop for EditorInstance {
 }
 
 /// Track flavour. Only LeSynth tracks carry the harmonic grid that can be
-/// exported/imported; custom VST tracks are create-only.
+/// exported/imported; custom plugin tracks are create-only.
 #[derive(Clone, Copy, PartialEq)]
 enum TrackKind {
     LeSynth,
@@ -160,10 +162,13 @@ struct PluginTrack {
     plugin_path: PathBuf,
     /// Class ID to select from the factory; `None` takes the first class.
     class_id: Option<[i8; 16]>,
+    /// Which plugin inside the file, for a CLAP or an LV2 bundle holding
+    /// several (or an Audio Unit's codes); `None` takes the first.
+    plugin_id: Option<String>,
     /// A saved grid to push into the instance when its editor is opened (set for
     /// tracks created via "Load LeSynth Fourier Track").
     import_state: Option<TrackState>,
-    /// The same for a custom VST3: its own `IComponent` state, which is where it
+    /// The same for a custom plugin: its own saved state, which is where it
     /// keeps the knobs the user set. Captured when the editor closes and restored
     /// when it opens, so the sound survives the window and reaches the Composer.
     vst_state: Option<Vec<u8>>,
@@ -193,14 +198,15 @@ impl PluginTrack {
         let inst = Arc::new(PluginInstance::load(
             &self.plugin_path,
             self.class_id.as_ref(),
+            self.plugin_id.as_deref(),
             token,
         )?);
 
-        // A custom VST3's own state goes in before activation, as the spec has
-        // it — and before the window opens, so the editor draws the knobs the
-        // user left rather than the plugin's defaults.
+        // A custom plugin's own state goes in before activation, as the VST3
+        // spec has it — and before the window opens, so the editor draws the
+        // knobs the user left rather than the plugin's defaults.
         if let Some(bytes) = &self.vst_state {
-            if let Err(e) = inst.set_component_state(bytes) {
+            if let Err(e) = inst.restore_state(bytes) {
                 log::warn!("Track state restore failed: {e:#}");
             }
         }
@@ -243,7 +249,7 @@ impl PluginTrack {
     ///
     /// Without this the Composer would fall back to the state the track was
     /// registered with the moment an editor closed — the plugin's defaults, for
-    /// a custom VST3 whose knobs had just been set by hand.
+    /// a custom plugin whose knobs had just been set by hand.
     fn capture_editor_state(&mut self, registry: &TrackRegistry) {
         let Some(editor) = &self.editor else { return };
         if let TrackKind::LeSynth = self.kind {
@@ -260,7 +266,7 @@ impl PluginTrack {
         // sliders under them. The grid says what the curves *are*; this says
         // what drew them, and without it reopening the track shows a correct
         // picture over controls that all read zero.
-        match editor.plugin().component_state() {
+        match editor.plugin().save_state() {
             Ok(bytes) if !bytes.is_empty() => {
                 registry.set_vst_state(self.registry_id, Some(bytes.clone()));
                 self.vst_state = Some(bytes);
@@ -280,62 +286,30 @@ impl PluginTrack {
     }
 }
 
-/// The "add a custom VST3" picker.
+/// The "add a custom plugin" picker.
 ///
 /// A VST3 is a *bundle* — a `Foo.vst3` directory with the real library buried at
-/// `Contents/x86_64-linux/Foo.so` — and a file dialog cannot select a directory,
-/// so "pick the plugin file" alone is a dead end for every plugin a user actually
-/// has installed. This lists what is installed instead, and keeps both browse
-/// buttons for anything outside the standard locations.
+/// `Contents/x86_64-linux/Foo.so` — and so is an LV2; a file dialog cannot
+/// select a directory, so "pick the plugin file" alone is a dead end for most
+/// plugins a user actually has installed. This lists what is installed, in
+/// every format, and keeps both browse buttons for anything outside the
+/// standard locations.
 pub struct PluginBrowser {
-    /// `(display name, path to the bundle or library)`.
-    pub found: Vec<(String, PathBuf)>,
+    pub found: Vec<FoundPlugin>,
     /// Where the scan looked, shown when it found nothing.
     pub searched: Vec<PathBuf>,
+    /// Only plugins of this format are listed; `None` lists every format.
+    filter: Option<PluginFormat>,
     error: Option<String>,
 }
 
 impl PluginBrowser {
     pub fn scan() -> Self {
-        let mut found: Vec<(String, PathBuf)> = Vec::new();
-        let searched = vst3_search_paths();
-        for dir in &searched {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_bundle = path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("vst3"));
-                if !is_bundle {
-                    continue;
-                }
-                let name = path
-                    .file_stem()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| crate::file_label(&path));
-                found.push((name, path));
-            }
-        }
-        found.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-        found.dedup_by(|a, b| a.1 == b.1);
-        // The same plugin installed in two places (a user copy and a system one)
-        // would otherwise show as two identical rows; name each by its directory.
-        let names: Vec<String> = found.iter().map(|(n, _)| n.clone()).collect();
-        for (idx, entry) in found.iter_mut().enumerate() {
-            if names.iter().enumerate().any(|(i, n)| i != idx && *n == entry.0) {
-                // Named by the folder they sit in rather than by the whole path:
-                // "Dexed — vst3" and "Dexed — VST3" tell them apart, and the
-                // whole path would be most of the window.
-                if let Some(dir) = entry.1.parent() {
-                    entry.0 = format!("{}  —  {}", entry.0, crate::file_label(dir));
-                }
-            }
-        }
+        let (found, searched) = scan_installed();
         PluginBrowser {
             found,
             searched,
+            filter: None,
             error: None,
         }
     }
@@ -347,56 +321,18 @@ impl PluginBrowser {
 /// falls back to the name, which is what catches the many that declare
 /// themselves a plain instrument. The scan opens the module and closes it again;
 /// if that fails the track is still perfectly usable, so the name alone decides.
-fn is_a_drum_kit(path: &std::path::Path, name: &str) -> bool {
-    match scan_classes(path) {
-        Ok(classes) => {
-            let audio = classes
-                .iter()
-                .find(|c| c.category == "Audio Module Class")
-                .or_else(|| classes.first());
-            let by_class = audio
-                .is_some_and(|c| plays_a_drum_kit(&c.name, &c.subcategories));
-            by_class || plays_a_drum_kit(name, "")
+fn is_a_drum_kit(path: &std::path::Path, plugin_id: Option<&str>, name: &str) -> bool {
+    match crate::plugin::describe(path, plugin_id) {
+        Some((own_name, categories)) => {
+            plays_a_drum_kit(&own_name, &categories) || plays_a_drum_kit(name, "")
         }
-        Err(e) => {
-            log::debug!("cannot scan {} for its category ({e:#})", path.display());
-            plays_a_drum_kit(name, "")
-        }
+        None => plays_a_drum_kit(name, ""),
     }
 }
 
-/// The directories a VST3 is installed into, most specific first. `VST3_PATH`
-/// overrides nothing — it adds to the list, as it does for other hosts.
+/// The directories a VST3 is installed into, most specific first.
 pub fn vst3_search_paths() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(extra) = std::env::var_os("VST3_PATH") {
-        dirs.extend(std::env::split_paths(&extra));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(&home).join(".vst3"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        dirs.push(PathBuf::from("/usr/lib/vst3"));
-        dirs.push(PathBuf::from("/usr/local/lib/vst3"));
-        dirs.push(PathBuf::from("/usr/lib64/vst3"));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(pf) = std::env::var_os("CommonProgramFiles") {
-            dirs.push(PathBuf::from(pf).join("VST3"));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3"));
-        }
-        dirs.push(PathBuf::from("/Library/Audio/Plug-Ins/VST3"));
-    }
-    dirs.retain(|d| d.is_dir());
-    dirs.dedup();
-    dirs
+    crate::plugin::search_paths(PluginFormat::Vst3)
 }
 
 /// The Tracks panel: the "add" buttons and the list of instrument tracks.
@@ -419,7 +355,7 @@ impl TracksPanel {
         Self {
             tracks: Vec::new(),
             next_id: 0,
-            status: "Add a LeSynth Fourier or custom VST track.".to_string(),
+            status: "Add a LeSynth Fourier or custom plugin track.".to_string(),
             browser: None,
             midi_router,
             registry,
@@ -452,6 +388,7 @@ impl TracksPanel {
             kind: TrackKind::LeSynth,
             plugin_path: path,
             class_id: Some(class_ids::FOURIER_SYNTH),
+            plugin_id: None,
             import_state: None,
             vst_state: None,
             midi_source: None,
@@ -461,25 +398,31 @@ impl TracksPanel {
         self.status = "Created LeSynth Fourier track.".to_string();
     }
 
-    /// Add a custom VST3 track for `path` — a `.vst3` bundle or a bare library.
+    /// Add a custom plugin track for `path` — a bundle or a bare library, of
+    /// any format — and `plugin_id` inside it, named `name` if the picker knew
+    /// what the plugin is called.
     ///
     /// The plugin is checked here rather than when its editor is opened: a file
-    /// that is not a VST3, or one whose dependencies the loader cannot satisfy,
-    /// should say so while the user is still looking at the picker.
-    fn add_custom_vst_track(&mut self, path: PathBuf) -> Result<()> {
-        let resolved = validate_module(&path)?;
+    /// that is not a plugin, or one whose dependencies the loader cannot
+    /// satisfy, should say so while the user is still looking at the picker.
+    fn add_custom_plugin_track(
+        &mut self,
+        path: PathBuf,
+        plugin_id: Option<String>,
+        name: Option<String>,
+    ) -> Result<()> {
+        let format = crate::plugin::validate(&path, plugin_id.as_deref())?;
         // Name the track after the bundle, not the library inside it: "Dexed"
         // rather than "Dexed.so", and never "libsomething.so".
-        let name = path
-            .file_stem()
-            .or_else(|| resolved.file_stem())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| crate::file_label(&path));
-        // Take the first audio-module class in the factory — we don't know the
-        // plugin's own class id, and a bundle may hold several classes.
+        let name = name.unwrap_or_else(|| crate::plugin::display_stem(&path));
+        // With no class id the first audio-module class in a VST3 factory is
+        // taken — a bundle may hold several, and only the plugin knows its own.
         let registry_id = self.registry.add(&name, path.clone(), None, false, None);
-        self.registry
-            .set_percussion(registry_id, is_a_drum_kit(&path, &name));
+        self.registry.set_plugin_id(registry_id, plugin_id.clone());
+        self.registry.set_percussion(
+            registry_id,
+            is_a_drum_kit(&path, plugin_id.as_deref(), &name),
+        );
         let id = self.take_id();
         self.tracks.push(PluginTrack {
             id,
@@ -488,13 +431,14 @@ impl TracksPanel {
             kind: TrackKind::CustomVst,
             plugin_path: path,
             class_id: None,
+            plugin_id,
             import_state: None,
             vst_state: None,
             midi_source: None,
             feed: None,
             editor: None,
         });
-        self.status = format!("Created custom VST track '{name}'.");
+        self.status = format!("Created {} track '{name}'.", format.label());
         Ok(())
     }
 
@@ -505,21 +449,41 @@ impl TracksPanel {
             return;
         };
         let mut open = true;
-        let mut chosen: Option<PathBuf> = None;
+        // `(path, plugin id, name)` of the plugin picked.
+        let mut chosen: Option<(PathBuf, Option<String>, Option<String>)> = None;
         let mut close = false;
 
-        egui::Window::new("Add a custom VST3")
+        egui::Window::new("Add a custom plugin")
             .open(&mut open)
             .collapsible(false)
-            .default_width(420.0)
+            .default_width(460.0)
             .show(ctx, |ui| {
+                // Which formats to list. Only the ones this scan found anything
+                // in are offered, so the row says what is installed at a glance.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Show:");
+                    ui.selectable_value(&mut browser.filter, None, "All");
+                    for format in PluginFormat::ALL {
+                        let count = browser.found.iter().filter(|p| p.format == format).count();
+                        if count > 0 {
+                            ui.selectable_value(
+                                &mut browser.filter,
+                                Some(format),
+                                format!("{} ({count})", format.label()),
+                            );
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
                 if browser.found.is_empty() {
-                    ui.label("No VST3 plugins found in:");
+                    ui.label("No plugins found in:");
                     for dir in &browser.searched {
                         ui.label(
                             egui::RichText::new(format!("  {}", crate::file_label(dir)))
                                 .color(egui::Color32::from_gray(160)),
-                        );
+                        )
+                        .on_hover_text(dir.display().to_string());
                     }
                     if browser.searched.is_empty() {
                         ui.label(
@@ -531,15 +495,32 @@ impl TracksPanel {
                     ui.label("Use the browse buttons below.");
                 } else {
                     egui::ScrollArea::vertical()
-                        .max_height(280.0)
+                        .max_height(320.0)
                         .show(ui, |ui| {
-                            for (name, path) in &browser.found {
+                            let shown = browser
+                                .found
+                                .iter()
+                                .filter(|p| browser.filter.is_none_or(|f| f == p.format));
+                            for plugin in shown {
                                 ui.horizontal(|ui| {
                                     if ui.button("Add").clicked() {
-                                        chosen = Some(path.clone());
+                                        chosen = Some((
+                                            plugin.path.clone(),
+                                            plugin.plugin_id.clone(),
+                                            Some(plugin.name.clone()),
+                                        ));
                                     }
-                                    ui.label(egui::RichText::new(name).strong())
-                                        .on_hover_text(crate::file_label(path));
+                                    ui.label(
+                                        egui::RichText::new(format!("{:<4}", plugin.format.label()))
+                                            .monospace()
+                                            .color(egui::Color32::from_gray(150)),
+                                    );
+                                    let hover = match &plugin.plugin_id {
+                                        Some(id) => format!("{}\n{id}", crate::file_label(&plugin.path)),
+                                        None => crate::file_label(&plugin.path),
+                                    };
+                                    ui.label(egui::RichText::new(&plugin.name).strong())
+                                        .on_hover_text(hover);
                                 });
                             }
                         });
@@ -550,24 +531,27 @@ impl TracksPanel {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .button("📁 Browse bundle…")
-                        .on_hover_text("Pick a .vst3 bundle directory")
+                        .on_hover_text("Pick a .vst3 or .lv2 bundle directory")
                         .clicked()
                     {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                            chosen = Some(dir);
+                            chosen = Some((dir, None, None));
                         }
                     }
                     if ui
                         .button("📄 Browse library…")
-                        .on_hover_text("Pick a plugin library file directly")
+                        .on_hover_text(
+                            "Pick a plugin file directly: a .clap, a VST2 library, \
+                             or a VST3 library",
+                        )
                         .clicked()
                     {
                         if let Some(file) = rfd::FileDialog::new()
-                            .add_filter("VST3 plugin", &["so", "vst3", "dll", "dylib"])
+                            .add_filter("Plugin", &["clap", "vst3", "so", "dll", "dylib", "vst"])
                             .add_filter("All files", &["*"])
                             .pick_file()
                         {
-                            chosen = Some(file);
+                            chosen = Some((file, None, None));
                         }
                     }
                     if ui.button("↻ Rescan").clicked() {
@@ -588,8 +572,8 @@ impl TracksPanel {
                 }
             });
 
-        if let Some(path) = chosen {
-            match self.add_custom_vst_track(path) {
+        if let Some((path, plugin_id, name)) = chosen {
+            match self.add_custom_plugin_track(path, plugin_id, name) {
                 Ok(()) => close = true,
                 // Stay open with the reason on screen — the user is most likely
                 // to want to pick something else straight away.
@@ -638,6 +622,7 @@ impl TracksPanel {
             kind: TrackKind::LeSynth,
             plugin_path: path,
             class_id: Some(class_ids::FOURIER_SYNTH),
+            plugin_id: None,
             import_state: state,
             vst_state,
             midi_source: None,
@@ -647,24 +632,28 @@ impl TracksPanel {
         Ok(registry_id)
     }
 
-    /// Adopt a custom VST3 track by path — the other half of loading a project.
-    /// `vst_state` is the plugin's own saved state from the project, restored
-    /// into every instance the track loads.
+    /// Adopt a custom plugin track by path — the other half of loading a
+    /// project. `vst_state` is the plugin's own saved state from the project,
+    /// restored into every instance the track loads.
     pub fn adopt_vst(
         &mut self,
         name: &str,
         path: PathBuf,
         class_id: Option<[i8; 16]>,
+        plugin_id: Option<String>,
         vst_state: Option<Vec<u8>>,
     ) -> Result<u64> {
-        if !path.exists() {
+        if crate::plugin::has_file(&path, plugin_id.as_deref()) && !path.exists() {
             anyhow::bail!("plugin {} not found", crate::file_label(&path));
         }
         let id = self.take_id();
         let registry_id = self.registry.add(name, path.clone(), class_id, false, None);
+        self.registry.set_plugin_id(registry_id, plugin_id.clone());
         self.registry.set_vst_state(registry_id, vst_state.clone());
-        self.registry
-            .set_percussion(registry_id, is_a_drum_kit(&path, name));
+        self.registry.set_percussion(
+            registry_id,
+            is_a_drum_kit(&path, plugin_id.as_deref(), name),
+        );
         self.tracks.push(PluginTrack {
             id,
             registry_id,
@@ -672,6 +661,7 @@ impl TracksPanel {
             kind: TrackKind::CustomVst,
             plugin_path: path,
             class_id,
+            plugin_id,
             import_state: None,
             vst_state,
             midi_source: None,
@@ -738,6 +728,7 @@ impl TracksPanel {
             kind: TrackKind::LeSynth,
             plugin_path,
             class_id: Some(class_ids::FOURIER_SYNTH),
+            plugin_id: None,
             import_state: Some(state),
             vst_state: None,
             midi_source: None,
@@ -790,8 +781,12 @@ impl TracksPanel {
                 self.add_lesynth_track();
             }
             if ui
-                .button("➕ Create Custom VST Track")
-                .on_hover_text("Pick an installed VST3, or browse for one")
+                .button("➕ Create Custom Plugin Track")
+                .on_hover_text(if cfg!(target_os = "macos") {
+                    "Pick an installed VST3, CLAP, VST2, LV2 or Audio Unit, or browse for one"
+                } else {
+                    "Pick an installed VST3, CLAP, VST2 or LV2, or browse for one"
+                })
                 .clicked()
             {
                 self.browser = Some(PluginBrowser::scan());

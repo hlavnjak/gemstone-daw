@@ -43,7 +43,8 @@ use crate::analysis::{self, build_contour, Subtrack};
 use crate::audio::capture::{self, Recorder, DEFAULT_INPUT};
 use crate::audio::{decode_audio_file, write_wav_i16, AudioEngine, DecodedAudio};
 use crate::midi::new_midi_queue;
-use crate::vst::{class_ids, PluginInstance};
+use crate::plugin::PluginInstance;
+use crate::vst::{class_ids, Vst3Instance};
 
 /// Number of harmonics we extract / preview per subtrack.
 const PREVIEW_HARMONICS: usize = 16;
@@ -200,7 +201,7 @@ pub struct ResynthPanel {
     status: String,
     /// Shared library handle used for the stateless analysis FFI calls, reused
     /// across every open file.
-    ffi_plugin: Option<Arc<PluginInstance>>,
+    ffi_plugin: Option<Arc<Vst3Instance>>,
     /// The app-wide track list. A subtrack analysed here can be published to it
     /// ("Add as Track"), which is what makes resynthesised material available to
     /// the Composer.
@@ -238,13 +239,13 @@ impl ResynthPanel {
 
     /// Load (once) a plugin instance whose shared object backs the analysis
     /// FFI. Returns a clone of the loaded instance.
-    fn ensure_ffi_plugin(&mut self) -> Option<Arc<PluginInstance>> {
+    fn ensure_ffi_plugin(&mut self) -> Option<Arc<Vst3Instance>> {
         if let Some(p) = &self.ffi_plugin {
             return Some(p.clone());
         }
         let path = Self::internal_plugin_path()?;
         // Stateless analysis FFI only — no editor, so no token needed.
-        match PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) {
+        match Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None) {
             Ok(inst) => {
                 let arc = Arc::new(inst);
                 self.ffi_plugin = Some(arc.clone());
@@ -403,12 +404,12 @@ impl ResynthPanel {
             return;
         };
         // Tag the instance so its edited grid can be exported to a .lsft later.
-        let inst = match PluginInstance::load(
+        let inst = match Vst3Instance::load(
             &path,
             Some(&class_ids::FOURIER_SYNTH),
             Some(crate::vst::next_instance_token()),
         ) {
-            Ok(i) => Arc::new(i),
+            Ok(i) => Arc::new(PluginInstance::from_vst3(i)),
             Err(e) => {
                 self.status = format!("Plugin load failed: {e:#}");
                 return;

@@ -6015,6 +6015,7 @@ mod tests {
                         name: prow.track_name.clone(),
                         plugin_path: internal.clone(),
                         class_id: Some(crate::vst::class_ids::FOURIER_SYNTH),
+                        plugin_id: None,
                         is_lesynth: true,
                         state: Some(
                             crate::track_format::TrackState::read(&dir.join(file)).unwrap(),
@@ -6023,11 +6024,12 @@ mod tests {
                         wav: None,
                     }
                 }
-                project::TrackSource::Vst { path, class_id, state } => {
+                project::TrackSource::Vst { path, class_id, plugin_id, state } => {
                     crate::gui::registry::PlaybackSource {
                         name: prow.track_name.clone(),
                         plugin_path: path.clone(),
                         class_id: *class_id,
+                        plugin_id: plugin_id.clone(),
                         is_lesynth: false,
                         state: None,
                         vst_state: read_state(state),

@@ -5,12 +5,14 @@ Project guidance for working in this repository.
 ## Project
 
 Gemstone DAW — a Rust DAW built with `egui`/`eframe`. It ports every feature of
-`lesynth-daw` (except the piano keyboard) and hosts VST3 plugins, with an
-embedded LeSynth Fourier VST3 ("Load Internal") as the key requirement.
+`lesynth-daw` (except the piano keyboard) and hosts VST3, CLAP, VST2 and LV2
+plugins (plus Audio Units on macOS), with an embedded LeSynth Fourier VST3
+("Load Internal") as the key requirement.
 
 - Language: **Rust**
 - GUI: `egui` / `eframe` (ported from `iced`)
-- Audio: `cpal` · MIDI: `midir` · VST3 hosting via the `vst3` crate
+- Audio: `cpal` · MIDI: `midir` · plugin hosting in `src/plugin/` (VST3 via the
+  `vst3` crate in `src/vst/`, CLAP via `clap-sys`, VST2/LV2/AU with no crate)
 - Targets: Linux (X11/Wayland) and Windows (`x86_64-pc-windows-gnu` cross build)
 
 See `README.md` for the full project layout and feature list.

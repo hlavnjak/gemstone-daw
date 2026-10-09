@@ -19,6 +19,6 @@ pub mod wav;
 
 pub use capture::{input_device_names, recordings_dir, Recorder, Recording};
 pub use decode::{decode_audio_file, probe_duration_secs, DecodedAudio};
-pub use engine::{AudioEngine, AudioConfig, midi_to_vst3_event};
+pub use engine::{AudioEngine, AudioConfig};
 pub use limiter::Limiter;
 pub use wav::{write_wav_f32, write_wav_i16};

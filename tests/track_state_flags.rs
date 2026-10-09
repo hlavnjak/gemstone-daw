@@ -20,17 +20,17 @@
 use std::path::PathBuf;
 
 use gemstone_daw::track_format::TrackState;
-use gemstone_daw::vst::{class_ids, next_instance_token, PluginInstance};
+use gemstone_daw::vst::{class_ids, next_instance_token, Vst3Instance};
 
 /// The plugin's grid is this many harmonics tall whatever is imported into it,
 /// so the flags it reports are this long too.
 const NUM_HARMONICS: usize = 256;
 
-fn load_tagged() -> PluginInstance {
+fn load_tagged() -> Vst3Instance {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("internal_plugins")
         .join("liblesynth_fourier.so");
-    PluginInstance::load(
+    Vst3Instance::load(
         &path,
         Some(&class_ids::FOURIER_SYNTH),
         Some(next_instance_token()),

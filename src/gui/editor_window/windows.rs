@@ -11,14 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//! The plugin editor window on Windows: a plain top-level window whose handle
+//! is given to a [`PluginEditor`]. Windows plugins pump their GUI on the
+//! thread's own message loop, so the loop below dispatches messages and pumps
+//! the editor for the idle work some formats want (a VST2's `effEditIdle`, an
+//! LV2 UI's idle interface).
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use vst3::Steinberg::{kInvalidArgument, kResultOk, IPlugFrame, IPlugFrameTrait, IPlugView,
-    IPlugViewTrait, ViewRect};
-use vst3::{Class, ComWrapper};
+use anyhow::Result;
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, RECT};
@@ -31,29 +34,7 @@ use winapi::um::winuser::{
 };
 
 use super::EditorHandle;
-use crate::vst::PluginInstance;
-
-/// The host frame the plugin's view talks to. Windows plugins pump their GUI on
-/// the thread's own message loop, so unlike X11 there is no run loop to provide —
-/// but a plugin that wants a different size still has to be able to ask.
-#[derive(Default)]
-struct EditorFrame {
-    pending_resize: Mutex<Option<ViewRect>>,
-}
-
-impl Class for EditorFrame {
-    type Interfaces = (IPlugFrame,);
-}
-
-impl IPlugFrameTrait for EditorFrame {
-    unsafe fn resizeView(&self, _view: *mut IPlugView, new_size: *mut ViewRect) -> i32 {
-        let Some(rect) = new_size.as_ref() else {
-            return kInvalidArgument;
-        };
-        *self.pending_resize.lock().unwrap() = Some(*rect);
-        kResultOk
-    }
-}
+use crate::plugin::{ParentWindow, PluginInstance};
 
 /// Convert a Rust string to a NUL-terminated UTF-16 buffer for the Win32 W APIs.
 fn to_wide(s: &str) -> Vec<u16> {
@@ -75,22 +56,34 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+/// The window size that gives a client area of `width × height`: the plugin
+/// means its own area, so the frame has to be added on top.
+unsafe fn frame_size(width: u32, height: u32) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width.clamp(1, 8192) as i32,
+        bottom: height.clamp(1, 8192) as i32,
+    };
+    AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, 0);
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+/// The window's client area, as the editor's size.
+unsafe fn client_size(hwnd: HWND) -> (u32, u32) {
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    (
+        (client.right - client.left).max(1) as u32,
+        (client.bottom - client.top).max(1) as u32,
+    )
+}
+
 /// Open the plugin editor in a new thread using a raw Win32 window.
 pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
-    let view = plugin.create_view().context(
-        "this plugin has no editor view (it reported no 'editor' GUI for the host to show)",
-    )?;
-
-    unsafe {
-        let platform = b"HWND\0";
-        anyhow::ensure!(
-            view.as_com_ref()
-                .isPlatformTypeSupported(platform.as_ptr() as *const i8)
-                == kResultOk,
-            "this plugin's editor does not support an HWND parent"
-        );
-    }
-
+    // Made here, so a plugin with no GUI this platform can host says so to the
+    // caller rather than to a log nobody reads.
+    let mut editor = plugin.create_editor()?;
     let title = format!("{} — Editor", plugin.name());
 
     let close_flag = Arc::new(AtomicBool::new(false));
@@ -108,6 +101,11 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
             }
         }
         let _signal = SignalClosed(closed_clone);
+
+        if let Err(e) = editor.open() {
+            log::error!("Plugin editor failed to open: {e:#}");
+            return;
+        }
 
         let class_name = to_wide("GemstoneDawEditorWindow");
         let window_title = to_wide(&title);
@@ -127,25 +125,11 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
         };
         RegisterClassW(&wc);
 
-        // The editor's own size, as a window size (the plugin means its client
-        // area, so the frame has to be added on top).
-        let view_ref = view.as_com_ref();
-        let mut size = ViewRect {
-            left: 0,
-            top: 0,
-            right: 1000,
-            bottom: 800,
-        };
-        view_ref.getSize(&mut size);
-        let mut frame_rect = RECT {
-            left: 0,
-            top: 0,
-            right: (size.right - size.left).clamp(64, 8192),
-            bottom: (size.bottom - size.top).clamp(64, 8192),
-        };
-        AdjustWindowRect(&mut frame_rect, WS_OVERLAPPEDWINDOW, 0);
-        let width = frame_rect.right - frame_rect.left;
-        let height = frame_rect.bottom - frame_rect.top;
+        let (width, height) = editor
+            .size()
+            .map(|(w, h)| (w.clamp(64, 8192), h.clamp(64, 8192)))
+            .unwrap_or((800, 600));
+        let (frame_w, frame_h) = frame_size(width, height);
 
         let hwnd = CreateWindowExW(
             0,
@@ -154,8 +138,8 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            width,
-            height,
+            frame_w,
+            frame_h,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -163,41 +147,24 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
         );
 
         if hwnd.is_null() {
-            eprintln!("Failed to create Win32 window");
+            log::error!("Failed to create Win32 window");
             UnregisterClassW(class_name.as_ptr(), hinstance);
             return;
         }
 
         ShowWindow(hwnd, SW_SHOW);
 
-        // Attach plugin view to the HWND. The frame has to outlive the
-        // attachment, so it is dropped only at the end of this thread.
-        let frame = ComWrapper::new(EditorFrame::default());
-        let frame_ptr = frame
-            .as_com_ref::<IPlugFrame>()
-            .map(|r| r.as_ptr())
-            .unwrap_or(std::ptr::null_mut());
-        view_ref.setFrame(frame_ptr);
-        let platform = b"HWND\0";
-        let attached = view_ref.attached(hwnd as *mut c_void, platform.as_ptr() as *const i8);
-        if attached != kResultOk {
-            view_ref.setFrame(std::ptr::null_mut());
+        if let Err(e) = editor.attach(ParentWindow::Win32 { hwnd: hwnd as *mut c_void }) {
+            log::error!("Plugin editor refused to attach: {e:#}");
             DestroyWindow(hwnd);
             UnregisterClassW(class_name.as_ptr(), hinstance);
             return;
         }
 
         // Size the plugin view to the window client area
-        let mut client = std::mem::zeroed();
-        GetClientRect(hwnd, &mut client);
-        let mut rect = ViewRect {
-            left: 0,
-            top: 0,
-            right: client.right,
-            bottom: client.bottom,
-        };
-        view_ref.onSize(&mut rect as *mut _);
-        eprintln!("Plugin editor attached to Win32 window");
+        let mut size = client_size(hwnd);
+        editor.set_size(size.0, size.1);
+        log::info!("Plugin editor attached to Win32 window");
 
         // Event loop
         let mut msg: MSG = std::mem::zeroed();
@@ -218,46 +185,37 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
             if got_quit {
                 break;
             }
+            editor.pump(&[]);
 
             // A size the plugin asked for while we were dispatching messages.
-            let pending = frame.pending_resize.lock().unwrap().take();
-            if let Some(rect) = pending {
-                let mut frame_rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: (rect.right - rect.left).clamp(1, 8192),
-                    bottom: (rect.bottom - rect.top).clamp(1, 8192),
-                };
-                AdjustWindowRect(&mut frame_rect, WS_OVERLAPPEDWINDOW, 0);
+            if let Some((w, h)) = editor.take_resize_request() {
+                let (frame_w, frame_h) = frame_size(w, h);
                 SetWindowPos(
                     hwnd,
                     std::ptr::null_mut(),
                     0,
                     0,
-                    frame_rect.right - frame_rect.left,
-                    frame_rect.bottom - frame_rect.top,
+                    frame_w,
+                    frame_h,
                     SWP_NOMOVE | SWP_NOZORDER,
                 );
-                let mut client = std::mem::zeroed();
-                GetClientRect(hwnd, &mut client);
-                let mut rect = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: client.right,
-                    bottom: client.bottom,
-                };
-                view_ref.onSize(&mut rect as *mut _);
+            }
+            // The window changed size, by the plugin's asking or the user's hand.
+            let now = client_size(hwnd);
+            if now != size {
+                size = now;
+                editor.set_size(size.0, size.1);
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(16));
+            std::thread::sleep(std::time::Duration::from_millis(editor.timeout_ms().clamp(1, 16) as u64));
         }
 
-        // Cleanup
-        view_ref.removed();
-        view_ref.setFrame(std::ptr::null_mut());
+        // Cleanup: detach before the window goes, on the thread that drove it.
+        editor.detach();
+        drop(editor);
         DestroyWindow(hwnd);
         UnregisterClassW(class_name.as_ptr(), hinstance);
-        eprintln!("Plugin editor window closed");
+        log::info!("Plugin editor window closed");
     });
 
     Ok(EditorHandle {

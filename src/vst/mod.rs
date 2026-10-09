@@ -18,7 +18,10 @@ pub mod host_context;
 pub mod module;
 pub mod param_changes;
 
-pub use host::{class_ids, next_instance_token, AnalysisGrid, PluginInstance, PluginIo};
+pub mod editor;
+pub mod realtime;
+
+pub use host::{class_ids, next_instance_token, AnalysisGrid, Vst3Instance};
 pub use module::{resolve_module_path, scan_classes, validate_module, ModuleClass, Vst3Module};
 pub use event_list::EventList;
 pub use param_changes::{ParamChanges, ParamEdits};

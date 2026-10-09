@@ -13,7 +13,7 @@
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
-use gemstone_daw::vst::{class_ids, PluginInstance};
+use gemstone_daw::vst::{class_ids, Vst3Instance};
 
 const NUM_HARMONICS: usize = 256;
 const F0: f64 = 590.0;
@@ -25,11 +25,11 @@ const SECS: f64 = 0.5;
 /// rather than ignored.
 const EDGE: usize = 256;
 
-fn load_plugin() -> PluginInstance {
+fn load_plugin() -> Vst3Instance {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("internal_plugins")
         .join("liblesynth_fourier.so");
-    PluginInstance::load(&path, Some(&class_ids::FOURIER_SYNTH), None).expect("load plugin")
+    Vst3Instance::load(&path, Some(&class_ids::FOURIER_SYNTH), None).expect("load plugin")
 }
 
 fn db(x: f32) -> f32 {

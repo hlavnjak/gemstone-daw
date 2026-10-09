@@ -44,6 +44,7 @@ fn wav_source(path: &PathBuf) -> PlaybackSource {
         // A wav track has no library; its path is the file it plays.
         plugin_path: path.clone(),
         class_id: None,
+        plugin_id: None,
         is_lesynth: false,
         state: None,
         vst_state: None,

@@ -40,7 +40,7 @@ use anyhow::{bail, Context, Result};
 
 use gemstone_daw::analysis;
 use gemstone_daw::audio::{decode_audio_file, write_wav_f32};
-use gemstone_daw::vst::{class_ids, AnalysisGrid, PluginInstance};
+use gemstone_daw::vst::{class_ids, AnalysisGrid, Vst3Instance};
 
 const USAGE: &str = "\
 dump_render — offline LeSynth Fourier renders for buzz debugging
@@ -175,7 +175,7 @@ fn main() -> Result<()> {
     );
 
     // 2) Analyse through a real plugin instance.
-    let plugin = PluginInstance::load(&plugin_path, Some(&class_ids::FOURIER_SYNTH), None)
+    let plugin = Vst3Instance::load(&plugin_path, Some(&class_ids::FOURIER_SYNTH), None)
         .with_context(|| format!("load {}", plugin_path.display()))?;
 
     let end = sub.end.min(audio.samples.len());

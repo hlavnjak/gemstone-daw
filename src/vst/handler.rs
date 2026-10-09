@@ -25,7 +25,7 @@ use vst3::Class;
 /// from springs back on the editor's next frame.
 pub struct ParamChangeHandler {
     /// Where the edits are left for the audio thread to pick up. Shared with
-    /// the [`PluginInstance`](crate::vst::PluginInstance) the handler was made
+    /// the [`Vst3Instance`](crate::vst::Vst3Instance) the handler was made
     /// for, and from there with whoever drives `process()`.
     pub edits: ParamEdits,
 }
