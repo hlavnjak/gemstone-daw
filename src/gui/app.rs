@@ -414,11 +414,29 @@ impl DawApp {
     /// panel, then hand the composition to the Composer with one resolved
     /// registry id per row (`None` where the source could not be found).
     fn load_project(&mut self, file: &std::path::Path) -> anyhow::Result<()> {
-        let project = Project::read(file)?;
+        let mut project = Project::read(file)?;
         let dir = file
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Wavs and plugins are saved by absolute path; a project made on
+        // another machine finds them by name in the folder itself, the
+        // recordings folder and the standard plugin folders.
+        use crate::plugin::{search_paths, PluginFormat};
+        let wav_dirs: Vec<_> = std::iter::once(dir.clone())
+            .chain(crate::audio::recordings_dir().ok())
+            .collect();
+        let plugin_dirs: Vec<_> = std::iter::once(dir.clone())
+            .chain(
+                [PluginFormat::Vst3, PluginFormat::Clap, PluginFormat::Vst2, PluginFormat::Lv2]
+                    .into_iter()
+                    .flat_map(search_paths),
+            )
+            .collect();
+        for (track, saved, found) in project.relocate_missing(&wav_dirs, &plugin_dirs) {
+            log::info!("'{track}': {} not found, using {}", saved.display(), found.display());
+        }
 
         // The loaded project replaces what is open, so the tracks it brings are
         // the only ones left — otherwise the previous project's tracks would sit

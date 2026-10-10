@@ -359,6 +359,76 @@ impl Project {
             .with_context(|| format!("read {}", crate::file_label(path)))?;
         Self::parse(&text).with_context(|| format!("in {}", crate::file_label(path)))
     }
+
+    /// Re-point every wav and plugin source whose saved path no longer exists
+    /// to an entry of the same name under `wav_dirs` / `plugin_dirs`, searched
+    /// in order and up to [`RELOCATE_DEPTH`] levels deep. Returns what moved,
+    /// as (track name, saved path, found path).
+    ///
+    /// Those two sources are saved by absolute path (see [`TrackSource::Wav`]),
+    /// so a project folder copied to another machine — another home directory,
+    /// another OS — names files that are not there, though the same recording
+    /// sits in that machine's recordings folder and the same plugin bundle in
+    /// its plugin folder. Matching by name finds them; a source found nowhere
+    /// keeps its saved path, so the row still says what it was looking for. The
+    /// next save writes the found path.
+    pub fn relocate_missing(
+        &mut self,
+        wav_dirs: &[PathBuf],
+        plugin_dirs: &[PathBuf],
+    ) -> Vec<(String, PathBuf, PathBuf)> {
+        let mut moved = Vec::new();
+        for row in &mut self.rows {
+            let (path, dirs) = match &mut row.source {
+                TrackSource::Wav { path } => (path, wav_dirs),
+                TrackSource::Vst { path, plugin_id, .. }
+                    if crate::plugin::has_file(path, plugin_id.as_deref()) =>
+                {
+                    (path, plugin_dirs)
+                }
+                _ => continue,
+            };
+            if path.exists() {
+                continue;
+            }
+            let Some(name) = path.file_name() else { continue };
+            if let Some(found) = find_by_name(dirs, name, RELOCATE_DEPTH) {
+                moved.push((row.track_name.clone(), path.clone(), found.clone()));
+                *path = found;
+            }
+        }
+        moved
+    }
+}
+
+/// How deep below each directory [`Project::relocate_missing`] looks: enough
+/// for a vendor folder in a plugin directory (`VST3/Vendor/Foo.vst3`) or a
+/// sub-folder of recordings, as the plugin scan does.
+pub const RELOCATE_DEPTH: usize = 3;
+
+/// The first entry named `name` in `dirs`, each searched breadth-first to
+/// `depth` levels, so a match near the top wins over one buried deeper.
+fn find_by_name(dirs: &[PathBuf], name: &std::ffi::OsStr, depth: usize) -> Option<PathBuf> {
+    for dir in dirs {
+        let mut level = vec![dir.clone()];
+        for _ in 0..=depth {
+            let mut next = Vec::new();
+            for d in &level {
+                let Ok(entries) = std::fs::read_dir(d) else { continue };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if entry.file_name() == name {
+                        return Some(path);
+                    }
+                    if path.is_dir() {
+                        next.push(path);
+                    }
+                }
+            }
+            level = next;
+        }
+    }
+    None
 }
 
 /// Turn a typed project name into something safe to use as a folder and file
@@ -998,6 +1068,67 @@ mod folder_tests {
         };
         assert_eq!(src.required_path(Path::new("/x")).unwrap(), PathBuf::from("/nowhere/plugin.so"));
         assert!(src.describe().contains("plugin.so"));
+    }
+
+    fn row_with(source: TrackSource) -> ProjectRow {
+        ProjectRow {
+            name: String::new(),
+            track_name: "T".to_string(),
+            source,
+            gain: 1.0,
+            lead: Duration::new(0, Fraction::None),
+            enabled: true,
+            autosave: true,
+            autoscroll: true,
+            items: vec![],
+        }
+    }
+
+    /// A project copied from another machine names a recording and a plugin
+    /// bundle by that machine's absolute paths. Both are found by name — the
+    /// plugin in a vendor folder — and a source that exists, or that is found
+    /// nowhere, keeps the path it was saved with.
+    #[test]
+    fn a_moved_project_finds_its_wavs_and_plugins_by_name() {
+        let dir = tmp("relocate");
+        let recordings = dir.join("GemstoneRecordings");
+        let plugins = dir.join("VST3");
+        fs::create_dir_all(&recordings).unwrap();
+        fs::create_dir_all(plugins.join("Vendor/Drums.vst3/Contents")).unwrap();
+        fs::write(recordings.join("take.wav"), b"").unwrap();
+        let present = dir.join("present.wav");
+        fs::write(&present, b"").unwrap();
+
+        let vst = |path: &str| TrackSource::Vst {
+            path: PathBuf::from(path),
+            class_id: None,
+            plugin_id: None,
+            state: None,
+        };
+        let mut p = Project {
+            name: "Song".to_string(),
+            tempo_bpm: 100.0,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
+            rows: vec![
+                row_with(TrackSource::Wav { path: PathBuf::from("/home/other/GemstoneRecordings/take.wav") }),
+                row_with(vst("/home/other/.vst3/Drums.vst3")),
+                row_with(TrackSource::Wav { path: present.clone() }),
+                row_with(TrackSource::Wav { path: PathBuf::from("/home/other/lost.wav") }),
+                // A wav is not looked for among plugins, nor a plugin among wavs.
+                row_with(vst("/home/other/take.wav")),
+            ],
+        };
+        let moved = p.relocate_missing(&[recordings.clone()], &[plugins.clone()]);
+
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        assert_eq!(p.rows[0].source, TrackSource::Wav { path: recordings.join("take.wav") });
+        assert_eq!(p.rows[1].source, vst(&plugins.join("Vendor/Drums.vst3").display().to_string()));
+        assert_eq!(p.rows[2].source, TrackSource::Wav { path: present });
+        assert_eq!(p.rows[3].source, TrackSource::Wav { path: PathBuf::from("/home/other/lost.wav") });
+        assert_eq!(p.rows[4].source, vst("/home/other/take.wav"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// An Audio Unit has no file a project could find missing: the system's

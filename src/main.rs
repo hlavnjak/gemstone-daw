@@ -19,7 +19,7 @@ fn init_logging() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(log::LevelFilter::Info);
 
-    let _ = fern::Dispatch::new()
+    let dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
                 "[{}][{}][{}] {}",
@@ -30,9 +30,44 @@ fn init_logging() {
             ))
         })
         .level(level)
-        .chain(std::io::stdout())
-        .chain(fern::log_file("gemstone-daw.log").expect("failed to open log file"))
-        .apply();
+        .chain(std::io::stdout());
+    let dispatch = match open_log_file() {
+        Some(file) => dispatch.chain(file),
+        None => dispatch,
+    };
+    let _ = dispatch.apply();
+}
+
+const LOG_FILE: &str = "gemstone-daw.log";
+
+/// The log file: `gemstone-daw.log` in the working directory (a checkout run
+/// with `make run`), else in the platform's log folder.
+///
+/// An app started from Finder runs with `/` as its working directory, which is
+/// read-only, and a downloaded app runs from a read-only translocated copy, so
+/// neither the working directory nor the bundle can take the log there.
+/// Opening it used to `expect`, which killed the app before its window opened.
+/// Without any writable place the app still runs, logging to stdout only.
+fn open_log_file() -> Option<std::fs::File> {
+    if let Ok(file) = fern::log_file(LOG_FILE) {
+        return Some(file);
+    }
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    fern::log_file(dir.join(LOG_FILE)).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn log_dir() -> std::path::PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home).join("Library/Logs/Gemstone DAW"),
+        None => std::env::temp_dir(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn log_dir() -> std::path::PathBuf {
+    std::env::temp_dir()
 }
 
 /// The main window's size when it first opens.
