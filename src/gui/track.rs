@@ -130,7 +130,7 @@ impl Drop for EditorInstance {
         //    before the `_plugin` Arc unloads the library the view points into.
         //    If the user already closed the window, the thread has finished and
         //    this joins instantly.
-        self.close_flag.store(true, Ordering::Relaxed);
+        super::editor_window::request_close(&self.close_flag);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

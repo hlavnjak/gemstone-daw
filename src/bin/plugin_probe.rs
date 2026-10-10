@@ -169,7 +169,7 @@ fn main() {
         "--window" => match open_editor_in_thread(&plugin) {
             Ok(handle) => {
                 hold("window", &|| handle.closed.load(Ordering::Relaxed));
-                handle.close_flag.store(true, Ordering::Relaxed);
+                gemstone_daw::gui::editor_window::request_close(&handle.close_flag);
                 let _ = handle.handle.join();
             }
             Err(e) => println!("window:   FAILED — {e:#}"),

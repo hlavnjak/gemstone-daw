@@ -284,6 +284,7 @@ impl PluginEditor for Lv2Editor {
         let parent_ptr = match parent {
             ParentWindow::X11 { window, .. } => window as usize as *mut c_void,
             ParentWindow::Win32 { hwnd } => hwnd,
+            ParentWindow::Cocoa { view } => view,
         };
         self.options = vec![
             OptionsOption {

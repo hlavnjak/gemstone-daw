@@ -23,8 +23,9 @@
 //! responds to a click, because none of its events are ever pumped.
 //!
 //! The same object is also the `IPlugFrame` a plugin calls `resizeView` on, so a
-//! plugin that wants a different size gets one. Windows plugins pump their GUI
-//! on the thread's own message loop, so there the frame is only that.
+//! plugin that wants a different size gets one. Windows and macOS plugins pump
+//! their GUI on the thread's own message or run loop, so there the frame is only
+//! that.
 
 use std::ffi::{c_void, CStr};
 use std::sync::Mutex;
@@ -53,7 +54,9 @@ const MAX_POLL_MS: i32 = 16;
 /// The platform type a view is asked to embed into here.
 #[cfg(target_os = "windows")]
 const PLATFORM: &[u8] = b"HWND\0";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+const PLATFORM: &[u8] = b"NSView\0";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 const PLATFORM: &[u8] = b"X11EmbedWindowID\0";
 
 /// The host object the plugin's view talks to: its frame *and*, on Linux, its
@@ -242,6 +245,7 @@ impl PluginEditor for Vst3Editor {
         let handle = match parent {
             ParentWindow::X11 { window, .. } => window as *mut c_void,
             ParentWindow::Win32 { hwnd } => hwnd,
+            ParentWindow::Cocoa { view } => view,
         };
         let view = self.view.as_com_ref();
         let frame_ptr = self

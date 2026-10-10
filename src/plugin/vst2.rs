@@ -731,6 +731,7 @@ impl PluginEditor for Vst2Editor {
         let (ptr, value) = match parent {
             ParentWindow::X11 { window, display } => (window as *mut c_void, display as isize),
             ParentWindow::Win32 { hwnd } => (hwnd, 0),
+            ParentWindow::Cocoa { view } => (view, 0),
         };
         self.dispatch(EFF_EDIT_OPEN, 0, value, ptr, 0.0);
         self.open = true;

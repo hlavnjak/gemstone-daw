@@ -1429,6 +1429,11 @@ impl PluginEditor for ClapEditor {
         let handle = match parent {
             ParentWindow::X11 { window, .. } => Handle::X11(window),
             ParentWindow::Win32 { hwnd } => Handle::Win32(Ptr(hwnd as *const c_void)),
+            // A Cocoa GUI must run on the process's main thread, and a CLAP
+            // plugin's "main thread" here is one of its own.
+            ParentWindow::Cocoa { .. } => {
+                anyhow::bail!("CLAP plugin editors are not supported on macOS yet")
+            }
         };
         self.on_main(|e| unsafe {
             let specific = match handle {

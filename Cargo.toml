@@ -53,6 +53,13 @@ x11-dl = "2.21"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The plugin editor window on macOS (an NSWindow). The versions winit already
+# pulls in, so nothing new is built.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSGeometry", "NSString", "NSThread"] }
+objc2-app-kit = { version = "0.2", features = ["NSGraphics", "NSResponder", "NSView", "NSWindow"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "libloaderapi", "windef", "minwindef"] }
 

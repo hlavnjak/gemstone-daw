@@ -34,6 +34,8 @@ pub enum ParentWindow {
     X11 { window: u64, display: *mut c_void },
     /// A Win32 `HWND`.
     Win32 { hwnd: *mut c_void },
+    /// A macOS `NSView*`: the content view of the editor's window.
+    Cocoa { view: *mut c_void },
 }
 
 /// One plugin editor, from creation to detachment.

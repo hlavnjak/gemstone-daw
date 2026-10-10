@@ -44,7 +44,21 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::open_editor_in_thread;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{open_editor_in_thread, request_close};
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod fallback;
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub use fallback::open_editor_in_thread;
+
+/// Ask the editor behind `close_flag` to close. Its own thread notices the flag
+/// and detaches the view as it unwinds, so joining [`EditorHandle::handle`]
+/// after this waits for exactly that. (macOS has no editor thread and does the
+/// detaching inside this call instead.)
+#[cfg(not(target_os = "macos"))]
+pub fn request_close(close_flag: &Arc<AtomicBool>) {
+    close_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+}
