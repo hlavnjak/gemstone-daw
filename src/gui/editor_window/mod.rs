@@ -47,7 +47,9 @@ pub use windows::open_editor_in_thread;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{open_editor_in_thread, request_close};
+pub use macos::{
+    open_editor_in_thread, remember_main_gl_context, request_close, restore_main_gl_context,
+};
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 mod fallback;

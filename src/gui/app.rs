@@ -86,6 +86,9 @@ impl Default for DawApp {
 
 impl DawApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // eframe has the main window's GL context current while it builds the app.
+        #[cfg(target_os = "macos")]
+        super::editor_window::remember_main_gl_context();
         Self::configure_style(&cc.egui_ctx);
         let mut app = Self::default();
         app.refresh_midi_ports();
@@ -539,6 +542,10 @@ impl DawApp {
 
 impl eframe::App for DawApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A plugin editor's OpenGL can leave another context current, which
+        // eframe would paint into without noticing (see the function).
+        #[cfg(target_os = "macos")]
+        super::editor_window::restore_main_gl_context();
         // Reactive repaint: nothing in this window changes without user input, so
         // let eframe/winit idle and wake on real events (egui still self-requests
         // repaints for its own hover/tooltip/scroll animations). The Tracks and

@@ -22,6 +22,17 @@
 //! timer does what the other backends' loops do: pumps the editor for formats
 //! that want idle calls, applies resizes, and notices a window the user closed.
 //!
+//! The plugin's view does not fill the window directly: it sits in a scroll view,
+//! in a container the size the editor asked for, and the editor is never told a
+//! smaller size just because macOS shrank the window to fit the screen —
+//! LeSynth's 1000×1000 editor is taller than a 13" MacBook's. LeSynth says it can
+//! resize, and told the smaller size it does resize its view, but baseview never
+//! reports its own resize to egui on macOS: egui went on laying out and drawing
+//! 1000 points tall into the shorter view, its top was cut off, and every click
+//! landed that much above what was under the pointer. Now the rest of the editor
+//! scrolls into view, and a resizable editor follows the window only when the
+//! window itself is resized.
+//!
 //! [`EditorHandle::handle`] is a thread that has already finished, so joining it
 //! never waits. That leaves no thread to detach the view on the way out, which is
 //! what [`request_close`] is for: called on the main thread, it detaches the view
@@ -30,12 +41,15 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use objc2::rc::Retained;
-use objc2_app_kit::{NSBackingStoreType, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSScrollView, NSView, NSWindow,
+    NSWindowStyleMask,
+};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use super::EditorHandle;
@@ -47,9 +61,16 @@ const TICK_SECS: f64 = 0.016;
 /// One open editor window.
 struct OpenEditor {
     window: Retained<NSWindow>,
+    /// The window's content view.
+    scroll: Retained<NSScrollView>,
+    /// The scroll view's document: the plugin's view's parent, at the editor's size.
+    container: Retained<NSView>,
     editor: Box<dyn PluginEditor>,
-    /// The content size the editor was last told about.
+    resizable: bool,
+    /// The size the editor was last told about.
     size: (u32, u32),
+    /// The window's content area when the editor last followed it.
+    area: (u32, u32),
     close_flag: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
 }
@@ -57,8 +78,15 @@ struct OpenEditor {
 impl OpenEditor {
     /// Detach the view, then close the window, then tell the host.
     fn close(mut self) {
+        // Torn down with no OpenGL context current. egui-baseview (LeSynth's)
+        // deletes its GL objects when its renderer is dropped, without making
+        // its own context current first; with the main window's current — as
+        // it is during a frame — those deletes would hit the main window's
+        // shaders and textures, whose ids are the same small numbers.
+        unsafe { CGLSetCurrentContext(std::ptr::null_mut()) };
         self.editor.detach();
         drop(self.editor);
+        restore_main_gl_context();
         self.window.close();
         self.closed.store(true, Ordering::Relaxed);
         log::info!("Plugin editor window closed");
@@ -85,11 +113,13 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
         .size()
         .map(|(w, h)| (w.clamp(64, 8192), h.clamp(64, 8192)))
         .unwrap_or((800, 600));
-    let mut style =
-        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
-    if editor.can_resize() {
-        style |= NSWindowStyleMask::Resizable;
-    }
+    let resizable = editor.can_resize();
+    // Resizable whatever the editor says: a fixed-size editor too big for the
+    // screen still needs a window it can be scrolled around in.
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
     let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -103,26 +133,52 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
     // The list below owns the window; AppKit must not free it on close as well.
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str(&format!("{} — Editor", plugin.name())));
+    if !resizable {
+        // Larger would only show empty space around the editor.
+        unsafe { window.setContentMaxSize(rect.size) };
+    }
+
+    let scroll = unsafe { NSScrollView::initWithFrame(mtm.alloc(), rect) };
+    let container = unsafe { NSView::initWithFrame(mtm.alloc(), rect) };
+    unsafe {
+        scroll.setHasVerticalScroller(true);
+        scroll.setHasHorizontalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDrawsBackground(false);
+        scroll.setAutoresizingMask(
+            NSAutoresizingMaskOptions::NSViewWidthSizable
+                | NSAutoresizingMaskOptions::NSViewHeightSizable,
+        );
+        scroll.setDocumentView(Some(&container));
+    }
+    window.setContentView(Some(&scroll));
     window.center();
     window.makeKeyAndOrderFront(None);
+    scroll_to_top(&scroll, &container);
 
-    let view = window.contentView().context("the editor window has no content view")?;
-    let view_ptr = Retained::as_ptr(&view) as *mut c_void;
+    let view_ptr = Retained::as_ptr(&container) as *mut c_void;
     if let Err(e) = editor.attach(ParentWindow::Cocoa { view: view_ptr }) {
         window.close();
         return Err(e.context("the plugin editor refused to attach"));
     }
-    let size = content_size(&window);
-    editor.set_size(size.0, size.1);
-    log::info!("Plugin editor attached to NSWindow");
+    // The editor opens at its own size even where macOS made the window
+    // smaller to fit the screen; the window scrolls instead.
+    let size = (width, height);
+    editor.set_size(width, height);
+    let area = window_area(&scroll);
+    log::info!("Plugin editor attached to NSWindow: editor {width}×{height}, window {area:?}");
 
     let close_flag = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicBool::new(false));
     EDITORS.with(|e| {
         e.borrow_mut().push(OpenEditor {
             window,
+            scroll,
+            container,
             editor,
+            resizable,
             size,
+            area,
             close_flag: close_flag.clone(),
             closed: closed.clone(),
         })
@@ -156,16 +212,26 @@ pub fn request_close(close_flag: &Arc<AtomicBool>) {
     stop_timer_if_idle();
 }
 
-/// The window's content area, in points — the unit a macOS plugin view sizes in.
-fn content_size(window: &NSWindow) -> (u32, u32) {
-    let frame = window
-        .contentView()
-        .map(|v| v.frame())
-        .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)));
+/// The window's content area, in points — the unit a macOS plugin view sizes
+/// in. The scroll view's own frame, so scroll bars coming and going leave it be;
+/// it changes only with the window.
+fn window_area(scroll: &NSScrollView) -> (u32, u32) {
+    let size = scroll.frame().size;
     (
-        frame.size.width.round().max(1.0) as u32,
-        frame.size.height.round().max(1.0) as u32,
+        size.width.round().max(1.0) as u32,
+        size.height.round().max(1.0) as u32,
     )
+}
+
+/// Show the top of the editor. The container is not flipped, so its top is at
+/// the far end of its y axis.
+fn scroll_to_top(scroll: &NSScrollView, container: &NSView) {
+    unsafe {
+        let clip = scroll.contentView();
+        let hidden = container.frame().size.height - clip.bounds().size.height;
+        clip.scrollToPoint(NSPoint::new(0.0, hidden.max(0.0)));
+        scroll.reflectScrolledClipView(&clip);
+    }
 }
 
 /// One turn of what the other backends' event loops do, for every editor.
@@ -184,11 +250,29 @@ fn tick() {
         }
         open.editor.pump(&[]);
         if let Some((w, h)) = open.editor.take_resize_request() {
-            open.window.setContentSize(NSSize::new(w as f64, h as f64));
+            let size = NSSize::new(w as f64, h as f64);
+            unsafe { open.container.setFrameSize(size) };
+            if !open.resizable {
+                unsafe { open.window.setContentMaxSize(size) };
+            }
+            open.window.setContentSize(size);
+            open.size = (w, h);
+            // Whatever part of that the screen has room for; not a window
+            // change to follow.
+            open.area = window_area(&open.scroll);
+            open.editor.set_size(w, h);
         }
-        let now = content_size(&open.window);
-        if now != open.size {
+        // A resizable editor follows the window when the window changes, not
+        // the window macOS opened smaller than the editor to fit the screen: that
+        // part scrolls. A fixed-size one keeps its size whatever the window does.
+        let now = window_area(&open.scroll);
+        if open.resizable && now != open.area {
+            open.area = now;
             open.size = now;
+            unsafe {
+                open.container
+                    .setFrameSize(NSSize::new(now.0 as f64, now.1 as f64))
+            };
             open.editor.set_size(now.0, now.1);
         }
         keep.push(open);
@@ -232,6 +316,44 @@ extern "C" {
     fn CFRunLoopAddTimer(run_loop: *mut c_void, timer: CFRunLoopTimerRef, mode: *const c_void);
     fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
     fn CFRelease(cf: *mut c_void);
+}
+
+// ── the main window's OpenGL context ────────────────────────────────────────
+
+#[link(name = "OpenGL", kind = "framework")]
+extern "C" {
+    fn CGLGetCurrentContext() -> *mut c_void;
+    fn CGLSetCurrentContext(context: *mut c_void) -> i32;
+}
+
+/// The main window's OpenGL context, once [`remember_main_gl_context`] saw it.
+static MAIN_GL_CONTEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Note the current OpenGL context as the main window's. Called while eframe
+/// sets the app up, when that context is current.
+pub fn remember_main_gl_context() {
+    let context = unsafe { CGLGetCurrentContext() };
+    if !context.is_null() {
+        MAIN_GL_CONTEXT.store(context, Ordering::Relaxed);
+    }
+}
+
+/// Make the main window's OpenGL context current again if something else made
+/// another one current, or none. Called at the start of every frame.
+///
+/// A plugin editor that draws with OpenGL makes its own context current on
+/// this thread for each frame it draws, and egui-baseview (LeSynth's) leaves
+/// none current afterwards. eframe never notices: before painting it asks
+/// glutin whether its context is still current, and glutin's macOS answer only
+/// checks that the context still draws into the main window's view, never that
+/// it is the thread's current one. So eframe painted with no context, every GL
+/// call went nowhere, and the window flashed blank on every other frame for as
+/// long as the app ran after a plugin editor had been opened.
+pub fn restore_main_gl_context() {
+    let main = MAIN_GL_CONTEXT.load(Ordering::Relaxed);
+    if !main.is_null() && unsafe { CGLGetCurrentContext() } != main {
+        unsafe { CGLSetCurrentContext(main) };
+    }
 }
 
 extern "C" fn on_timer(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
