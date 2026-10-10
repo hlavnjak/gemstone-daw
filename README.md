@@ -237,6 +237,7 @@ Makefile            # builds the app; (re)builds + embeds the VST3 when its sour
 .cargo/config.toml  # Windows cross linker
 packaging/macos/    # Info.plist template for the macOS app bundle
 tools/zig-macos-cc.sh  # macOS cross linker (zig, honouring the minimum macOS)
+tools/macos-sign*.sh   # sign + notarise the app on a Mac over ssh (make sign-macos)
 internal_plugins/   # the embedded LeSynth Fourier VST3 (committed precompiled)
 src/
   main.rs                                 # eframe entry point
@@ -330,9 +331,11 @@ make fourier-macos  # build only the universal VST3 plugin .dylib
 
 Output: `target/universal-apple-darwin/release/Gemstone DAW.app` (and the bare
 universal binary beside it). The arm64 slice is ad-hoc signed by the linker,
-which is what Apple silicon requires to run it at all; the app is not notarised,
+which is what Apple silicon requires to run it at all; that app is not notarised,
 so a downloaded copy needs `xattr -cr "Gemstone DAW.app"` (or right-click → Open)
-the first time. Embedding a plugin's own editor window is not implemented on
+the first time. `make sign-macos` signs it with a Developer ID, notarises and
+staples it on a Mac reached over ssh, and brings back a zip that opens with a
+double-click. Embedding a plugin's own editor window is not implemented on
 macOS yet — the editor button reports that instead of opening one.
 
 ## License

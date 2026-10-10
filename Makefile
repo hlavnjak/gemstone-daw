@@ -52,7 +52,7 @@ FOURIER_SRCS := $(shell find $(FOURIER_DIR)/src -name '*.rs' 2>/dev/null) \
 HAVE_FOURIER_SRC := $(wildcard $(FOURIER_DIR)/Cargo.toml)
 
 .PHONY: run build build-windows build-macos fourier fourier-windows fourier-macos \
-	copy-internal copy-internal-windows copy-internal-macos macos-toolchain clean clean-all dump scan
+	copy-internal copy-internal-windows copy-internal-macos macos-toolchain sign-macos clean clean-all dump scan
 
 # ── Buzz debugging ──────────────────────────────────────────────────────────
 # Source to render offline, and where the dumps land.
@@ -168,6 +168,14 @@ build-macos: copy-internal-macos | macos-toolchain
 	printf 'APPL????' > "$(MAC_APP)/Contents/PkgInfo"
 	@$(LIPO) -info $(MAC_OUT)/gemstone-daw
 	@echo "App bundle: $(MAC_APP)"
+
+# Sign with the Developer ID certificate, notarise and staple — on a real Mac
+# over ssh, since codesign and notarytool exist only on macOS. Which Mac, which
+# identity and which notary key come from $(MAC_SIGN_ENV), which is gitignored;
+# see tools/macos-sign.sh.
+MAC_SIGN_ENV ?= packaging/macos/sign.env
+sign-macos: build-macos
+	MAC_SIGN_ENV=$(MAC_SIGN_ENV) VERSION=$(VERSION) tools/macos-sign.sh "$(MAC_APP)" $(MAC_OUT)
 
 # ── Buzz debugging ──────────────────────────────────────────────────────────
 

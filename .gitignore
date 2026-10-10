@@ -17,6 +17,16 @@
 /notes
 /misc_notes
 /track1.lsft
+/MAC_TEST_SETUP.md
 
 # Python bytecode from the tools/ scripts.
 __pycache__/
+
+# macOS signing: the filled-in settings and any key material — never commit.
+/packaging/macos/sign.env
+/packaging/macos/sign.env.example
+/packaging/macos/SIGNING.md
+/packaging/macos/gemstone.entitlements
+*.p8
+*.p12
+*.cer
