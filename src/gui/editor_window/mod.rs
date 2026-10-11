@@ -18,11 +18,30 @@
 //! Result<EditorHandle>`. The handle carries two flags: `close_flag` asks the
 //! editor to close, and `closed` is set by the thread once the window has gone —
 //! whether the host asked or the user clicked its own close button. The host
-//! polls `closed` each frame to reap the instance and free its resources.
+//! checks `closed` each frame to reap the instance and free its resources, and
+//! [`signal_closed`] wakes it to do so — the GUI only draws when something happens.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
+
+/// The host window's context, woken when an editor window closes.
+static HOST_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+/// Remember the host window's context, so a closing editor can wake it.
+pub fn set_host_context(ctx: &egui::Context) {
+    let _ = HOST_CTX.set(ctx.clone());
+}
+
+/// Mark an editor window closed and wake the host to reap it. Without the wake
+/// a window the user closed directly would linger as "open" until the next
+/// input, so the host would have to poll for it.
+pub(crate) fn signal_closed(closed: &AtomicBool) {
+    closed.store(true, Ordering::Relaxed);
+    if let Some(ctx) = HOST_CTX.get() {
+        ctx.request_repaint();
+    }
+}
 
 /// A running editor window and the flags used to coordinate its lifecycle.
 pub struct EditorHandle {

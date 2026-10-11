@@ -90,6 +90,7 @@ impl DawApp {
         #[cfg(target_os = "macos")]
         super::editor_window::remember_main_gl_context();
         Self::configure_style(&cc.egui_ctx);
+        super::editor_window::set_host_context(&cc.egui_ctx);
         let mut app = Self::default();
         app.refresh_midi_ports();
         app

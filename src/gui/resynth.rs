@@ -1000,14 +1000,6 @@ impl ResynthPanel {
             }
         }
 
-        // While any editor window is open, poll a few times a second so a window
-        // the user closes directly is reaped promptly (the editor thread only
-        // sets a flag; nothing else wakes this reactive panel). When none are
-        // open, this stops and the panel returns to fully idle.
-        if self.files.iter().any(|f| f.open_editor_count() > 0) {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(250));
-        }
         // A take's clock is the one thing here that moves without the user
         // touching anything, so while one runs the panel asks to be redrawn.
         if self.recorder.is_some() {

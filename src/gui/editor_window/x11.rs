@@ -51,7 +51,7 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
         struct SignalClosed(Arc<AtomicBool>);
         impl Drop for SignalClosed {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
+                super::signal_closed(&self.0);
             }
         }
         let _signal = SignalClosed(closed_clone);

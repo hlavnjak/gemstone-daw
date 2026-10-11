@@ -88,7 +88,7 @@ impl OpenEditor {
         drop(self.editor);
         restore_main_gl_context();
         self.window.close();
-        self.closed.store(true, Ordering::Relaxed);
+        super::signal_closed(&self.closed);
         log::info!("Plugin editor window closed");
     }
 }

@@ -997,13 +997,6 @@ impl TracksPanel {
             }
             None => {}
         }
-
-        // While any editor is open, poll a few times a second so a window the
-        // user closes directly is reaped promptly; otherwise stay idle.
-        if self.tracks.iter().any(|t| t.editor.is_some()) {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(250));
-        }
     }
 }
 

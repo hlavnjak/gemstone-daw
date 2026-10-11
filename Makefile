@@ -41,9 +41,10 @@ mac_cargo_arm = $(call mac_cargo,$(MAC_ARM),aarch64-macos.$(MAC_ARM_MIN)-none,$(
 # Source files of the plugin. Listing them as prerequisites of the build
 # artifacts is essential: without them make sees the existing .so/.dll and
 # considers the rule satisfied, so it never rebuilds after the plugin sources
-# change — silently shipping a stale plugin into internal_plugins/.
+# change — silently shipping a stale plugin into internal_plugins/. Cargo.lock
+# too: a bumped git dependency (the baseview forks) changes no source file here.
 FOURIER_SRCS := $(shell find $(FOURIER_DIR)/src -name '*.rs' 2>/dev/null) \
-	$(FOURIER_DIR)/Cargo.toml
+	$(FOURIER_DIR)/Cargo.toml $(FOURIER_DIR)/Cargo.lock
 
 # Is the lesynth-fourier source tree available next to this repo? If so
 # (developer setup), `make` rebuilds the embedded VST3 plugin from source and
