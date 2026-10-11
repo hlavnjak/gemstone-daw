@@ -340,8 +340,9 @@ which is what Apple silicon requires to run it at all; that app is not notarised
 so a downloaded copy needs `xattr -cr "ReSynth Studio.app"` (or right-click → Open)
 the first time. `make sign-macos` signs it with a Developer ID, notarises and
 staples it on a Mac reached over ssh, and brings back a zip that opens with a
-double-click. Embedding a plugin's own editor window is not implemented on
-macOS yet — the editor button reports that instead of opening one.
+double-click. Plugin editors — LeSynth Fourier's and those of VST3, VST2 and LV2
+plugins — open in a window of their own; CLAP and Audio Unit editors are not
+supported on macOS yet, and the editor button says so instead of opening one.
 
 ## Release (`make release`)
 

@@ -30,3 +30,5 @@ __pycache__/
 *.p8
 *.p12
 *.cer
+/ultra_hype.md
+/releases
