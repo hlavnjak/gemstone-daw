@@ -178,6 +178,91 @@ MAC_SIGN_ENV ?= packaging/macos/sign.env
 sign-macos: build-macos
 	MAC_SIGN_ENV=$(MAC_SIGN_ENV) VERSION=$(VERSION) tools/macos-sign.sh "$(MAC_APP)" $(MAC_OUT)
 
+# ── Release ─────────────────────────────────────────────────────────────────
+# `make release` writes releases/$(VERSION)/ReSynth-Studio-$(VERSION)-*.zip for
+# Linux, Windows and macOS, plus SHA256SUMS. Each zip is one folder: the app,
+# internal_plugins/ (or the .app), LICENSE, README.txt and
+# THIRD-PARTY-LICENSES.txt. It needs the lesynth-fourier source beside this repo,
+# and the Mac that sign-macos uses.
+#
+# The Linux binaries are not the `make build` ones: those link against this
+# machine's glibc and refuse to start on any older one (a rolling distro's is
+# newer than every LTS). zig links them against glibc $(PORTABLE_GLIBC) instead —
+# Ubuntu 20.04 / Debian 11 and later — in a target dir of their own, so they
+# never mix with the native build. The app links GTK, and the host's GTK names
+# newer glibc symbols than that; --allow-shlib-undefined lets it link, and on a
+# user's machine their own GTK, built for their own glibc, is what loads.
+RELEASE_DIR := releases/$(VERSION)
+RELEASE_NAME := ReSynth-Studio-$(VERSION)
+RELEASE_STAGE := target/release-stage
+PORTABLE_GLIBC := 2.31
+PORTABLE_DIR := target/portable
+PORTABLE_CARGO = PKG_CONFIG_ALLOW_CROSS=1 cargo zigbuild --release \
+	--target $(LINUX_TARGET).$(PORTABLE_GLIBC) --target-dir $(PORTABLE_DIR)
+THIRD_PARTY = python3 tools/third-party-licenses.py
+# Release README.txt for one platform ($(1)), with the version filled in.
+release_readme = sed 's/@VERSION@/$(VERSION)/' packaging/release/readme/head.txt \
+	packaging/release/readme/$(1).txt packaging/release/readme/tail.txt
+
+.PHONY: release release-check release-linux release-windows release-macos
+
+release: release-linux release-windows release-macos
+	cd $(RELEASE_DIR) && sha256sum $(RELEASE_NAME)-*.zip > SHA256SUMS
+	@cat $(RELEASE_DIR)/SHA256SUMS
+
+release-check:
+	@test -n "$(HAVE_FOURIER_SRC)" || { \
+		echo "error: a release builds the plugin, so it needs $(FOURIER_DIR)"; exit 1; }
+	@command -v cargo-zigbuild >/dev/null || { echo "error: run 'cargo install cargo-zigbuild'"; exit 1; }
+	@command -v zip >/dev/null || { echo "error: zip not found"; exit 1; }
+	@mkdir -p $(RELEASE_DIR)
+
+release-linux: release-check
+	cd $(FOURIER_DIR) && $(PORTABLE_CARGO)
+	RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-undefined" $(PORTABLE_CARGO) --bin resynth-studio
+	rm -rf $(RELEASE_STAGE)/linux
+	mkdir -p $(RELEASE_STAGE)/linux/$(RELEASE_NAME)/internal_plugins
+	cp $(PORTABLE_DIR)/$(LINUX_TARGET)/release/resynth-studio $(RELEASE_STAGE)/linux/$(RELEASE_NAME)/
+	cp $(FOURIER_DIR)/$(PORTABLE_DIR)/$(LINUX_TARGET)/release/liblesynth_fourier.so \
+		$(RELEASE_STAGE)/linux/$(RELEASE_NAME)/internal_plugins/
+	cp LICENSE $(RELEASE_STAGE)/linux/$(RELEASE_NAME)/
+	$(call release_readme,linux) > $(RELEASE_STAGE)/linux/$(RELEASE_NAME)/README.txt
+	$(THIRD_PARTY) $(RELEASE_STAGE)/linux/$(RELEASE_NAME)/THIRD-PARTY-LICENSES.txt \
+		$(LINUX_TARGET) . $(FOURIER_DIR)
+	rm -f $(RELEASE_DIR)/$(RELEASE_NAME)-linux-x86_64.zip
+	cd $(RELEASE_STAGE)/linux && zip -q -r -X -9 \
+		$(CURDIR)/$(RELEASE_DIR)/$(RELEASE_NAME)-linux-x86_64.zip $(RELEASE_NAME)
+
+# Text files get CRLF line endings, which is what Notepad on an older Windows
+# needs to show them as more than one line.
+release-windows: release-check build-windows
+	rm -rf $(RELEASE_STAGE)/windows
+	mkdir -p $(RELEASE_STAGE)/windows/$(RELEASE_NAME)/internal_plugins
+	cp target/$(WIN_TARGET)/release/resynth-studio.exe $(RELEASE_STAGE)/windows/$(RELEASE_NAME)/
+	cp $(INTERNAL_PLUGINS)/lesynth_fourier.dll $(RELEASE_STAGE)/windows/$(RELEASE_NAME)/internal_plugins/
+	sed 's/$$/\r/' LICENSE > $(RELEASE_STAGE)/windows/$(RELEASE_NAME)/LICENSE.txt
+	$(call release_readme,windows) | sed 's/(LICENSE)/(LICENSE.txt)/; s/$$/\r/' \
+		> $(RELEASE_STAGE)/windows/$(RELEASE_NAME)/README.txt
+	$(THIRD_PARTY) $(RELEASE_STAGE)/windows/THIRD-PARTY-LICENSES.txt $(WIN_TARGET) . $(FOURIER_DIR)
+	sed 's/$$/\r/' $(RELEASE_STAGE)/windows/THIRD-PARTY-LICENSES.txt \
+		> $(RELEASE_STAGE)/windows/$(RELEASE_NAME)/THIRD-PARTY-LICENSES.txt
+	rm $(RELEASE_STAGE)/windows/THIRD-PARTY-LICENSES.txt
+	rm -f $(RELEASE_DIR)/$(RELEASE_NAME)-windows-x86_64.zip
+	cd $(RELEASE_STAGE)/windows && zip -q -r -X -9 \
+		$(CURDIR)/$(RELEASE_DIR)/$(RELEASE_NAME)-windows-x86_64.zip $(RELEASE_NAME)
+
+# The notarised zip from sign-macos, wrapped with the licence and readme on the
+# Mac (tools/macos-release-zip.sh says why there).
+release-macos: release-check sign-macos
+	rm -rf $(RELEASE_STAGE)/macos
+	mkdir -p $(RELEASE_STAGE)/macos
+	cp LICENSE $(RELEASE_STAGE)/macos/
+	$(call release_readme,macos) > $(RELEASE_STAGE)/macos/README.txt
+	$(THIRD_PARTY) $(RELEASE_STAGE)/macos/THIRD-PARTY-LICENSES.txt $(MAC_ARM) . $(FOURIER_DIR)
+	MAC_SIGN_ENV=$(MAC_SIGN_ENV) tools/macos-release-zip.sh \
+		$(MAC_OUT)/$(RELEASE_NAME)-macos.zip $(RELEASE_STAGE)/macos $(RELEASE_NAME) \
+		$(RELEASE_DIR)/$(RELEASE_NAME)-macos-universal.zip
+
 # ── Buzz debugging ──────────────────────────────────────────────────────────
 
 # Render a source offline through a real plugin instance — no cpal, no engine

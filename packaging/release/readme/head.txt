@@ -1,0 +1,9 @@
+ReSynth Studio @VERSION@ — pre-release
+==========================================
+
+A small DAW that turns any recording (.wav / .mp3 / .m4a) into a playable,
+editable additive-synthesis instrument through its embedded LeSynth Fourier
+plugin, and hosts VST3, CLAP, VST2 and LV2 plugins.
+
+Source, issues and documentation: https://github.com/hlavnjak/resynth-studio
+

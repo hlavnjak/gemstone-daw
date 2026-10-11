@@ -1,0 +1,12 @@
+Running it (Linux, x86_64)
+--------------------------
+Unpack the folder anywhere and run ./resynth-studio. Keep internal_plugins/
+next to the binary: it holds the LeSynth Fourier plugin.
+
+Needs glibc 2.31 or newer (Ubuntu 20.04, Debian 11, Fedora 32 and later),
+GTK 3, ALSA (PipeWire and PulseAudio provide it) and OpenGL. On Debian/Ubuntu:
+    sudo apt install libgtk-3-0 libasound2 libgl1
+It runs on X11 and Wayland.
+
+A log, resynth-studio.log, is written to the folder you start it from (or to
+/tmp when that folder is not writable).

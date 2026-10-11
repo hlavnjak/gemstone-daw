@@ -241,6 +241,8 @@ Makefile            # builds the app; (re)builds + embeds the VST3 when its sour
 packaging/macos/    # Info.plist template for the macOS app bundle
 tools/zig-macos-cc.sh  # macOS cross linker (zig, honouring the minimum macOS)
 tools/macos-sign*.sh   # sign + notarise the app on a Mac over ssh (make sign-macos)
+tools/macos-release-zip.sh, tools/third-party-licenses.py  # make release
+packaging/release/   # release README parts, licence-notice header, standard licence texts
 internal_plugins/   # the embedded LeSynth Fourier VST3 (committed precompiled)
 src/
   main.rs                                 # eframe entry point
@@ -340,6 +342,19 @@ the first time. `make sign-macos` signs it with a Developer ID, notarises and
 staples it on a Mac reached over ssh, and brings back a zip that opens with a
 double-click. Embedding a plugin's own editor window is not implemented on
 macOS yet — the editor button reports that instead of opening one.
+
+## Release (`make release`)
+
+`make release` writes `releases/<version>/` with one zip per platform —
+`ReSynth-Studio-<version>-linux-x86_64.zip`, `-windows-x86_64.zip` and
+`-macos-universal.zip` — and `SHA256SUMS`. Each zip is a single folder holding
+the app, its embedded plugin, `LICENSE`, a `README.txt` for that platform and
+`THIRD-PARTY-LICENSES.txt`, generated from `cargo metadata` for that target.
+
+It needs the lesynth-fourier source beside this repo, `zip`, cargo-zigbuild,
+and the Mac that `make sign-macos` uses. The Linux binaries are linked by zig
+against glibc 2.31 (Ubuntu 20.04 / Debian 11 and later) rather than this
+machine's glibc, and the macOS zip is the notarised app, re-zipped on the Mac.
 
 ## License
 

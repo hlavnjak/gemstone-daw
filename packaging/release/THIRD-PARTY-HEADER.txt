@@ -1,0 +1,29 @@
+Third-party software in ReSynth Studio
+========================================================================
+
+ReSynth Studio and the LeSynth Fourier plugin embedded in it
+(internal_plugins/) are Copyright 2026 Jakub Hlavnicka and licensed under the
+Apache License 2.0 (see LICENSE).
+
+They are built from the following open-source Rust crates, each under its own
+licence, reproduced below. Two points need attention:
+
+* GPLv3: the embedded LeSynth Fourier plugin (liblesynth_fourier.so /
+  lesynth_fourier.dll / liblesynth_fourier.dylib) exports its VST3 interface
+  through vst3-sys, which is licensed under the GNU GPL version 3. That plugin
+  binary is therefore distributed under the terms of the GPLv3 (the Apache-2.0
+  code in it is GPLv3-compatible). Its complete corresponding source code is
+  public:
+    https://github.com/hlavnjak/lesynth-fourier
+    https://github.com/hlavnjak/nih-plug (branch reduce_egui_high_cpu_consumption)
+    https://github.com/hlavnjak/baseview (branch reactive-idle-wait)
+    https://github.com/hlavnjak/egui-baseview (branch reactive-idle-wait)
+    https://github.com/robbert-vdh/vst3-sys (branch fix/drop-box-from-raw)
+  with the exact revisions pinned in lesynth-fourier's Cargo.lock.
+
+* MPL-2.0: the symphonia crates (audio decoding) are used unmodified; their
+  source is available from https://github.com/pdeljanov/Symphonia and
+  crates.io.
+
+ReSynth Studio's own source: https://github.com/hlavnjak/resynth-studio
+

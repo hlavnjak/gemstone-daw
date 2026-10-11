@@ -59,6 +59,17 @@ Output: `target/universal-apple-darwin/release/ReSynth Studio.app`. Linking goes
 through `tools/zig-macos-cc.sh`, because plain `cargo zigbuild` stamps every
 binary "minimum macOS 13" whatever `MACOSX_DEPLOYMENT_TARGET` says.
 
+### Release
+
+```sh
+make release        # releases/<version>/ReSynth-Studio-<version>-{linux-x86_64,windows-x86_64,macos-universal}.zip + SHA256SUMS
+```
+
+Linux release binaries are zigbuilt against glibc 2.31 into `target/portable`
+(not the `make build` ones); macOS goes through `sign-macos` and is re-zipped on
+the Mac (`tools/macos-release-zip.sh`); `tools/third-party-licenses.py` writes
+the licence notices.
+
 ## Commits
 
 - **Never** add a Claude signature, watermark, or "Generated with Claude Code" /

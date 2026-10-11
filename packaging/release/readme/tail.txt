@@ -1,0 +1,17 @@
+
+Your files
+----------
+Projects are folders holding a .rsyn file (projects saved as .gmstn by the
+earlier "Gemstone DAW" builds still open). Recordings go to ReSynthRecordings
+in your home folder.
+
+Licence
+-------
+ReSynth Studio is licensed under the Apache License 2.0 (LICENSE).
+THIRD-PARTY-LICENSES.txt lists the open-source components it is built from and
+their licences. Note that the embedded LeSynth Fourier plugin is distributed
+under the GPLv3 because of its VST3 bindings; see that file for details and
+for where its source code is.
+
+This is a pre-release: formats and the interface may still change, and it
+comes with no warranty.

@@ -1,0 +1,10 @@
+Running it (Windows 10/11, 64-bit)
+----------------------------------
+Unpack the folder anywhere and run resynth-studio.exe. Keep internal_plugins\
+next to the .exe: it holds the LeSynth Fourier plugin.
+
+The .exe is not code-signed yet, so Windows SmartScreen may warn that it is
+from an unknown publisher: click "More info" and then "Run anyway".
+
+A log, resynth-studio.log, is written to the folder you start it from (or to
+the temp folder when that folder is not writable).
