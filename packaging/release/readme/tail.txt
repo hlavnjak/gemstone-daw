@@ -13,5 +13,5 @@ their licences. Note that the embedded LeSynth Fourier plugin is distributed
 under the GPLv3 because of its VST3 bindings; see that file for details and
 for where its source code is.
 
-This is a pre-release: formats and the interface may still change, and it
-comes with no warranty.
+This is an early version: the interface may still change, and it comes with
+no warranty.

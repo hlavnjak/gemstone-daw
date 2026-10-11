@@ -1,8 +1,7 @@
 # ReSynth Studio
 
-> **Pre-release public draft.** ReSynth Studio is under active development and the
-> interface and formats may change. It is published early to share the core idea
-> — additive **resynthesis** of arbitrary audio.
+> **Early version (0.x).** ReSynth Studio is under active development, so the
+> interface may still change. Projects saved by older versions keep opening.
 
 ReSynth Studio is a small DAW written in **Rust** with an `egui`/`eframe` GUI. It
 hosts **VST3, CLAP, VST2 and LV2** plugins (and **Audio Units** on macOS) and
@@ -188,15 +187,16 @@ published there as a wav track — and any number of rows may share the same one
   a plugin file anywhere else. Every format plays notes, renders in the
   Composer and an exported `.wav`, keeps its knobs in the track (and in a saved
   project, as the plugin's own state beside the manifest), and shows its own
-  editor in a native window (raw X11 on Linux, raw Win32 on Windows):
+  editor in a native window (raw X11 on Linux, raw Win32 on Windows, an
+  NSWindow on macOS):
 
   | Format | Linux | Windows | macOS | Looked for in |
   |---|---|---|---|---|
-  | **VST3** | ✓ | ✓ | ✓ (no editor yet) | `VST3_PATH`, `~/.vst3`, `/usr/lib/vst3`; `%CommonProgramFiles%\VST3`; `~/Library/Audio/Plug-Ins/VST3` |
-  | **CLAP** | ✓ | ✓ | ✓ (no editor yet) | `CLAP_PATH`, `~/.clap`, `/usr/lib/clap`; `%CommonProgramFiles%\CLAP`; `~/Library/Audio/Plug-Ins/CLAP` |
-  | **VST2** | ✓ | ✓ | ✓ (no editor yet) | `VST_PATH`, `~/.vst`, `/usr/lib/vst`, `/usr/lib/lxvst`; `%ProgramFiles%\VSTPlugins`, `…\Steinberg\VSTPlugins`; `~/Library/Audio/Plug-Ins/VST` |
-  | **LV2** | ✓ | ✓ | ✓ (no editor yet) | `LV2_PATH`, `~/.lv2`, `/usr/lib/lv2`; `%APPDATA%\LV2`; `~/Library/Audio/Plug-Ins/LV2` |
-  | **Audio Unit** (v2) | — | — | ✓ (no editor yet) | the system's component registry |
+  | **VST3** | ✓ | ✓ | ✓ | `VST3_PATH`, `~/.vst3`, `/usr/lib/vst3`; `%CommonProgramFiles%\VST3`; `~/Library/Audio/Plug-Ins/VST3` |
+  | **CLAP** | ✓ | ✓ | ✓ (no editor on macOS yet) | `CLAP_PATH`, `~/.clap`, `/usr/lib/clap`; `%CommonProgramFiles%\CLAP`; `~/Library/Audio/Plug-Ins/CLAP` |
+  | **VST2** | ✓ | ✓ | ✓ | `VST_PATH`, `~/.vst`, `/usr/lib/vst`, `/usr/lib/lxvst`; `%ProgramFiles%\VSTPlugins`, `…\Steinberg\VSTPlugins`; `~/Library/Audio/Plug-Ins/VST` |
+  | **LV2** | ✓ | ✓ | ✓ | `LV2_PATH`, `~/.lv2`, `/usr/lib/lv2`; `%APPDATA%\LV2`; `~/Library/Audio/Plug-Ins/LV2` |
+  | **Audio Unit** (v2) | — | — | ✓ (no editor on macOS yet) | the system's component registry |
 
   Each format is in `src/plugin/` (VST3 in `src/vst/`), behind one
   `PluginInstance`, one `BlockProcessor` that drives any of them a block at a

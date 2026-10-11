@@ -1,5 +1,5 @@
-ReSynth Studio @VERSION@ — pre-release
-==========================================
+ReSynth Studio @VERSION@
+======================
 
 A small DAW that turns any recording (.wav / .mp3 / .m4a) into a playable,
 editable additive-synthesis instrument through its embedded LeSynth Fourier
