@@ -1,10 +1,10 @@
-# Gemstone DAW
+# ReSynth Studio
 
-> **Pre-release public draft.** Gemstone DAW is under active development and the
+> **Pre-release public draft.** ReSynth Studio is under active development and the
 > interface and formats may change. It is published early to share the core idea
 > — additive **resynthesis** of arbitrary audio.
 
-Gemstone DAW is a small DAW written in **Rust** with an `egui`/`eframe` GUI. It
+ReSynth Studio is a small DAW written in **Rust** with an `egui`/`eframe` GUI. It
 hosts **VST3, CLAP, VST2 and LV2** plugins (and **Audio Units** on macOS) and
 ships with an embedded **LeSynth Fourier** additive
 synthesizer, which powers its headline feature: turning any audio file into a
@@ -227,7 +227,10 @@ published there as a wav track — and any number of rows may share the same one
   would offer); `tests/third_party_plugins.rs` loads and renders what is
   installed, in every format.
 - **MIDI input** — pick a USB keyboard / port, connect, refresh.
-- **Logging** to `gemstone-daw.log`.
+- **Logging** to `resynth-studio.log`.
+- **Formerly Gemstone DAW.** Projects saved under the old name (`.gmstn`) still
+  open; saving one writes a `.rsyn` beside it. Takes recorded into
+  `~/GemstoneRecordings` are still found; new ones go to `~/ReSynthRecordings`.
 
 ## Project layout
 
@@ -279,10 +282,10 @@ make clean      # cargo clean (keeps the committed plugin binaries)
 make clean-all  # also clean ../lesynth-fourier if it is checked out alongside
 ```
 
-The binary lands at `target/release/gemstone-daw`. The app is GUI-only and needs
+The binary lands at `target/release/resynth-studio`. The app is GUI-only and needs
 a display. The embedded plugin is loaded from the committed
 `internal_plugins/liblesynth_fourier.so`, so you do **not** need the
-lesynth-fourier source tree just to run Gemstone DAW.
+lesynth-fourier source tree just to run ReSynth Studio.
 
 ### Rebuilding the embedded plugin (developers)
 
@@ -305,7 +308,7 @@ make build-windows    # build the app + embed the VST3 .dll
 make fourier-windows  # build only the VST3 plugin for Windows
 ```
 
-Output: `target/x86_64-pc-windows-gnu/release/gemstone-daw.exe`.
+Output: `target/x86_64-pc-windows-gnu/release/resynth-studio.exe`.
 
 ## macOS cross build (from Linux via zig)
 
@@ -329,10 +332,10 @@ make build-macos    # build both slices, lipo them, assemble the .app
 make fourier-macos  # build only the universal VST3 plugin .dylib
 ```
 
-Output: `target/universal-apple-darwin/release/Gemstone DAW.app` (and the bare
+Output: `target/universal-apple-darwin/release/ReSynth Studio.app` (and the bare
 universal binary beside it). The arm64 slice is ad-hoc signed by the linker,
 which is what Apple silicon requires to run it at all; that app is not notarised,
-so a downloaded copy needs `xattr -cr "Gemstone DAW.app"` (or right-click → Open)
+so a downloaded copy needs `xattr -cr "ReSynth Studio.app"` (or right-click → Open)
 the first time. `make sign-macos` signs it with a Developer ID, notarises and
 staples it on a Mac reached over ssh, and brings back a zip that opens with a
 double-click. Embedding a plugin's own editor window is not implemented on

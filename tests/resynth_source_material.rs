@@ -49,9 +49,9 @@
 
 use std::path::{Path, PathBuf};
 
-use gemstone_daw::analysis;
-use gemstone_daw::audio::{decode_audio_file, DecodedAudio};
-use gemstone_daw::vst::{class_ids, Vst3Instance};
+use resynth_studio::analysis;
+use resynth_studio::audio::{decode_audio_file, DecodedAudio};
+use resynth_studio::vst::{class_ids, Vst3Instance};
 
 const NUM_HARMONICS: usize = 256;
 

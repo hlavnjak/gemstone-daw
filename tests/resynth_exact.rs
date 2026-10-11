@@ -4,9 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use gemstone_daw::analysis;
-use gemstone_daw::audio::decode_audio_file;
-use gemstone_daw::vst::{class_ids, Vst3Instance};
+use resynth_studio::analysis;
+use resynth_studio::audio::decode_audio_file;
+use resynth_studio::vst::{class_ids, Vst3Instance};
 
 const NUM_HARMONICS: usize = 256;
 
@@ -95,7 +95,7 @@ fn resynthesis_reproduces_every_source_file() {
 /// a track sounded worse after saving it than before.
 #[test]
 fn a_saved_track_reloads_with_its_exact_inverse() {
-    use gemstone_daw::track_format::TrackState;
+    use resynth_studio::track_format::TrackState;
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let wav = root.join("D5.wav");
@@ -145,7 +145,7 @@ fn a_saved_track_reloads_with_its_exact_inverse() {
     assert!(reloaded.supports_exact_inverse());
 
     // Invert the *reloaded* grid and compare against the source file.
-    let restored = gemstone_daw::vst::AnalysisGrid {
+    let restored = resynth_studio::vst::AnalysisGrid {
         num_harmonics: reloaded.num_harmonics,
         num_buckets: reloaded.num_buckets,
         amplitude: reloaded.amplitude.clone(),

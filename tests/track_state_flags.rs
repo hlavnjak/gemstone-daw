@@ -19,8 +19,8 @@
 
 use std::path::PathBuf;
 
-use gemstone_daw::track_format::TrackState;
-use gemstone_daw::vst::{class_ids, next_instance_token, Vst3Instance};
+use resynth_studio::track_format::TrackState;
+use resynth_studio::vst::{class_ids, next_instance_token, Vst3Instance};
 
 /// The plugin's grid is this many harmonics tall whatever is imported into it,
 /// so the flags it reports are this long too.

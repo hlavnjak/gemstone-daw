@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use gemstone_daw::gui::DawApp;
+use resynth_studio::gui::DawApp;
 
 fn init_logging() {
     let level = std::env::var("RUST_LOG")
@@ -38,9 +38,9 @@ fn init_logging() {
     let _ = dispatch.apply();
 }
 
-const LOG_FILE: &str = "gemstone-daw.log";
+const LOG_FILE: &str = "resynth-studio.log";
 
-/// The log file: `gemstone-daw.log` in the working directory (a checkout run
+/// The log file: `resynth-studio.log` in the working directory (a checkout run
 /// with `make run`), else in the platform's log folder.
 ///
 /// An app started from Finder runs with `/` as its working directory, which is
@@ -60,7 +60,7 @@ fn open_log_file() -> Option<std::fs::File> {
 #[cfg(target_os = "macos")]
 fn log_dir() -> std::path::PathBuf {
     match std::env::var_os("HOME") {
-        Some(home) => std::path::PathBuf::from(home).join("Library/Logs/Gemstone DAW"),
+        Some(home) => std::path::PathBuf::from(home).join("Library/Logs/ReSynth Studio"),
         None => std::env::temp_dir(),
     }
 }
@@ -120,7 +120,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(opening_size)
             .with_min_inner_size([700.0, 450.0])
-            .with_title("Gemstone DAW")
+            .with_title("ReSynth Studio")
             // Windows only: winit registers an OLE drop target per window, and
             // asserts that RegisterDragDrop succeeded. Under Wine that call
             // comes back E_NOINTERFACE and the process panics before the first
@@ -132,7 +132,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Gemstone DAW",
+        "ReSynth Studio",
         options,
         Box::new(move |cc| {
             // egui follows the system theme by default. Linux reports none and

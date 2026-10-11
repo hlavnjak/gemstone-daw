@@ -33,11 +33,11 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use gemstone_daw::audio::{write_wav_f32, AudioEngine};
-use gemstone_daw::gui::editor_window::open_editor_in_thread;
-use gemstone_daw::gui::track::EditorInstance;
-use gemstone_daw::midi::new_midi_queue;
-use gemstone_daw::plugin::{detect_format, scan_installed, BlockProcessor, PluginInstance};
+use resynth_studio::audio::{write_wav_f32, AudioEngine};
+use resynth_studio::gui::editor_window::open_editor_in_thread;
+use resynth_studio::gui::track::EditorInstance;
+use resynth_studio::midi::new_midi_queue;
+use resynth_studio::plugin::{detect_format, scan_installed, BlockProcessor, PluginInstance};
 
 /// The chord the render plays unless told otherwise: C major, held for a
 /// second.
@@ -169,7 +169,7 @@ fn main() {
         "--window" => match open_editor_in_thread(&plugin) {
             Ok(handle) => {
                 hold("window", &|| handle.closed.load(Ordering::Relaxed));
-                gemstone_daw::gui::editor_window::request_close(&handle.close_flag);
+                resynth_studio::gui::editor_window::request_close(&handle.close_flag);
                 let _ = handle.handle.join();
             }
             Err(e) => println!("window:   FAILED — {e:#}"),

@@ -1,5 +1,5 @@
 /target
-/gemstone-daw.log
+/resynth-studio.log
 *.log
 
 # The embedded LeSynth Fourier VST3 plugin is committed precompiled so the DAW
@@ -26,7 +26,7 @@ __pycache__/
 /packaging/macos/sign.env
 /packaging/macos/sign.env.example
 /packaging/macos/SIGNING.md
-/packaging/macos/gemstone.entitlements
+/packaging/macos/resynth-studio.entitlements
 *.p8
 *.p12
 *.cer

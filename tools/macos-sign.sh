@@ -10,7 +10,7 @@
 # Machine, identity and key come from $MAC_SIGN_ENV (packaging/macos/sign.env,
 # gitignored): MAC_SSH, SIGN_IDENTITY, NOTARY_KEY_FILE, NOTARY_KEY_ID and, for a
 # Team API key, NOTARY_ISSUER. The entitlements are read from
-# packaging/macos/gemstone.entitlements. $VERSION names the zip.
+# packaging/macos/resynth-studio.entitlements. $VERSION names the zip.
 set -euo pipefail
 
 APP=$1
@@ -27,14 +27,14 @@ for v in MAC_SSH SIGN_IDENTITY NOTARY_KEY_FILE NOTARY_KEY_ID; do
 	[ -n "${!v:-}" ] || { echo "error: $v is not set in $ENV" >&2; exit 1; }
 done
 [ -f "$NOTARY_KEY_FILE" ] || { echo "error: notary key $NOTARY_KEY_FILE not found" >&2; exit 1; }
-ENTITLEMENTS="$HERE/../packaging/macos/gemstone.entitlements"
+ENTITLEMENTS="$HERE/../packaging/macos/resynth-studio.entitlements"
 [ -f "$ENTITLEMENTS" ] || { echo "error: $ENTITLEMENTS not found" >&2; exit 1; }
 [ -d "$APP" ] || { echo "error: no app bundle at $APP (run make build-macos)" >&2; exit 1; }
 
-ZIP_NAME="Gemstone-DAW-${VERSION:-dev}-macos.zip"
+ZIP_NAME="ReSynth-Studio-${VERSION:-dev}-macos.zip"
 
 CONF=$(mktemp)
-REMOTE=$(ssh "$MAC_SSH" 'mktemp -d -t gemstone-sign')
+REMOTE=$(ssh "$MAC_SSH" 'mktemp -d -t resynth-studio-sign')
 trap 'rm -f "$CONF"; ssh "$MAC_SSH" "rm -rf $REMOTE"' EXIT
 {
 	printf 'SIGN_IDENTITY=%q\n' "$SIGN_IDENTITY"

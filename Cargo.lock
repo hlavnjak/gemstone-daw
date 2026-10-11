@@ -1030,34 +1030,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gemstone-daw"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap-sys",
- "cpal",
- "eframe",
- "egui",
- "fern",
- "libc",
- "libloading 0.7.4",
- "log",
- "midir",
- "objc2 0.5.2",
- "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
- "rfd",
- "serde_json",
- "symphonia",
- "tempfile",
- "uuid",
- "vst3",
- "winapi",
- "x11-dl",
-]
-
-[[package]]
 name = "gethostname"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2543,6 +2515,34 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "resynth-studio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap-sys",
+ "cpal",
+ "eframe",
+ "egui",
+ "fern",
+ "libc",
+ "libloading 0.7.4",
+ "log",
+ "midir",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "rfd",
+ "serde_json",
+ "symphonia",
+ "tempfile",
+ "uuid",
+ "vst3",
+ "winapi",
+ "x11-dl",
+]
 
 [[package]]
 name = "rfd"

@@ -23,7 +23,7 @@ MACOS_SDK ?= $(HOME)/.local/opt/MacOSX26.1.sdk
 MAC_CC := $(CURDIR)/tools/zig-macos-cc.sh
 LIPO ?= llvm-lipo
 MAC_OUT := target/universal-apple-darwin/release
-MAC_APP := $(MAC_OUT)/Gemstone DAW.app
+MAC_APP := $(MAC_OUT)/ReSynth Studio.app
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 FOURIER_DYLIB_X86 := $(FOURIER_DIR)/target/$(MAC_X86)/release/liblesynth_fourier.dylib
 FOURIER_DYLIB_ARM := $(FOURIER_DIR)/target/$(MAC_ARM)/release/liblesynth_fourier.dylib
@@ -158,16 +158,16 @@ build-macos: copy-internal-macos | macos-toolchain
 	$(mac_cargo_x86)
 	$(mac_cargo_arm)
 	@mkdir -p $(MAC_OUT)
-	$(LIPO) -create -output $(MAC_OUT)/gemstone-daw \
-		target/$(MAC_X86)/release/gemstone-daw target/$(MAC_ARM)/release/gemstone-daw
+	$(LIPO) -create -output $(MAC_OUT)/resynth-studio \
+		target/$(MAC_X86)/release/resynth-studio target/$(MAC_ARM)/release/resynth-studio
 	rm -rf "$(MAC_APP)"
 	mkdir -p "$(MAC_APP)/Contents/MacOS" "$(MAC_APP)/Contents/PlugIns"
-	cp $(MAC_OUT)/gemstone-daw "$(MAC_APP)/Contents/MacOS/"
+	cp $(MAC_OUT)/resynth-studio "$(MAC_APP)/Contents/MacOS/"
 	cp $(INTERNAL_PLUGINS)/liblesynth_fourier.dylib "$(MAC_APP)/Contents/PlugIns/"
 	sed -e 's/@VERSION@/$(VERSION)/' -e 's/@MIN_MACOS@/$(MAC_X86_MIN)/' \
 		packaging/macos/Info.plist > "$(MAC_APP)/Contents/Info.plist"
 	printf 'APPL????' > "$(MAC_APP)/Contents/PkgInfo"
-	@$(LIPO) -info $(MAC_OUT)/gemstone-daw
+	@$(LIPO) -info $(MAC_OUT)/resynth-studio
 	@echo "App bundle: $(MAC_APP)"
 
 # Sign with the Developer ID certificate, notarise and staple — on a real Mac

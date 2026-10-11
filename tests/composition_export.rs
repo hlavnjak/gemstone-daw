@@ -19,11 +19,11 @@
 
 use std::path::PathBuf;
 
-use gemstone_daw::audio::write_wav_i16;
-use gemstone_daw::track_format::TrackState;
-use gemstone_daw::gui::composer::player::{render_offline, PlannedNote, RowPlan};
-use gemstone_daw::gui::registry::PlaybackSource;
-use gemstone_daw::vst::class_ids;
+use resynth_studio::audio::write_wav_i16;
+use resynth_studio::track_format::TrackState;
+use resynth_studio::gui::composer::player::{render_offline, PlannedNote, RowPlan};
+use resynth_studio::gui::registry::PlaybackSource;
+use resynth_studio::vst::class_ids;
 
 /// The release the renderer plays past the last note-off, from `player`.
 const TAIL_SECS: f64 = 1.5;

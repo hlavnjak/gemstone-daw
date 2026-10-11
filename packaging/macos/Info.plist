@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>Gemstone DAW</string>
+	<string>ReSynth Studio</string>
 	<key>CFBundleDisplayName</key>
-	<string>Gemstone DAW</string>
+	<string>ReSynth Studio</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.github.hlavnjak.gemstone-daw</string>
+	<string>com.github.hlavnjak.resynth-studio</string>
 	<key>CFBundleExecutable</key>
-	<string>gemstone-daw</string>
+	<string>resynth-studio</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -23,6 +23,6 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Gemstone DAW records audio input for resynthesis.</string>
+	<string>ReSynth Studio records audio input for resynthesis.</string>
 </dict>
 </plist>

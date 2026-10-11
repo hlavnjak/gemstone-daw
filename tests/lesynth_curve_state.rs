@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use gemstone_daw::vst::{class_ids, next_instance_token, Vst3Instance};
+use resynth_studio::vst::{class_ids, next_instance_token, Vst3Instance};
 use serde_json::Value;
 
 fn load_tagged() -> Vst3Instance {

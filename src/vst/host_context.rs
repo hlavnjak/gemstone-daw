@@ -75,7 +75,7 @@ impl Class for HostApplication {
 
 impl IHostApplicationTrait for HostApplication {
     unsafe fn getName(&self, name: *mut String128) -> tresult {
-        write_string128(name, "Gemstone DAW");
+        write_string128(name, "ReSynth Studio");
         kResultOk
     }
 

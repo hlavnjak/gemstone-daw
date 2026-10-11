@@ -82,7 +82,7 @@ mod tests {
     /// The UI shows what a file is called, never where it lives.
     #[test]
     fn a_path_shows_as_its_name_alone() {
-        assert_eq!(file_label("/home/kuba/Music/My Song/My Song.gmstn"), "My Song.gmstn");
+        assert_eq!(file_label("/home/kuba/Music/My Song/My Song.rsyn"), "My Song.rsyn");
         assert_eq!(file_label("/opt/vst3/Dexed.vst3"), "Dexed.vst3");
         // A folder is named by its own last component, which is what the
         // Composer shows for a project directory.

@@ -211,7 +211,7 @@ impl Recorder {
     }
 }
 
-/// Where takes are written: `~/GemstoneRecordings`, created on demand.
+/// Where takes are written: `~/ReSynthRecordings`, created on demand.
 ///
 /// A fixed folder rather than a dialog per take — a recording is stopped with
 /// one click and must not open a file picker over whatever the user is doing —
@@ -222,9 +222,19 @@ pub fn recordings_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .context("no home directory to put recordings in")?;
-    let dir = PathBuf::from(home).join("GemstoneRecordings");
+    let dir = PathBuf::from(home).join("ReSynthRecordings");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
+}
+
+/// `~/GemstoneRecordings`, where takes went before the app was renamed from
+/// Gemstone DAW — if it is there. Never created or written: it is only
+/// searched, so a project that names a take by a path that no longer exists
+/// still finds it by name.
+pub fn legacy_recordings_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let dir = PathBuf::from(home).join("GemstoneRecordings");
+    dir.is_dir().then_some(dir)
 }
 
 #[cfg(test)]

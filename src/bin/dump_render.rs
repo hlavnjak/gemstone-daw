@@ -38,9 +38,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use gemstone_daw::analysis;
-use gemstone_daw::audio::{decode_audio_file, write_wav_f32};
-use gemstone_daw::vst::{class_ids, AnalysisGrid, Vst3Instance};
+use resynth_studio::analysis;
+use resynth_studio::audio::{decode_audio_file, write_wav_f32};
+use resynth_studio::vst::{class_ids, AnalysisGrid, Vst3Instance};
 
 const USAGE: &str = "\
 dump_render — offline LeSynth Fourier renders for buzz debugging

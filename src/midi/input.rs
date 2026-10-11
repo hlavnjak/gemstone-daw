@@ -97,7 +97,7 @@ pub fn add_midi_tap(taps: &MidiTaps) -> MidiTap {
 
 /// List available MIDI input port names.
 pub fn list_midi_ports() -> Result<Vec<String>> {
-    let midi_in = MidiInput::new("gemstone-daw-query")?;
+    let midi_in = MidiInput::new("resynth-studio-query")?;
     let ports = midi_in.ports();
     let names: Vec<String> = ports
         .iter()
@@ -135,7 +135,7 @@ pub fn spawn_midi_thread(
     octave_shift: OctaveShift,
     device_filter: Option<&str>,
 ) -> Result<MidiInputConnection<()>> {
-    let mut midi_in = MidiInput::new("gemstone-daw-midi-in")?;
+    let mut midi_in = MidiInput::new("resynth-studio-midi-in")?;
     midi_in.ignore(midir::Ignore::None);
 
     let ports = midi_in.ports();
@@ -181,7 +181,7 @@ pub fn spawn_midi_thread(
     let conn = midi_in
         .connect(
             port,
-            "gemstone-daw-midi-conn",
+            "resynth-studio-midi-conn",
             move |_stamp, message, _| {
                 if message.len() >= 3 {
                     let Some(msg) = shift_octaves(
@@ -571,7 +571,7 @@ impl MidiRouter {
     /// The connection itself: one callback per port, delivering to whoever wants
     /// that port when the message arrives.
     fn connect(&self, name: &str) -> Result<MidiInputConnection<()>> {
-        let mut midi_in = MidiInput::new("gemstone-daw-midi-in")?;
+        let mut midi_in = MidiInput::new("resynth-studio-midi-in")?;
         midi_in.ignore(midir::Ignore::None);
         let port = midi_in
             .ports()
@@ -588,7 +588,7 @@ impl MidiRouter {
         let conn = midi_in
             .connect(
                 &port,
-                "gemstone-daw-midi-conn",
+                "resynth-studio-midi-conn",
                 move |_stamp, message, _| {
                     if message.len() < 3 {
                         return;

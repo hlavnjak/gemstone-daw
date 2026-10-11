@@ -11,9 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! `.gmstn` — the Gemstone project format.
+//! `.rsyn` — the ReSynth Studio project format.
 //!
-//! A saved project is a **folder**, not a file: `MySong/` holds `MySong.gmstn`,
+//! A saved project is a **folder**, not a file: `MySong/` holds `MySong.rsyn`,
 //! one `.lsft` per LeSynth Fourier track any row plays, and one `.vststate` per
 //! plugin track — the plugin's own state, which is where it keeps the knobs
 //! the user set. A LeSynth track has both, and needs both: the `.lsft` is the
@@ -34,7 +34,7 @@
 //! would have made worse.
 //!
 //! ```text
-//! gemstone-project 1
+//! resynth-project 1
 //! name = My Song
 //! tempo = 120
 //! repeat-from = 1 none
@@ -98,10 +98,17 @@ use super::{Duration, Fraction, Item};
 
 /// What this writer produces. A reader accepts anything up to it.
 const VERSION: u32 = 1;
-const MAGIC: &str = "gemstone-project";
+const MAGIC: &str = "resynth-project";
+/// What the app wrote before it was renamed from Gemstone DAW. Same format,
+/// same version numbers — only the word on the first line differs — so it is
+/// read exactly like [`MAGIC`] and the next save writes the new one.
+const LEGACY_MAGIC: &str = "gemstone-project";
 
 /// The file extension, and what a project folder's manifest is named after.
-pub const EXTENSION: &str = "gmstn";
+pub const EXTENSION: &str = "rsyn";
+/// The extension projects were saved under as Gemstone DAW. Opened, never
+/// written: saving such a project puts a `.rsyn` beside the old file.
+pub const LEGACY_EXTENSION: &str = "gmstn";
 
 /// Where a row's sound comes from, as recorded in the manifest.
 #[derive(Clone, Debug, PartialEq)]
@@ -277,13 +284,13 @@ impl Project {
         let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
         let header = lines.next().context("empty project file")?;
         let (magic, version) = header.split_once(' ').unwrap_or((header, ""));
-        if magic != MAGIC {
-            bail!("not a Gemstone project file (first line reads {header:?})");
+        if magic != MAGIC && magic != LEGACY_MAGIC {
+            bail!("not a ReSynth Studio project file (first line reads {header:?})");
         }
         let version: u32 = version.trim().parse().context("unreadable format version")?;
         if version > VERSION {
             bail!(
-                "project was saved by a newer Gemstone ({version} > {VERSION}); \
+                "project was saved by a newer ReSynth Studio ({version} > {VERSION}); \
                  update before opening it"
             );
         }
@@ -733,7 +740,7 @@ mod tests {
     /// line with one field too many is refused rather than half-read.
     #[test]
     fn a_note_without_a_start_reads_as_the_top_of_the_file() {
-        let text = "gemstone-project 1\nname = X\n\n\
+        let text = "resynth-project 1\nname = X\n\n\
                     [row]\nsource = none\nnote = 60 0 1/4 0 none\n\
                     note = 62 0 1/4 0 none 0.5\n";
         let p = Project::parse(text).expect("parses");
@@ -783,7 +790,7 @@ mod tests {
         // A file written before the keys existed reads as the whole composition,
         // which is what those projects were played as: no start, and a stop of
         // zero, which the panel reads as the end.
-        let old = "gemstone-project 1\nname = X\ntempo = 120\n";
+        let old = "resynth-project 1\nname = X\ntempo = 120\n";
         let back = Project::parse(old).expect("parses");
         assert_eq!(back.repeat_from.units(), 0);
         assert_eq!(back.repeat_to.units(), 0);
@@ -840,7 +847,7 @@ mod tests {
     /// is exactly how a missing one arrives.
     #[test]
     fn a_row_without_the_newer_switches_takes_their_defaults() {
-        let text = "gemstone-project 1\nname = X\n\n\
+        let text = "resynth-project 1\nname = X\n\n\
                     [row]\nsource = none\ngain = 1\nnote = 60 0 1/4 0 none\n";
         let p = Project::parse(text).expect("parses");
         assert!(p.rows[0].autosave, "autosave should default on");
@@ -849,10 +856,10 @@ mod tests {
     }
 
     /// A field this build does not know must not stop it loading — that is what
-    /// lets an older Gemstone open a newer project's rows.
+    /// lets an older ReSynth Studio open a newer project's rows.
     #[test]
     fn an_unknown_field_is_skipped_not_fatal() {
-        let text = "gemstone-project 1\nname = X\nsomething_new = 4\n\n\
+        let text = "resynth-project 1\nname = X\nsomething_new = 4\n\n\
                     [row]\nsource = none\nfuture_field = yes\nnote = 60 0 1/4 0 none\n";
         let p = Project::parse(text).expect("parses");
         assert_eq!(p.name, "X");
@@ -864,9 +871,25 @@ mod tests {
     /// silently missing its notes is worse than a message.
     #[test]
     fn a_newer_format_is_refused() {
-        let err = Project::parse("gemstone-project 99\nname = X\n").unwrap_err().to_string();
-        assert!(err.contains("newer Gemstone"), "{err}");
+        let err = Project::parse("resynth-project 99\nname = X\n").unwrap_err().to_string();
+        assert!(err.contains("newer ReSynth Studio"), "{err}");
         assert!(Project::parse("something else\n").is_err());
+    }
+
+    /// A project saved as Gemstone DAW opens as it always did, and saving it
+    /// again writes the new first line.
+    #[test]
+    fn a_gemstone_project_still_opens_and_saves_as_resynth() {
+        let old = "gemstone-project 1\nname = Old\ntempo = 96\n\n\
+                   [row]\nsource = none\nnote = 60 0 1/4 0 none\n";
+        let p = Project::parse(old).expect("a Gemstone DAW project parses");
+        assert_eq!(p.name, "Old");
+        assert_eq!(p.tempo_bpm, 96.0);
+        assert_eq!(p.rows.len(), 1);
+        let text = p.to_text();
+        assert!(text.starts_with("resynth-project 1\n"), "{text}");
+        assert_eq!(Project::parse(&text).unwrap(), p);
+        assert!(Project::parse("gemstone-project 99\nname = X\n").is_err());
     }
 
     #[test]
@@ -927,7 +950,7 @@ mod tests {
     /// than being refused or half-read.
     #[test]
     fn a_lesynth_row_without_a_state_line_still_loads() {
-        let text = "gemstone-project 1\nname = X\ntempo = 120\n\n[row]\n\
+        let text = "resynth-project 1\nname = X\ntempo = 120\n\n[row]\n\
                     track = LeSynth Fourier 1\nsource = lesynth voice.lsft\n\
                     gain = 1\nlead = 0 none\n";
         let p = Project::parse(text).expect("parses");
@@ -976,7 +999,7 @@ mod folder_tests {
     use std::fs;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("gmstn-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rsyn-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1091,7 +1114,7 @@ mod folder_tests {
     #[test]
     fn a_moved_project_finds_its_wavs_and_plugins_by_name() {
         let dir = tmp("relocate");
-        let recordings = dir.join("GemstoneRecordings");
+        let recordings = dir.join("ReSynthRecordings");
         let plugins = dir.join("VST3");
         fs::create_dir_all(&recordings).unwrap();
         fs::create_dir_all(plugins.join("Vendor/Drums.vst3/Contents")).unwrap();
@@ -1111,7 +1134,7 @@ mod folder_tests {
             repeat_from: Duration::new(0, Fraction::None),
             repeat_to: Duration::new(0, Fraction::None),
             rows: vec![
-                row_with(TrackSource::Wav { path: PathBuf::from("/home/other/GemstoneRecordings/take.wav") }),
+                row_with(TrackSource::Wav { path: PathBuf::from("/home/other/ReSynthRecordings/take.wav") }),
                 row_with(vst("/home/other/.vst3/Drums.vst3")),
                 row_with(TrackSource::Wav { path: present.clone() }),
                 row_with(TrackSource::Wav { path: PathBuf::from("/home/other/lost.wav") }),

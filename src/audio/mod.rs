@@ -17,7 +17,7 @@ pub mod engine;
 pub mod limiter;
 pub mod wav;
 
-pub use capture::{input_device_names, recordings_dir, Recorder, Recording};
+pub use capture::{input_device_names, legacy_recordings_dir, recordings_dir, Recorder, Recording};
 pub use decode::{decode_audio_file, probe_duration_secs, DecodedAudio};
 pub use engine::{AudioEngine, AudioConfig};
 pub use limiter::Limiter;

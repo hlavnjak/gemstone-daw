@@ -426,10 +426,12 @@ impl DawApp {
 
         // Wavs and plugins are saved by absolute path; a project made on
         // another machine finds them by name in the folder itself, the
-        // recordings folder and the standard plugin folders.
+        // recordings folder (and the one from before the rename) and the
+        // standard plugin folders.
         use crate::plugin::{search_paths, PluginFormat};
         let wav_dirs: Vec<_> = std::iter::once(dir.clone())
             .chain(crate::audio::recordings_dir().ok())
+            .chain(crate::audio::legacy_recordings_dir())
             .collect();
         let plugin_dirs: Vec<_> = std::iter::once(dir.clone())
             .chain(
@@ -563,7 +565,7 @@ impl eframe::App for DawApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("💎 Gemstone DAW")
+                        egui::RichText::new("🌊 ReSynth Studio")
                             .heading()
                             .strong()
                             .color(egui::Color32::from_rgb(150, 200, 255)),
@@ -636,14 +638,14 @@ mod tests {
     /// track that plays that file, and saving again must write the same path.
     #[test]
     fn a_wav_row_saves_as_a_path_and_loads_back_onto_the_file() {
-        let dir = std::env::temp_dir().join("gemstone-wav-project");
+        let dir = std::env::temp_dir().join("resynth-wav-project");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let manifest = dir.join(format!("Take.{}", project::EXTENSION));
         std::fs::write(
             &manifest,
             format!(
-                "gemstone-project 1\nname = Take\ntempo = 120\n\n\
+                "resynth-project 1\nname = Take\ntempo = 120\n\n\
                  [row]\ntrack = take.wav\nsource = wav {}\ngain = 1\n\
                  lead = 0 none\nnote = 60 0 1/4 0 1/8\n",
                 d5().display()
@@ -692,13 +694,13 @@ mod tests {
     /// is what puts "⚠ missing" in its select box.
     #[test]
     fn a_missing_audio_file_leaves_the_row_asking_for_it() {
-        let dir = std::env::temp_dir().join("gemstone-wav-project-missing");
+        let dir = std::env::temp_dir().join("resynth-wav-project-missing");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let manifest = dir.join(format!("Gone.{}", project::EXTENSION));
         std::fs::write(
             &manifest,
-            "gemstone-project 1\nname = Gone\n\n\
+            "resynth-project 1\nname = Gone\n\n\
              [row]\ntrack = gone.wav\nsource = wav /nonexistent/gone.wav\n\
              note = 60 0 1/4 0 none\n",
         )

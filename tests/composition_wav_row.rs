@@ -20,9 +20,9 @@
 
 use std::path::PathBuf;
 
-use gemstone_daw::audio::write_wav_f32;
-use gemstone_daw::gui::composer::player::{render_offline, PlannedNote, RowPlan};
-use gemstone_daw::gui::registry::PlaybackSource;
+use resynth_studio::audio::write_wav_f32;
+use resynth_studio::gui::composer::player::{render_offline, PlannedNote, RowPlan};
+use resynth_studio::gui::registry::PlaybackSource;
 
 /// The release the renderer plays past the last note-off, from `player`.
 const TAIL_SECS: f64 = 1.5;
@@ -57,7 +57,7 @@ fn wav_source(path: &PathBuf) -> PlaybackSource {
 /// has silence.
 #[test]
 fn a_wav_row_renders_the_file_under_every_note() {
-    let dir = std::env::temp_dir().join("gemstone-wav-row");
+    let dir = std::env::temp_dir().join("resynth-wav-row");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("take.wav");
     let source = ramp();
@@ -118,7 +118,7 @@ fn a_wav_row_renders_the_file_under_every_note() {
 /// at different places, must play different parts of it.
 #[test]
 fn a_note_plays_the_file_from_where_its_start_points() {
-    let dir = std::env::temp_dir().join("gemstone-wav-start");
+    let dir = std::env::temp_dir().join("resynth-wav-start");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("take.wav");
     let source = ramp();
@@ -173,7 +173,7 @@ fn a_note_plays_the_file_from_where_its_start_points() {
 /// dropped, the rest plays, and the caller is told how many rows made it.
 #[test]
 fn a_missing_file_leaves_the_row_out_rather_than_failing_the_render() {
-    let present = std::env::temp_dir().join("gemstone-wav-row").join("present.wav");
+    let present = std::env::temp_dir().join("resynth-wav-row").join("present.wav");
     std::fs::create_dir_all(present.parent().unwrap()).expect("temp dir");
     write_wav_f32(&present, &ramp(), 1, RATE as u32).expect("write the source file");
 

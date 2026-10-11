@@ -271,7 +271,7 @@ unsafe extern "C" fn host_callback(
             1
         }
         AM_GET_PRODUCT_STRING => {
-            write_c_string(ptr, "Gemstone DAW", 64);
+            write_c_string(ptr, "ReSynth Studio", 64);
             1
         }
         AM_GET_VENDOR_VERSION => 100,

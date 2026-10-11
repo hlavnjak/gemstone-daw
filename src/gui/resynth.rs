@@ -785,7 +785,7 @@ impl ResynthPanel {
                          {}.",
                         capture::recordings_dir()
                             .map(|d| d.display().to_string())
-                            .unwrap_or_else(|_| "~/GemstoneRecordings".to_string())
+                            .unwrap_or_else(|_| "~/ReSynthRecordings".to_string())
                     ))
                     .clicked()
                 {

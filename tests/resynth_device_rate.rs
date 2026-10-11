@@ -13,7 +13,7 @@
 use std::f64::consts::PI;
 use std::path::PathBuf;
 
-use gemstone_daw::vst::{class_ids, Vst3Instance};
+use resynth_studio::vst::{class_ids, Vst3Instance};
 
 const NUM_HARMONICS: usize = 256;
 const F0: f64 = 590.0;
@@ -79,8 +79,8 @@ fn err_db(reference: &[f32], got: &[f32]) -> (f32, f32) {
 /// pipeline — decode, segment, analyse, invert, rate-convert — is under test.
 #[test]
 fn real_files_survive_the_device_rate() {
-    use gemstone_daw::analysis;
-    use gemstone_daw::audio::decode_audio_file;
+    use resynth_studio::analysis;
+    use resynth_studio::audio::decode_audio_file;
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let plugin = load_plugin();

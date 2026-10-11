@@ -32,9 +32,9 @@
 //! With nothing installed there is nothing to test and the test says so and
 //! passes; run it with `--nocapture` to see what it found.
 
-use gemstone_daw::gui::composer::player::{render_offline, PlannedNote, RowPlan};
-use gemstone_daw::gui::registry::PlaybackSource;
-use gemstone_daw::plugin::{scan_installed, validate, PluginFormat, PluginInstance};
+use resynth_studio::gui::composer::player::{render_offline, PlannedNote, RowPlan};
+use resynth_studio::gui::registry::PlaybackSource;
+use resynth_studio::plugin::{scan_installed, validate, PluginFormat, PluginInstance};
 
 const RATE: f64 = 44_100.0;
 const CHANNELS: usize = 2;

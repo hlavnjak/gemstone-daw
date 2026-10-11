@@ -25,12 +25,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gemstone_daw::gui::composer::player::{
+use resynth_studio::gui::composer::player::{
     CompositionPlayer, LoopSpan, PlannedNote, RowEdit, RowPlan,
 };
-use gemstone_daw::gui::registry::PlaybackSource;
-use gemstone_daw::track_format::TrackState;
-use gemstone_daw::vst::class_ids;
+use resynth_studio::gui::registry::PlaybackSource;
+use resynth_studio::track_format::TrackState;
+use resynth_studio::vst::class_ids;
 
 /// The composition loops on this, not on the last note plus its release.
 const LOOP_SECS: f64 = 1.0;

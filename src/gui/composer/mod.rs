@@ -2130,7 +2130,7 @@ impl ComposerPanel {
             )
             .on_hover_text(
                 "The project's name — also the folder it is saved in and the \
-                 .gmstn file inside it.\n\nSaving under a new name writes a new \
+                 .rsyn file inside it.\n\nSaving under a new name writes a new \
                  folder next to the old one and leaves that one untouched.",
             );
 
@@ -2148,11 +2148,11 @@ impl ComposerPanel {
             }
             if ui
                 .button("📂 Load Project")
-                .on_hover_text("Open a .gmstn project — this replaces the rows below.")
+                .on_hover_text("Open a .rsyn project (or an old .gmstn one) — this replaces the rows below.")
                 .clicked()
             {
                 if let Some(file) = rfd::FileDialog::new()
-                    .add_filter("Gemstone project", &[project::EXTENSION])
+                    .add_filter("ReSynth Studio project", &[project::EXTENSION, project::LEGACY_EXTENSION])
                     .add_filter("All files", &["*"])
                     .pick_file()
                 {
@@ -5982,13 +5982,13 @@ mod tests {
     /// TEMPORARY: render a project folder to a wav, offline. Not part of the
     /// suite (`#[ignore]`); it exists to hear a hand-written manifest.
     ///
-    ///   GEMSTONE_PROJECT=/path/to/X.gmstn GEMSTONE_OUT=/tmp/x.wav \
+    ///   RESYNTH_PROJECT=/path/to/X.rsyn RESYNTH_OUT=/tmp/x.wav \
     ///     cargo test --lib render_named_project -- --ignored --nocapture
     #[test]
     #[ignore]
     fn render_named_project() {
-        let file = std::path::PathBuf::from(std::env::var("GEMSTONE_PROJECT").unwrap());
-        let out = std::env::var("GEMSTONE_OUT").unwrap();
+        let file = std::path::PathBuf::from(std::env::var("RESYNTH_PROJECT").unwrap());
+        let out = std::env::var("RESYNTH_OUT").unwrap();
         let dir = file.parent().unwrap().to_path_buf();
         let proj = project::Project::read(&file).unwrap();
         let spu = 60.0 / (proj.tempo_bpm.max(1.0) as f64) / UNITS_PER_BEAT as f64;
@@ -6001,7 +6001,7 @@ mod tests {
             if !prow.enabled {
                 continue;
             }
-            if let Ok(solo) = std::env::var("GEMSTONE_SOLO") {
+            if let Ok(solo) = std::env::var("RESYNTH_SOLO") {
                 if solo.parse::<usize>() != Ok(i) {
                     continue;
                 }

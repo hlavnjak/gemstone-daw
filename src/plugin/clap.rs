@@ -368,7 +368,7 @@ struct Host {
     state: HostState,
 }
 
-const HOST_NAME: &CStr = c"Gemstone DAW";
+const HOST_NAME: &CStr = c"ReSynth Studio";
 const HOST_VENDOR: &CStr = c"Jakub Hlavnicka";
 const HOST_URL: &CStr = c"https://github.com/hlavnjak";
 const HOST_VERSION: &CStr = c"0.1.0";

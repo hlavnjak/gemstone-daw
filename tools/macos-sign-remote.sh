@@ -20,7 +20,7 @@ if [ "${1:-}" != --in-session ]; then
 		echo "error: nobody is logged in on the Mac's desktop. Log in there (or over" >&2
 		echo "       screen sharing), or turn on automatic login, and run again." >&2
 		exit 1; }
-	label="gemstone.sign.$$"
+	label="resynth-studio.sign.$$"
 	: > sign.log
 	cat > job.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -48,7 +48,7 @@ fi
 trap 'echo $? > sign.status' EXIT
 . ./sign.conf   # SIGN_IDENTITY NOTARY_KEY_ID NOTARY_ISSUER ZIP_NAME
 
-APP="Gemstone DAW.app"
+APP="ReSynth Studio.app"
 
 security find-identity -v -p codesigning | grep -qF -- "$SIGN_IDENTITY" || {
 	echo "error: no signing identity \"$SIGN_IDENTITY\" in the login keychain:"
@@ -61,7 +61,7 @@ echo "── signing ───────────────────�
 echo "(the first run may wait on a key-access dialog on the Mac's screen:"
 echo " enter the login password there and click Always Allow)"
 for lib in "$APP"/Contents/PlugIns/*.dylib; do sign "$lib"; done
-sign --entitlements gemstone.entitlements "$APP"
+sign --entitlements resynth-studio.entitlements "$APP"
 codesign --verify --strict --deep --verbose=2 "$APP"
 
 echo "── notarising (takes a few minutes) ────────────────────────────────"

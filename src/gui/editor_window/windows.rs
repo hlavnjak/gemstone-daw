@@ -107,7 +107,7 @@ pub fn open_editor_in_thread(plugin: &PluginInstance) -> Result<EditorHandle> {
             return;
         }
 
-        let class_name = to_wide("GemstoneDawEditorWindow");
+        let class_name = to_wide("ReSynthStudioEditorWindow");
         let window_title = to_wide(&title);
         let hinstance = GetModuleHandleW(std::ptr::null());
 
