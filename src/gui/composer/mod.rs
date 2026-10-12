@@ -1296,6 +1296,59 @@ impl ComposerPanel {
             format!("Block spans {rows} row(s), {frames} frame(s) — {} of music.", span_label(to - from));
     }
 
+    /// The one frame selected in the whole composition, as the row it is on and
+    /// where its note starts. `None` unless exactly one frame is selected
+    /// anywhere — a block of two says nothing about which one is meant.
+    fn single_selected(&self) -> Option<(usize, i64)> {
+        let mut found = None;
+        for (idx, row) in self.rows.iter().enumerate() {
+            let Some((first, last)) = row.sel_range() else {
+                continue;
+            };
+            if first != last || found.is_some() {
+                return None;
+            }
+            found = Some((idx, row.starts()[first]));
+        }
+        found
+    }
+
+    /// Set row `target`'s lead so its first note starts where the one selected
+    /// note on *another* row starts — the way to bring a part in on a cue
+    /// without counting the lengths in front of it by eye.
+    ///
+    /// Does nothing but say why unless exactly one frame is selected and it is
+    /// on a different row: a row cannot be lined up with itself, and a lead
+    /// that moved its own cue would be chasing it.
+    fn lead_from_selected(&mut self, target: usize) {
+        let Some((from, at)) = self.single_selected() else {
+            self.status = "Select exactly one note, on another row, to take the lead from.".to_string();
+            return;
+        };
+        if from == target || target >= self.rows.len() {
+            self.status = "The selected note is on this row — select one on another row.".to_string();
+            return;
+        }
+        // A lead is one length, so it can only be what the boxes can name.
+        // Anything else would leave the row off its cue by a fraction, which is
+        // the exact thing this button is for avoiding.
+        let Some(lead) = Duration::exact(at) else {
+            self.status = format!(
+                "The selected note starts {} in — further than one lead can say.",
+                span_label(at)
+            );
+            return;
+        };
+        let source = self.rows[from].label();
+        let row = &mut self.rows[target];
+        row.lead = lead;
+        self.status = format!(
+            "Lead of {} set to {} — in with the selected note on {source}.",
+            row.label(),
+            lead.label()
+        );
+    }
+
     /// Hold the block for pasting. The frames are copied with the silence in
     /// front of them, per row, so what goes back keeps the shape that was taken.
     fn copy_block(&mut self) {
@@ -2364,6 +2417,12 @@ impl ComposerPanel {
         // Deferred like the removal, and for the same reason: the status line
         // belongs to the panel, and the rows are borrowed for the whole loop.
         let mut renamed: Option<String> = None;
+        // Which row's lead button was pressed — applied after the loop, which
+        // has every row borrowed.
+        let mut derive_lead: Option<usize> = None;
+        // The row the one selected note is on, if exactly one is: every other
+        // row's lead button is live, and only those.
+        let cue_row = self.single_selected().map(|(idx, _)| idx);
         let playhead = self.playhead_units();
         // What a grid unit is worth in seconds, for the frames that have to turn
         // a stretch of a recording into a length.
@@ -2604,6 +2663,29 @@ impl ComposerPanel {
                                                 row.sel = None;
                                             }
                                         }
+                                        if ui
+                                            .add_enabled(
+                                                cue_row.is_some_and(|c| c != idx),
+                                                egui::Button::new("⤵ lead"),
+                                            )
+                                            .on_hover_text(
+                                                "Derive this row's lead from the \
+                                                 selected note: set the silence before \
+                                                 the row's first note to the time from \
+                                                 the start of the composition to that \
+                                                 note, so this row comes in with it.\n\n\
+                                                 Live only while exactly one note is \
+                                                 selected, and on another row.",
+                                            )
+                                            .on_disabled_hover_text(
+                                                "Derive this row's lead from the \
+                                                 selected note.\n\nSelect exactly one \
+                                                 note, on another row, first.",
+                                            )
+                                            .clicked()
+                                        {
+                                            derive_lead = Some(idx);
+                                        }
                                     });
                                     ui.horizontal(|ui| {
                                         ui.checkbox(&mut row.enabled, "Enabled")
@@ -2669,6 +2751,9 @@ impl ComposerPanel {
             ui.add_space(4.0);
         }
 
+        if let Some(idx) = derive_lead {
+            self.lead_from_selected(idx);
+        }
         if let Some(name) = renamed {
             self.status = format!("Renamed a row to {name}.");
             // A name the project cannot be closed and reopened with is not the
@@ -6064,5 +6149,52 @@ mod tests {
         let (samples, rows, total) = player::render_offline(plans, 44100.0, 2).unwrap();
         println!("rendered {rows}/{total} rows, {:.2}s", samples.len() as f64 / 2.0 / 44100.0);
         crate::audio::write_wav_i16(std::path::Path::new(&out), &samples, 2, 44100).unwrap();
+    }
+
+    /// The lead button lines a row up on the one note selected on another row:
+    /// the row's first note then starts exactly where that note does.
+    #[test]
+    fn lead_from_selected_starts_the_row_on_the_selected_note() {
+        let q = frac(Fraction::Quarter);
+        let e = frac(Fraction::Eighth);
+        let mut panel = panel_with_rows(&[&[(60, q, e), (62, q, e), (64, q, e)], &[(48, q, e)]]);
+        panel.rows[0].lead = Duration::new(1, Fraction::None);
+        let cue = panel.rows[0].items[2].id;
+        panel.rows[0].select_item(cue, false);
+
+        panel.lead_from_selected(1);
+
+        let want = UNITS_PER_WHOLE + 2 * (QUARTER + EIGHTH);
+        assert_eq!(panel.rows[1].lead.units(), want);
+        assert_eq!(note_starts(&panel)[1][0], note_starts(&panel)[0][2]);
+    }
+
+    /// Anything but exactly one note on another row leaves the lead alone: no
+    /// selection, a block of two, or the note being on the row itself.
+    #[test]
+    fn lead_from_selected_needs_exactly_one_note_on_another_row() {
+        let q = frac(Fraction::Quarter);
+        let e = frac(Fraction::Eighth);
+        let mut panel = panel_with_rows(&[&[(60, q, e), (62, q, e)], &[(48, q, e)]]);
+        let keep = frac(Fraction::Sixteenth);
+        panel.rows[1].lead = keep;
+
+        panel.lead_from_selected(1);
+        assert_eq!(panel.rows[1].lead, keep, "nothing selected");
+
+        panel.rows[0].select_all();
+        panel.lead_from_selected(1);
+        assert_eq!(panel.rows[1].lead, keep, "two notes selected");
+
+        panel.rows[0].sel = None;
+        let own = panel.rows[1].items[0].id;
+        panel.rows[1].select_item(own, false);
+        panel.lead_from_selected(1);
+        assert_eq!(panel.rows[1].lead, keep, "the note is on this row");
+
+        let other = panel.rows[0].items[1].id;
+        panel.rows[0].select_item(other, false);
+        panel.lead_from_selected(1);
+        assert_eq!(panel.rows[1].lead, keep, "one note on each row is two notes");
     }
 }
