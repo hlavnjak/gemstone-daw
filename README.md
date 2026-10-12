@@ -167,7 +167,10 @@ published there as a wav track — and any number of rows may share the same one
 - **Load Internal plugin** — loads the embedded LeSynth Fourier VST3
   (`internal_plugins/liblesynth_fourier.so`, committed precompiled) by its class
   ID. No separate plugin install required.
-- **A wav track is a path.** A row playing one needs no plugin at all: the
+- **A wav track travels with the project.** Saving copies the file into the
+  project folder's `audio/` and names it there, so a project keeps its
+  recordings when `~/ReSynthRecordings` (or wherever the file came from) is
+  cleaned out. A row playing one needs no plugin at all: the
   Composer decodes the file once, however many rows name it, and plays it under
   every note from that note's own start, cut to the note's length and faded a few
   milliseconds at each end so a cut cannot click. A start past the end of the

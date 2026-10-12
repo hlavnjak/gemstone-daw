@@ -20,10 +20,11 @@
 //! harmonic grid, the `.vststate` is every control that drew it (curve type,
 //! offset, granularity, and the nested-Fourier sliders), which the grid does
 //! not contain. The folder is the unit you move, copy or hand to someone else,
-//! and it carries its own sounds; what is left outside it is a third-party
-//! plugin's *binary*, and the audio file behind a wav track — neither is ours to
-//! copy, and the second is usually larger than the whole rest of the folder.
-//! Both are recorded as the path they were added from.
+//! and it carries its own sounds — the audio file behind a wav track included,
+//! copied into `audio/` on save, because a recording kept only by path is lost
+//! the day its folder is tidied away. What is left outside is a third-party
+//! plugin's *binary*, which is not ours to copy, and is recorded as the path it
+//! was added from.
 //!
 //! **The manifest is line-oriented text, deliberately.** The grids are already
 //! binary (`.lsft`); what is left is a small structure whose main job is to hold
@@ -143,11 +144,12 @@ pub enum TrackSource {
         plugin_id: Option<String>,
         state: Option<String>,
     },
-    /// An audio file played whole, as one note, by absolute path. Like a VST3's
-    /// binary and for the same reason, the file is **not** copied into the
-    /// project folder: it is the user's recording, often far larger than
-    /// everything else in the folder put together, and it is not ours to
-    /// duplicate. What is saved is the path it was first added from.
+    /// An audio file played whole, as one note. Saving copies the file into
+    /// the project folder's [`AUDIO_DIR`] (see [`bundle_audio`]) and names it
+    /// *relative* to the folder, so the folder carries its recordings the way
+    /// it carries its grids. An absolute path is a project saved before that,
+    /// or a file that was already gone when it was saved; a relative one is
+    /// resolved against the folder by [`Project::resolve_audio`].
     Wav { path: PathBuf },
     /// The row had no track assigned when it was saved.
     None,
@@ -164,8 +166,8 @@ impl TrackSource {
             Self::Vst { path, plugin_id, .. } => crate::plugin::has_file(path, plugin_id.as_deref())
                 .then(|| path.clone()),
             // The whole sound of the row: without the file there is nothing to
-            // play at all.
-            Self::Wav { path } => Some(path.clone()),
+            // play at all. Relative is inside the folder; absolute stays as is.
+            Self::Wav { path } => Some(dir.join(path)),
             Self::LeSynthDefault | Self::None => None,
         }
     }
@@ -367,6 +369,19 @@ impl Project {
         Self::parse(&text).with_context(|| format!("in {}", crate::file_label(path)))
     }
 
+    /// Make every wav source's path absolute: one saved inside the folder is
+    /// named relative to it, and everything after loading — the registry, the
+    /// missing-file search — wants the file itself.
+    pub fn resolve_audio(&mut self, dir: &Path) {
+        for row in &mut self.rows {
+            if let TrackSource::Wav { path } = &mut row.source {
+                if path.is_relative() {
+                    *path = dir.join(&*path);
+                }
+            }
+        }
+    }
+
     /// Re-point every wav and plugin source whose saved path no longer exists
     /// to an entry of the same name under `wav_dirs` / `plugin_dirs`, searched
     /// in order and up to [`RELOCATE_DEPTH`] levels deep. Returns what moved,
@@ -406,6 +421,72 @@ impl Project {
         }
         moved
     }
+}
+
+/// The sub-folder of a project that holds the audio its wav rows play.
+pub const AUDIO_DIR: &str = "audio";
+
+/// Make sure the audio file `src` is inside the project folder `dir`, and return
+/// the path the manifest should name it by — relative to `dir`.
+///
+/// A file already somewhere in the folder (a project saved before, and loaded
+/// back) is named where it is. Anything else is copied into [`AUDIO_DIR`] under
+/// its own name; a different file already holding that name keeps it, and the
+/// copy takes `name 2.wav`. A file with the same name *and* the same bytes is the
+/// copy an earlier save made, and is reused rather than copied again. `taken`
+/// is what this save has already placed, so two files that share a name never
+/// land on one copy.
+///
+/// A file that is gone cannot be copied; its path is returned unchanged, so the
+/// manifest still says what the row was looking for.
+pub fn bundle_audio(dir: &Path, src: &Path, taken: &mut Vec<PathBuf>) -> Result<PathBuf> {
+    let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let Ok(canon_src) = src.canonicalize() else {
+        return Ok(src.to_path_buf());
+    };
+    if let Ok(inside) = canon_src.strip_prefix(&canon_dir) {
+        taken.push(inside.to_path_buf());
+        return Ok(inside.to_path_buf());
+    }
+    let audio = dir.join(AUDIO_DIR);
+    std::fs::create_dir_all(&audio)
+        .with_context(|| format!("create the folder {}", crate::file_label(&audio)))?;
+    let name = src.file_name().context("an audio file with no name")?;
+    let stem = Path::new(name).file_stem().unwrap_or(name).to_string_lossy().into_owned();
+    let ext = Path::new(name).extension().map(|e| format!(".{}", e.to_string_lossy()));
+    let mut n = 1;
+    loop {
+        let file = match n {
+            1 => name.to_string_lossy().into_owned(),
+            _ => format!("{stem} {n}{}", ext.as_deref().unwrap_or("")),
+        };
+        let rel = Path::new(AUDIO_DIR).join(&file);
+        n += 1;
+        if taken.contains(&rel) {
+            continue;
+        }
+        let full = dir.join(&rel);
+        if full.exists() && !same_bytes(&full, src)? {
+            continue;
+        }
+        if !full.exists() {
+            std::fs::copy(src, &full).with_context(|| {
+                format!("copy {} into {}", crate::file_label(src), crate::file_label(&audio))
+            })?;
+        }
+        taken.push(rel.clone());
+        return Ok(rel);
+    }
+}
+
+/// Whether two files hold the same bytes — the length first, which settles it
+/// for nearly every pair without reading either.
+fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len());
+    if len(a)? != len(b)? {
+        return Ok(false);
+    }
+    Ok(std::fs::read(a)? == std::fs::read(b)?)
 }
 
 /// How deep below each directory [`Project::relocate_missing`] looks: enough
@@ -1150,6 +1231,66 @@ mod folder_tests {
         assert_eq!(p.rows[2].source, TrackSource::Wav { path: present });
         assert_eq!(p.rows[3].source, TrackSource::Wav { path: PathBuf::from("/home/other/lost.wav") });
         assert_eq!(p.rows[4].source, vst("/home/other/take.wav"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A recording saved into a project is copied into its `audio/` folder,
+    /// once: a second save reuses the copy, a different file with the same name
+    /// gets a name of its own, and a file already in the folder is named where
+    /// it is. The manifest names them all relative, so the folder moves whole.
+    #[test]
+    fn a_saved_project_carries_its_own_recordings() {
+        let dir = tmp("bundle");
+        let project = dir.join("Song");
+        fs::create_dir_all(&project).unwrap();
+        let elsewhere = dir.join("ReSynthRecordings");
+        let other = dir.join("other");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(elsewhere.join("take.wav"), b"first take").unwrap();
+        fs::write(other.join("take.wav"), b"another take").unwrap();
+
+        let mut taken = Vec::new();
+        let a = bundle_audio(&project, &elsewhere.join("take.wav"), &mut taken).unwrap();
+        let b = bundle_audio(&project, &other.join("take.wav"), &mut taken).unwrap();
+        assert_eq!(a, Path::new(AUDIO_DIR).join("take.wav"));
+        assert_eq!(b, Path::new(AUDIO_DIR).join("take 2.wav"));
+        assert_eq!(fs::read(project.join(&a)).unwrap(), b"first take");
+        assert_eq!(fs::read(project.join(&b)).unwrap(), b"another take");
+
+        // The next save, in the other order: each finds its own copy.
+        let mut taken = Vec::new();
+        let b2 = bundle_audio(&project, &other.join("take.wav"), &mut taken).unwrap();
+        let a2 = bundle_audio(&project, &elsewhere.join("take.wav"), &mut taken).unwrap();
+        assert_eq!((a2, b2), (a.clone(), b.clone()));
+        assert_eq!(fs::read_dir(project.join(AUDIO_DIR)).unwrap().count(), 2);
+
+        // Already inside: named where it is.
+        let mut taken = Vec::new();
+        let inside = bundle_audio(&project, &project.join(&a), &mut taken).unwrap();
+        assert_eq!(inside, a);
+
+        // Gone: nothing to copy, and the path still says what it was.
+        let gone = dir.join("gone.wav");
+        assert_eq!(bundle_audio(&project, &gone, &mut Vec::new()).unwrap(), gone);
+
+        // Through the manifest, and back from somewhere else.
+        let mut p = Project {
+            name: "Song".to_string(),
+            tempo_bpm: 100.0,
+            repeat_from: Duration::new(0, Fraction::None),
+            repeat_to: Duration::new(0, Fraction::None),
+            rows: vec![row_with(TrackSource::Wav { path: a.clone() })],
+        };
+        p.write(&project.join(format!("Song.{EXTENSION}"))).unwrap();
+        fs::remove_dir_all(&elsewhere).unwrap();
+        let moved = dir.join("Moved");
+        fs::rename(&project, &moved).unwrap();
+        p = Project::read(&moved.join(format!("Song.{EXTENSION}"))).unwrap();
+        p.resolve_audio(&moved);
+        let TrackSource::Wav { path } = &p.rows[0].source else { panic!() };
+        assert_eq!(fs::read(path).unwrap(), b"first take");
 
         let _ = fs::remove_dir_all(&dir);
     }

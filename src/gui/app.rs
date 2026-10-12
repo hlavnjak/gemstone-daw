@@ -337,6 +337,7 @@ impl DawApp {
         let autosave: Vec<u64> = self.composer.autosave_track_ids();
         let mut sources: std::collections::HashMap<u64, TrackSource> = Default::default();
         let mut taken: Vec<String> = Vec::new();
+        let mut taken_audio: Vec<std::path::PathBuf> = Vec::new();
         let mut written = 0usize;
 
         // One file per distinct track, however many rows share it. Read through
@@ -347,10 +348,11 @@ impl DawApp {
             // `playback_source` snapshots the live editor when one is open, so
             // what gets written is what the user can currently hear.
             let Some(src) = self.registry.playback_source(id) else { continue };
-            // A wav track is a path. Like a third-party plugin's binary the file
-            // stays where it is — it is the user's recording, and usually larger
-            // than everything else in the folder together.
+            // A wav track's file is copied into the folder, so the project
+            // keeps its recordings when the folder they were made in is gone.
+            // The track itself keeps playing the file it was opened from.
             if let Some(path) = src.wav {
+                let path = project::bundle_audio(dir, &path, &mut taken_audio)?;
                 sources.insert(id, TrackSource::Wav { path });
                 continue;
             }
@@ -424,10 +426,12 @@ impl DawApp {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        // Wavs and plugins are saved by absolute path; a project made on
-        // another machine finds them by name in the folder itself, the
-        // recordings folder (and the one from before the rename) and the
-        // standard plugin folders.
+        // A wav saved inside the folder is named relative to it. Older
+        // projects name wavs, and every project names plugins, by absolute
+        // path; one made on another machine finds them by name in the folder
+        // itself, the recordings folder (and the one from before the rename)
+        // and the standard plugin folders.
+        project.resolve_audio(&dir);
         use crate::plugin::{search_paths, PluginFormat};
         let wav_dirs: Vec<_> = std::iter::once(dir.clone())
             .chain(crate::audio::recordings_dir().ok())
@@ -642,12 +646,12 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("D5.wav")
     }
 
-    /// A wav track survives a project the way every other track does — except
-    /// that what is saved is the path to the file, since the recording is not
-    /// ours to copy into the folder. Loading it back must bind the row to a
-    /// track that plays that file, and saving again must write the same path.
+    /// A wav track survives a project the way every other track does. Loading
+    /// a project that names the file by absolute path must bind the row to a
+    /// track that plays it; saving must copy the file into the folder and name
+    /// it relative, so the project still plays once the original is gone.
     #[test]
-    fn a_wav_row_saves_as_a_path_and_loads_back_onto_the_file() {
+    fn a_wav_row_is_copied_into_the_folder_and_loads_back_onto_the_copy() {
         let dir = std::env::temp_dir().join("resynth-wav-project");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -681,20 +685,28 @@ mod tests {
             "D5.wav is 5.8 s; the project loaded it as {secs}"
         );
 
-        // And saving writes the path back out — through the app, which is what
-        // decides what a track's source is.
-        let written = app.save_project(&dir, "Take").expect("saves");
-        assert_eq!(written, 0, "a wav track writes no file into the folder");
+        // Saving copies the recording in and names the copy — through the app,
+        // which is what decides what a track's source is.
+        app.save_project(&dir, "Take").expect("saves");
+        let copy = dir.join(project::AUDIO_DIR).join("D5.wav");
+        assert_eq!(std::fs::read(&copy).expect("copied"), std::fs::read(d5()).unwrap());
         let text = std::fs::read_to_string(&manifest).expect("re-read");
         assert!(
-            text.contains(&format!("source = wav {}", d5().display())),
-            "the path did not survive the round trip: {text}"
+            text.contains(&format!("source = wav {}/D5.wav", project::AUDIO_DIR)),
+            "the manifest does not name the copy: {text}"
         );
 
-        // Loading again must not leave the first load's track behind: one file
-        // is one track, however many times a project names it.
+        // Loading again plays the copy, and must not leave the first load's
+        // track behind.
         app.load_project(&manifest).expect("loads again");
         assert_eq!(app.registry.list().len(), 1, "{:?}", app.registry.list());
+        assert!(app.registry.find_wav(&copy).is_some(), "the row does not play the copy");
+
+        // A save of the reloaded project names the copy where it is, rather than
+        // copying it into itself again.
+        app.save_project(&dir, "Take").expect("saves again");
+        let files: Vec<_> = std::fs::read_dir(dir.join(project::AUDIO_DIR)).unwrap().collect();
+        assert_eq!(files.len(), 1, "{files:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
