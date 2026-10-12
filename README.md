@@ -9,6 +9,10 @@ ships with an embedded **LeSynth Fourier** additive
 synthesizer, which powers its headline feature: turning any audio file into a
 playable, editable additive-synthesis instrument.
 
+<p align="center">
+  <img src="assets/track_0.1.0.png" alt="ReSynth Studio 0.1.0: Track Composer, MIDI and Resynthesis panels" width="800">
+</p>
+
 ## Headline feature — Resynthesis
 
 The **Resynthesis** panel (`.wav` / `.mp3` / `.m4a` → LeSynth Fourier) takes an
