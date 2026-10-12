@@ -555,6 +555,16 @@ impl eframe::App for DawApp {
         // Resynthesis panels each request a low-frequency repaint while they hold
         // an open editor, so windows the user closes directly are reaped promptly.
 
+        // Space plays and stops, as in any DAW — unless a text box is being
+        // typed in, where a space is a space. Consumed before anything is drawn,
+        // so a button that happens to have keyboard focus is not pressed by it
+        // as well.
+        if !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
+            self.composer.toggle_transport(ctx);
+        }
+
         // App title bar.
         egui::TopBottomPanel::top("title_bar")
             .frame(

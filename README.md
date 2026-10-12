@@ -155,6 +155,8 @@ published there as a wav track — and any number of rows may share the same one
   stream, one plugin instance per row, mixed with each row's own gain. The
   Composer loads its own instances, so a composition plays whether or not the
   tracks' editors are open — and when one is open, its live grid is what plays.
+  **Space** does the same: it plays when nothing is playing and stops whatever
+  is (unless a text box is being typed in).
 - **Export WAV** writes the whole composition to a 16-bit `.wav` at the output
   device's rate and channel count. It renders offline, through the same voices,
   schedule and mix the transport uses, so the file is what Play sounds like; the

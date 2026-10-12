@@ -130,8 +130,19 @@ const CARD_FILLS: [egui::Color32; 5] = [
 ];
 /// Height of one row's lane. The frames plus a little air around them.
 const ROW_H: f32 = CARD_H + 10.0;
-/// Width of the fixed row head (track select, add-note, gain).
-const HEAD_W: f32 = 284.0;
+/// The row head (name, track select, add-note, gain) takes this share of the
+/// lanes' width, between the two bounds below. Every row's head is exactly the
+/// same width, so every lane — and with it every lead frame — starts at the
+/// same x: a head sized by its own contents put a row playing a long file name
+/// a few hundred points to the right of its neighbours.
+const HEAD_FRAC: f32 = 0.3;
+/// Narrowest head: what the widest fixed line (add-note, gain, auto) needs.
+const HEAD_W_MIN: f32 = 420.0;
+/// Widest head: past this a longer track name is not worth the lane it costs.
+const HEAD_W_MAX: f32 = 640.0;
+/// Room beside a full-width box for the small button that goes with it (the
+/// rename pencil, the row's bin).
+const HEAD_BUTTON_W: f32 = 40.0;
 
 /// The loudest a row may be set to, +34 dB. Well past unity: a drum sampled
 /// quietly, or a resynthesised voice analysed well below full scale, has to
@@ -1906,6 +1917,16 @@ impl ComposerPanel {
         );
     }
 
+    /// What the space bar does: stop whatever the transport is doing — a
+    /// play, a Play still loading, a take — or, when it is doing nothing, play.
+    pub fn toggle_transport(&mut self, ctx: &egui::Context) {
+        if self.player.is_some() || self.preparing.is_some() || self.recording.is_some() {
+            self.stop_playback();
+        } else {
+            self.start_playback(ctx);
+        }
+    }
+
     fn stop_playback(&mut self) {
         // The take is closed first: the transport is the clock it is placed on,
         // so it cannot be read after the player has gone.
@@ -2423,6 +2444,9 @@ impl ComposerPanel {
         // The row the one selected note is on, if exactly one is: every other
         // row's lead button is live, and only those.
         let cue_row = self.single_selected().map(|(idx, _)| idx);
+        // One width for every head, from the width there is — less the row
+        // frame's margins, which are inside what the lanes are given.
+        let head_w = ((ui.available_width() - 12.0) * HEAD_FRAC).clamp(HEAD_W_MIN, HEAD_W_MAX);
         let playhead = self.playhead_units();
         // What a grid unit is worth in seconds, for the frames that have to turn
         // a stretch of a recording into a length.
@@ -2457,9 +2481,14 @@ impl ComposerPanel {
                         ui.horizontal_top(|ui| {
                             // ── Row head ──────────────────────────────────
                             ui.allocate_ui_with_layout(
-                                egui::vec2(HEAD_W, ROW_H),
+                                egui::vec2(head_w, ROW_H),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
+                                    // Exactly `head_w`, however short or long
+                                    // its contents: this is what lines the
+                                    // lanes up.
+                                    ui.set_min_width(head_w);
+                                    ui.set_max_width(head_w);
                                     ui.horizontal(|ui| {
                                         // The row's own name, and the form that
                                         // changes it. The box holds a draft
@@ -2475,7 +2504,7 @@ impl ComposerPanel {
                                             .add(
                                                 egui::TextEdit::singleline(&mut row.name_edit)
                                                     .id_salt(("row_name", row_id))
-                                                    .desired_width(148.0)
+                                                    .desired_width(head_w - HEAD_BUTTON_W)
                                                     .hint_text("row name"),
                                             )
                                             .on_hover_text(format!(
@@ -2551,8 +2580,21 @@ impl ComposerPanel {
                                         // again — a box first opened with two
                                         // tracks stayed two tall. A new count is
                                         // a new Area, measured afresh.
+                                        //
+                                        // Cut to the head's width: a source's
+                                        // name is often a file name plus a
+                                        // UUID, and the box would otherwise
+                                        // grow to all of it. The full name is
+                                        // in the list, which is as wide as it
+                                        // needs to be.
+                                        let combo_w = head_w - HEAD_BUTTON_W;
+                                        let full = label.clone();
+                                        ui.allocate_ui(
+                                            egui::vec2(combo_w, ui.spacing().interact_size.y),
+                                            |ui| {
                                         egui::ComboBox::from_id_salt(("track", row_id, tracks.len()))
-                                            .width(168.0)
+                                            .width(combo_w)
+                                            .truncate()
                                             .selected_text(label)
                                             .show_ui(ui, |ui| {
                                                 if tracks.is_empty() {
@@ -2573,7 +2615,11 @@ impl ComposerPanel {
                                                         row.missing = None;
                                                     }
                                                 }
-                                            });
+                                            })
+                                            .response
+                                            .on_hover_text(full);
+                                            },
+                                        );
                                         if ui
                                             .button("🗑")
                                             .on_hover_text("Remove this row")
@@ -3284,7 +3330,7 @@ impl ComposerPanel {
             let recording = self.recording.is_some();
             if ui
                 .add_enabled(!playing && !loading, egui::Button::new("▶ Play"))
-                .on_hover_text("Play every row from the start")
+                .on_hover_text("Play every row from the start.\n\nSpace plays, and stops again.")
                 .clicked()
             {
                 self.start_playback(ui.ctx());
@@ -3314,6 +3360,7 @@ impl ComposerPanel {
             // Stop also abandons a Play still loading its rows, and ends a take.
             if ui
                 .add_enabled(playing || loading || recording, egui::Button::new("■ Stop"))
+                .on_hover_text("Stop — or press Space.")
                 .clicked()
             {
                 self.stop_playback();
