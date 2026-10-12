@@ -1,8 +1,5 @@
 # ReSynth Studio
 
-> **Early version (0.x).** ReSynth Studio is under active development, so the
-> interface may still change. Projects saved by older versions keep opening.
-
 ReSynth Studio is a small DAW written in **Rust** with an `egui`/`eframe` GUI. It
 hosts **VST3, CLAP, VST2 and LV2** plugins (and **Audio Units** on macOS) and
 ships with an embedded **LeSynth Fourier** additive
