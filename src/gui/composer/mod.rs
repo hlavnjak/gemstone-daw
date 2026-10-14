@@ -50,8 +50,9 @@
 //! lengths rather than timestamps, because that is the only vocabulary the
 //! panel has, and from the same end as each other so the pair can be read
 //! against each other at a glance. A stop of zero is the end of the
-//! composition. Everything in front of the start still plays, once, on the way
-//! in. See [`ComposerPanel::repeat_span_units`].
+//! composition. Play with Repeat ticked starts at the window's start, so every
+//! pass — the first one too — is the window. See
+//! [`ComposerPanel::repeat_span_units`].
 //!
 //! **Rows can also be played in rather than written.** "Record & Play Once"
 //! plays the composition through once and captures a MIDI keyboard against it,
@@ -167,7 +168,10 @@ const DEFAULT_PITCH: u8 = 60;
 /// anyone wants first is the kick.
 const DEFAULT_DRUM_PITCH: u8 = 36;
 /// Largest whole-note count a length may carry.
-const MAX_WHOLES: u8 = 16;
+const MAX_WHOLES: u16 = 16;
+/// …except in the repeat window, whose two lengths are counted from the very
+/// beginning of the composition and so have to reach anywhere in a long piece.
+const MAX_REPEAT_WHOLES: u16 = 2048;
 /// Largest nominator — how many of its fraction a length may carry. Sixteen,
 /// like [`MAX_WHOLES`]: beyond that the whole-note box says the same thing in
 /// fewer parts.
@@ -260,7 +264,7 @@ impl Fraction {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Duration {
     /// Whole notes, `0..=`[`MAX_WHOLES`].
-    wholes: u8,
+    wholes: u16,
     /// How many of [`Duration::frac`] — the nominator, `1..=`[`MAX_NUM`].
     ///
     /// Kept canonical by [`Duration::canonicalise`]: never zero, and forced back
@@ -274,12 +278,12 @@ pub struct Duration {
 impl Duration {
     /// One of `frac` past `wholes` whole notes — the plain length, the one the
     /// nominator leaves alone.
-    const fn new(wholes: u8, frac: Fraction) -> Self {
+    const fn new(wholes: u16, frac: Fraction) -> Self {
         Self { wholes, num: 1, frac }
     }
 
     /// `num` of `frac` past `wholes` whole notes, canonicalised.
-    fn with_num(wholes: u8, num: u8, frac: Fraction) -> Self {
+    fn with_num(wholes: u16, num: u8, frac: Fraction) -> Self {
         let mut d = Self { wholes, num, frac };
         d.canonicalise();
         d
@@ -323,7 +327,7 @@ impl Duration {
                 let counted = num as i64 * frac.units();
                 let wholes = ((target - counted as f64) / UNITS_PER_WHOLE as f64)
                     .round()
-                    .clamp(0.0, MAX_WHOLES as f64) as u8;
+                    .clamp(0.0, MAX_WHOLES as f64) as u16;
                 let d = Duration::with_num(wholes, num, frac);
                 let key = ((d.units() as f64 - target).abs(), frac.denom(), num);
                 if key < best_key {
@@ -363,12 +367,12 @@ impl Duration {
         let wholes = (units / UNITS_PER_WHOLE).min(MAX_WHOLES as i64);
         let rem = units - wholes * UNITS_PER_WHOLE;
         if rem == 0 {
-            return Some(Duration::new(wholes as u8, Fraction::None));
+            return Some(Duration::new(wholes as u16, Fraction::None));
         }
         for frac in Fraction::ALL {
             let f = frac.units();
             if f > 0 && rem % f == 0 && rem / f <= MAX_NUM as i64 {
-                return Some(Duration::with_num(wholes as u8, (rem / f) as u8, frac));
+                return Some(Duration::with_num(wholes as u16, (rem / f) as u8, frac));
             }
         }
         None
@@ -391,12 +395,12 @@ impl Duration {
             }
             let wholes = (left / UNITS_PER_WHOLE).min(MAX_WHOLES as i64);
             let rem = left - wholes * UNITS_PER_WHOLE;
-            let mut d = Duration::new(wholes as u8, Fraction::None);
+            let mut d = Duration::new(wholes as u16, Fraction::None);
             for frac in Fraction::ALL {
                 let f = frac.units();
                 if f > 0 && f <= rem {
                     let num = (rem / f).min(MAX_NUM as i64) as u8;
-                    d = Duration::with_num(wholes as u8, num, frac);
+                    d = Duration::with_num(wholes as u16, num, frac);
                     break;
                 }
             }
@@ -1351,6 +1355,9 @@ impl ComposerPanel {
             return;
         };
         let source = self.rows[from].label();
+        // The cue has done its job: unticking it leaves the next lead free to
+        // be taken from another note without clearing this one by hand first.
+        self.rows[from].sel = None;
         let row = &mut self.rows[target];
         row.lead = lead;
         self.status = format!(
@@ -2213,7 +2220,7 @@ impl ComposerPanel {
                 .button("💾 Save Project")
                 .on_hover_text(format!(
                     "Write {stem}/{stem}.{ext}, with a .lsft beside it for every \
-                     LeSynth Fourier track a row plays.",
+                     LeSynth Fourier track a row plays.\n\nShortcut: Ctrl+S.",
                     ext = project::EXTENSION
                 ))
                 .clicked()
@@ -2241,6 +2248,12 @@ impl ComposerPanel {
                 );
             }
         });
+    }
+
+    /// What Ctrl+S does: exactly what the Save Project button does.
+    pub fn save_project(&mut self) {
+        let stem = project::sanitize_name(&self.project_name);
+        self.request_save(&stem);
     }
 
     /// Where to save. An existing project saves in place unless the name has
@@ -3258,8 +3271,8 @@ impl ComposerPanel {
                         "How far into the composition a repeat starts — a length \
                          from the beginning, in the same three boxes a note is \
                          written with.\n\nLeave it at zero to loop from the top. \
-                         Everything in front of the start still plays, once, on \
-                         the way in: it is an intro, not something to be skipped.",
+                         Play with Repeat ticked starts right here, the first \
+                         pass included.",
                     );
                     length_boxes(ui, "repeat_from", &mut self.repeat_from);
 
@@ -3532,7 +3545,9 @@ impl ComposerPanel {
 /// can write a dotted quarter into a row can write one into a repeat's start
 /// without learning a second way to say it. Only the layout differs — a card
 /// stacks them, a toolbar lays them out — which is why this is a function of
-/// its own rather than a call into [`ComposerPanel::frame_ui`].
+/// its own rather than a call into [`ComposerPanel::frame_ui`]. The one
+/// difference is the whole-note count, which goes up to [`MAX_REPEAT_WHOLES`]
+/// here and so is typed or dragged rather than picked off a list.
 ///
 /// Change is reported by comparing the length rather than by asking the boxes:
 /// a combo answers `changed()` for the *button*, not for the popup (see the
@@ -3540,17 +3555,15 @@ impl ComposerPanel {
 /// a change to anything but the widget.
 fn length_boxes(ui: &mut egui::Ui, salt: &'static str, dur: &mut Duration) -> bool {
     let before = *dur;
-    egui::ComboBox::from_id_salt((salt, "wholes"))
-        .width(84.0)
-        .height(260.0)
-        .selected_text(format!("{} whole", dur.wholes))
-        .show_ui(ui, |ui| {
-            for w in 0..=MAX_WHOLES {
-                ui.selectable_value(&mut dur.wholes, w, format!("{w} whole"));
-            }
-        })
-        .response
-        .on_hover_text("Whole notes — the whole part of the length");
+    // A value to drag or type rather than a list to pick from: a repeat window
+    // reaches thousands of whole notes into a long piece.
+    ui.add(
+        egui::DragValue::new(&mut dur.wholes)
+            .range(0..=MAX_REPEAT_WHOLES)
+            .speed(0.25)
+            .suffix(" whole"),
+    )
+    .on_hover_text("Whole notes — the whole part of the length. Drag or type.");
     // The greying-out gets a horizontal region of its own: a scope nested in a
     // line inherits the *line's* full height and centres what is in it there, so
     // one wrapped straight round a box drops it a few pixels below its
@@ -6214,6 +6227,7 @@ mod tests {
         let want = UNITS_PER_WHOLE + 2 * (QUARTER + EIGHTH);
         assert_eq!(panel.rows[1].lead.units(), want);
         assert_eq!(note_starts(&panel)[1][0], note_starts(&panel)[0][2]);
+        assert_eq!(panel.rows[0].sel, None, "the cue is unticked once it has been used");
     }
 
     /// Anything but exactly one note on another row leaves the lead alone: no

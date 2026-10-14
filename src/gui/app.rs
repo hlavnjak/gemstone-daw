@@ -568,6 +568,11 @@ impl eframe::App for DawApp {
         {
             self.composer.toggle_transport(ctx);
         }
+        // Ctrl+S (Cmd+S on macOS) is the Save Project button — even from a text
+        // box, since saving is never what a typed character means.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            self.composer.save_project();
+        }
 
         // App title bar.
         egui::TopBottomPanel::top("title_bar")
@@ -590,6 +595,12 @@ impl eframe::App for DawApp {
                             .italics()
                             .color(egui::Color32::from_gray(150)),
                     );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                .color(egui::Color32::from_gray(130)),
+                        );
+                    });
                 });
             });
 

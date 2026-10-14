@@ -868,6 +868,13 @@ mod tests {
         assert!(text.contains("repeat-to = 2 3/8"), "{text}");
         assert_eq!(Project::parse(&text).expect("parses"), p);
 
+        // A window reaches far past the 16 whole notes a frame can hold.
+        p.repeat_from = Duration::new(2000, Fraction::None);
+        p.repeat_to = Duration::new(2048, Fraction::None);
+        let text = p.to_text();
+        assert!(text.contains("repeat-from = 2000 none"), "{text}");
+        assert_eq!(Project::parse(&text).expect("parses"), p);
+
         // A file written before the keys existed reads as the whole composition,
         // which is what those projects were played as: no start, and a stop of
         // zero, which the panel reads as the end.

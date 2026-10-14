@@ -267,7 +267,7 @@ pub fn duration_from_units(units: i64) -> Option<Duration> {
     }
     let rest = units - wholes * UNITS_PER_WHOLE;
     let frac = Fraction::ALL.into_iter().find(|f| f.units() == rest)?;
-    Some(Duration::new(wholes as u8, frac))
+    Some(Duration::new(wholes as u16, frac))
 }
 
 /// The plain length closest to `units` — what a *note* has to settle for,
@@ -315,7 +315,7 @@ pub fn split_units(mut units: i64) -> Vec<Duration> {
             .filter(|f| f.units() > 0 && f.units() <= rest)
             .max_by_key(|f| f.units())
             .unwrap_or(Fraction::None);
-        let term = Duration::new(wholes as u8, frac);
+        let term = Duration::new(wholes as u16, frac);
         // Every term takes at least a 1/256 (the grid's own step), so this
         // cannot spin: the smallest positive `units` still yields one.
         if term.units() == 0 {

@@ -371,7 +371,11 @@ struct Host {
 const HOST_NAME: &CStr = c"ReSynth Studio";
 const HOST_VENDOR: &CStr = c"Jakub Hlavnicka";
 const HOST_URL: &CStr = c"https://github.com/hlavnjak";
-const HOST_VERSION: &CStr = c"0.1.0";
+const HOST_VERSION: &CStr =
+    match CStr::from_bytes_with_nul(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) {
+        Ok(v) => v,
+        Err(_) => panic!("the package version has a NUL in it"),
+    };
 
 impl Host {
     fn new() -> Box<Host> {

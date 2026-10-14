@@ -434,6 +434,12 @@ impl CompositionPlayer {
         // Where a repeat runs between — see `loop_window`.
         let last_event = end_sample.saturating_sub((TAIL_SECS * sample_rate).round() as u64);
         let (start, end) = loop_window(span, sample_rate, last_event);
+        // Started with Repeat already ticked, the very first pass begins where
+        // every later one does: the window is what was asked to be heard, and
+        // an intro played in front of it only the first time round is a wait.
+        if repeat.load(Ordering::Relaxed) {
+            rewind(&mut voices, &position, start);
+        }
         let loop_start = Arc::new(AtomicU64::new(start));
         let loop_sample = Arc::new(AtomicU64::new(end));
         let live: Arc<Mutex<Option<LiveUpdate>>> = Arc::new(Mutex::new(None));
@@ -489,10 +495,10 @@ impl CompositionPlayer {
                     // back now rather than play on to the end.
                     //
                     // Before the window rather than past it, the pass simply
-                    // plays on into it: what is in front of a repeat's start is
-                    // an intro, and cutting to the loop under a sound the user
-                    // is already hearing would be the one thing a transport
-                    // must not do.
+                    // plays on into it: Repeat ticked on mid-intro must not cut
+                    // to the loop under a sound the user is already hearing.
+                    // (Started with Repeat on, there is no intro — the stream
+                    // opens at the window's start.)
                     if repeat && pos >= loop_sample {
                         rewind(&mut voices, &cb_position, loop_start);
                         continue;
