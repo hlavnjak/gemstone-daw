@@ -171,19 +171,28 @@ fn main() {
                 hold("window", &|| handle.closed.load(Ordering::Relaxed));
                 resynth_studio::gui::editor_window::request_close(&handle.close_flag);
                 let _ = handle.handle.join();
+                drop(plugin);
             }
             Err(e) => println!("window:   FAILED — {e:#}"),
         },
         // Audio stream, no editor window.
-        "--audio" => match AudioEngine::start(plugin, new_midi_queue()) {
+        "--audio" => match AudioEngine::start(plugin.clone(), new_midi_queue()) {
             Ok(engine) => {
                 hold("audio", &|| false);
                 drop(engine);
+                drop(plugin);
             }
             Err(e) => println!("audio:    FAILED — {e:#}"),
         },
-        _ => {}
+        _ => drop(plugin),
     }
+    // Every mode has let go of the instance by now, on the thread the app would.
+    // If anything of the plugin outlives it in code the host has unmapped — a
+    // thread it left running, a thread-local destructor — the process dies
+    // within the next second, rather than one click later in the DAW. The host
+    // pins plugin libraries for exactly this (see `plugin::open_pinned`).
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    println!("unload:   survived 1 s after the instance was dropped");
     println!("done");
 }
 

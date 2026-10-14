@@ -175,6 +175,55 @@ pub fn detect_format(path: &Path, plugin_id: Option<&str>) -> Result<PluginForma
     library_format(path)
 }
 
+/// Open a plugin library that will run: one an instance or a UI is made from.
+/// It stays mapped for the life of the process, whatever later drops it.
+///
+/// Unloading plugin code is not safe in general, and a Rust plugin proves it on
+/// every platform. Each thread that ever ran its code — the GUI thread, a loader,
+/// the audio thread — carries thread-local destructors that point into the
+/// library, and runs them when it exits; unload first and that thread jumps into
+/// unmapped memory. A plugin thread still running at unload does the same. On
+/// Linux and macOS a lingering thread used to pin the library by accident; on
+/// Windows nothing did, and closing LeSynth's editor or stopping the Composer
+/// crashed the process. So the library is pinned on purpose: `RTLD_NODELETE`, or
+/// a pinned module handle. The plugin's own exit hook still runs; only the
+/// unmapping is skipped, and opening the same library again reuses the mapping.
+///
+/// Used for VST3 modules and CLAP libraries — the formats LeSynth ships in, so
+/// the ones where this is proven — and only where the code will run: sniffing
+/// a file for its entry point opens and closes it as usual. Not for VST2: Vital
+/// (JUCE) hangs when a second instance is made in a mapping whose first one was
+/// closed, so a VST2 still gets a fresh load each time.
+pub(crate) fn open_pinned(path: &Path) -> std::result::Result<libloading::Library, libloading::Error> {
+    #[cfg(unix)]
+    {
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_LAZY, RTLD_LOCAL};
+        // RTLD_LAZY | RTLD_LOCAL is what `Library::new` uses; NODELETE is the pin.
+        let lib = unsafe { UnixLibrary::open(Some(path), RTLD_LAZY | RTLD_LOCAL | libc::RTLD_NODELETE)? };
+        Ok(lib.into())
+    }
+    #[cfg(windows)]
+    {
+        use winapi::um::libloaderapi::{
+            GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+        };
+        let lib = unsafe { libloading::os::windows::Library::new(path)? };
+        let module = lib.into_raw();
+        let mut pinned = std::ptr::null_mut();
+        let ok = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                module as *const u16,
+                &mut pinned,
+            )
+        };
+        if ok == 0 {
+            log::warn!("could not pin {}; it will be unloaded when released", path.display());
+        }
+        Ok(unsafe { libloading::os::windows::Library::from_raw(module) }.into())
+    }
+}
+
 /// Ask a bare shared library which entry point it exports.
 fn library_format(path: &Path) -> Result<PluginFormat> {
     let library = unsafe { libloading::Library::new(path) }

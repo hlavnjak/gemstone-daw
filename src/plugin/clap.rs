@@ -132,7 +132,7 @@ impl ClapLibrary {
         }
 
         let binary = binary_path(&path)?;
-        let library = unsafe { Library::new(&binary) }
+        let library = crate::plugin::open_pinned(&binary)
             .with_context(|| format!("Failed to open {}", crate::file_label(&binary)))?;
         let entry = unsafe {
             *library

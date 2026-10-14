@@ -30,7 +30,7 @@ use winapi::um::winuser::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, PeekMessageW, PostQuitMessage, RegisterClassW, SetWindowPos, ShowWindow,
     TranslateMessage, UnregisterClassW, CW_USEDEFAULT, MSG, PM_REMOVE, SWP_NOMOVE, SWP_NOZORDER,
-    SW_SHOW, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    SW_SHOW, WM_CLOSE, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use super::EditorHandle;
@@ -48,6 +48,14 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // The user's close button. Left to `DefWindowProcW`, it destroys the
+        // window — and the plugin's child window inside it — before the plugin
+        // is told its view was `removed()`. Ending the loop instead closes the
+        // same way the host's own close does: detach, then destroy.
+        WM_CLOSE => {
+            PostQuitMessage(0);
+            0
+        }
         WM_DESTROY => {
             PostQuitMessage(0);
             0

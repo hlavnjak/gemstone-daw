@@ -438,7 +438,9 @@ unsafe fn not_a_vst3(library: &Library, path: &Path) -> anyhow::Error {
 #[cfg(unix)]
 fn open_library(path: &Path) -> Result<(Library, *mut c_void)> {
     use libloading::os::unix::{Library as UnixLibrary, RTLD_LAZY, RTLD_LOCAL};
-    let lib = unsafe { UnixLibrary::open(Some(path), RTLD_LAZY | RTLD_LOCAL)? };
+    // NODELETE: see `crate::plugin::open_pinned` — unloading a plugin's code is
+    // what crashed the host.
+    let lib = unsafe { UnixLibrary::open(Some(path), RTLD_LAZY | RTLD_LOCAL | libc::RTLD_NODELETE)? };
     let handle = lib.into_raw();
     let lib = unsafe { UnixLibrary::from_raw(handle) };
     Ok((Library::from(lib), handle))
@@ -503,7 +505,7 @@ mod macos {
 
 #[cfg(not(unix))]
 fn open_library(path: &Path) -> Result<(Library, *mut c_void)> {
-    Ok((unsafe { Library::new(path)? }, std::ptr::null_mut()))
+    Ok((crate::plugin::open_pinned(path)?, std::ptr::null_mut()))
 }
 
 #[cfg(test)]
