@@ -7,7 +7,10 @@ synthesizer, which powers its headline feature: turning any audio file into a
 playable, editable additive-synthesis instrument.
 
 <p align="center">
-  <img src="assets/track_0.1.0.png" alt="ReSynth Studio 0.1.0: Track Composer, MIDI and Resynthesis panels" width="800">
+  <img src="assets/track_0.2.0_1.png" alt="ReSynth Studio 0.2.0: Tracks panel and Track Composer rows" width="800">
+</p>
+<p align="center">
+  <img src="assets/track_0.2.0_2.png" alt="ReSynth Studio 0.2.0: Track Composer transport and repeat window, MIDI and Resynthesis panels" width="800">
 </p>
 
 ## Headline feature — Resynthesis
