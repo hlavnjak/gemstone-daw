@@ -104,6 +104,12 @@ fn wine_desktop_height() -> Option<f32> {
     None
 }
 
+/// The window icon, drawn by packaging/icon/make_icon.py.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../packaging/icon/resynth-studio-256.png"))
+        .expect("the embedded app icon is a valid PNG")
+}
+
 fn main() -> eframe::Result<()> {
     init_logging();
 
@@ -121,6 +127,11 @@ fn main() -> eframe::Result<()> {
             .with_inner_size(opening_size)
             .with_min_inner_size([700.0, 450.0])
             .with_title("ReSynth Studio")
+            // The title bar and taskbar icon on X11 and Windows. macOS ignores
+            // it and takes the bundle's AppIcon.icns; a Wayland compositor
+            // finds the icon through the app id's .desktop entry instead.
+            .with_icon(std::sync::Arc::new(app_icon()))
+            .with_app_id("resynth-studio")
             // Windows only: winit registers an OLE drop target per window, and
             // asserts that RegisterDragDrop succeeded. Under Wine that call
             // comes back E_NOINTERFACE and the process panics before the first

@@ -32,3 +32,6 @@ __pycache__/
 *.cer
 /ultra_hype.md
 /releases
+
+# Intermediate PNGs from packaging/icon/make_icon.py.
+/packaging/icon/build/

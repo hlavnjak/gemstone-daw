@@ -161,8 +161,9 @@ build-macos: copy-internal-macos | macos-toolchain
 	$(LIPO) -create -output $(MAC_OUT)/resynth-studio \
 		target/$(MAC_X86)/release/resynth-studio target/$(MAC_ARM)/release/resynth-studio
 	rm -rf "$(MAC_APP)"
-	mkdir -p "$(MAC_APP)/Contents/MacOS" "$(MAC_APP)/Contents/PlugIns"
+	mkdir -p "$(MAC_APP)/Contents/MacOS" "$(MAC_APP)/Contents/PlugIns" "$(MAC_APP)/Contents/Resources"
 	cp $(MAC_OUT)/resynth-studio "$(MAC_APP)/Contents/MacOS/"
+	cp packaging/icon/AppIcon.icns "$(MAC_APP)/Contents/Resources/"
 	cp $(INTERNAL_PLUGINS)/liblesynth_fourier.dylib "$(MAC_APP)/Contents/PlugIns/"
 	sed -e 's/@VERSION@/$(VERSION)/' -e 's/@MIN_MACOS@/$(MAC_X86_MIN)/' \
 		packaging/macos/Info.plist > "$(MAC_APP)/Contents/Info.plist"

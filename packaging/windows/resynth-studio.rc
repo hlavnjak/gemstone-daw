@@ -1,0 +1,3 @@
+// The .exe's icon; build.rs compiles this with windres. The first icon
+// resource is the one Explorer shows.
+1 ICON "resynth-studio.ico"

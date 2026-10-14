@@ -245,9 +245,12 @@ published there as a wav track — and any number of rows may share the same one
 
 ```
 Cargo.toml          # egui/eframe app crate
+build.rs            # links the icon resource into the Windows .exe
 Makefile            # builds the app; (re)builds + embeds the VST3 when its source is present
 .cargo/config.toml  # Windows cross linker
 packaging/macos/    # Info.plist template for the macOS app bundle
+packaging/icon/     # the app icon (SVG, PNG, .ico, .icns) and make_icon.py, which draws it
+packaging/windows/  # the .exe's icon resource, compiled by build.rs with windres
 tools/zig-macos-cc.sh  # macOS cross linker (zig, honouring the minimum macOS)
 tools/macos-sign*.sh   # sign + notarise the app on a Mac over ssh (make sign-macos)
 tools/macos-release-zip.sh, tools/third-party-licenses.py  # make release
