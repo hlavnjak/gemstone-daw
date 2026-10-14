@@ -370,4 +370,4 @@ machine's glibc, and the macOS zip is the notarised app, re-zipped on the Mac.
 
 Licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE).
 
-Copyright 2025 Jakub Hlavnicka.
+Copyright 2026 Jakub Hlavnicka.
