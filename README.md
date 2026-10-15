@@ -2,9 +2,14 @@
 
 ReSynth Studio is a small DAW written in **Rust** with an `egui`/`eframe` GUI. It
 hosts **VST3, CLAP, VST2 and LV2** plugins (and **Audio Units** on macOS) and
-ships with an embedded **LeSynth Fourier** additive
+ships with an embedded **[LeSynth Fourier](https://github.com/hlavnjak/lesynth-fourier)** additive
 synthesizer, which powers its headline feature: turning any audio file into a
 playable, editable additive-synthesis instrument.
+
+ReSynth Studio and LeSynth Fourier are companion projects: LeSynth Fourier
+([github.com/hlavnjak/lesynth-fourier](https://github.com/hlavnjak/lesynth-fourier))
+is the VST3/CLAP plugin that does the analysis and synthesis, and ReSynth Studio
+is the host that feeds it recordings.
 
 <p align="center">
   <img src="assets/track_0.2.0_1.png" alt="ReSynth Studio 0.2.0: Tracks panel and Track Composer rows" width="800">
@@ -303,7 +308,7 @@ lesynth-fourier source tree just to run ReSynth Studio.
 
 ### Rebuilding the embedded plugin (developers)
 
-If you have the `lesynth-fourier` source checked out next to this repo
+If you have the [`lesynth-fourier`](https://github.com/hlavnjak/lesynth-fourier) source checked out next to this repo
 (`../lesynth-fourier`), `make` automatically rebuilds it and refreshes
 `internal_plugins/` when its sources change. Otherwise the committed binary is
 used as-is.
