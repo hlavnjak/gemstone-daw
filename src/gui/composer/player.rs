@@ -218,6 +218,10 @@ enum Sound {
 /// exists.
 struct PluginSound {
     processor: BlockProcessor,
+    /// How many notes of each pitch this instance has been sent a note-on for
+    /// and not yet the note-off. A repeat's wrap releases exactly these — see
+    /// [`render_voice`].
+    sounding: [u16; 128],
 }
 
 /// A decoded audio file, played from its start for as long as the note lasts.
@@ -510,9 +514,10 @@ impl CompositionPlayer {
                     } else {
                         remaining
                     };
-                    // The last chunk of a pass takes every event still in hand.
-                    // A note ending exactly on the loop point would otherwise
-                    // have its note-off skipped and sound forever.
+                    // The last chunk of a pass releases every note still
+                    // sounding. A note ending exactly on the loop point, or
+                    // running on past it, would otherwise have its note-off
+                    // skipped and sound forever.
                     let wraps = repeat && pos + n as u64 >= loop_sample;
                     mix_block(
                         &mut voices,
@@ -1156,7 +1161,7 @@ fn prepare_voices(
             schedule,
             hits,
             cursor: 0,
-            sound: Sound::Plugin(PluginSound { processor }),
+            sound: Sound::Plugin(PluginSound { processor, sounding: [0; 128] }),
         });
         plugins.push(inst);
     }
@@ -1260,23 +1265,38 @@ fn render_voice(
     // Events due in this block, offset to their sample in it.
     let processor = &mut sound.processor;
     while let Some(&(at, pitch, on)) = voice.schedule.get(voice.cursor) {
-        // `flush_events` empties the schedule into this block: the caller is
-        // about to rewind, and anything left behind is a note-off that would
-        // never be sent.
-        if at >= block_end && !flush_events {
+        if at >= block_end {
             break;
         }
         let status = if on { 0x90 } else { 0x80 };
         let velocity = if on { NOTE_VELOCITY } else { 0 };
         // Events already due (a late start, or two in the same block) land on
-        // the block's first sample; the processor puts anything past its end
-        // on the last.
+        // the block's first sample.
         let offset = at.saturating_sub(block_start).min(u32::MAX as u64) as u32;
         if !processor.push_event(offset, [status, pitch, velocity]) {
             // The block is full; the rest wait for the next one.
             break;
         }
+        let count = &mut sound.sounding[pitch as usize & 0x7f];
+        *count = if on { count.saturating_add(1) } else { count.saturating_sub(1) };
         voice.cursor += 1;
+    }
+
+    // `flush_events`: the caller is about to rewind, so a note still sounding
+    // would never get its note-off. Release exactly those, on the block's last
+    // sample — and *only* those. Emptying the rest of the schedule instead
+    // handed the plugin every note-on and note-off after the loop's end in one
+    // burst: a drum sampler fired them all, and with the song running on past
+    // the window the burst overflowed the block's event list, leaving whatever
+    // note-on had lost its note-off ringing out of time with the loop.
+    if flush_events {
+        let last = frames.saturating_sub(1).min(u32::MAX as usize) as u32;
+        for pitch in 0..128u8 {
+            let count = &mut sound.sounding[pitch as usize];
+            while *count > 0 && processor.push_event(last, [0x80, pitch, 0]) {
+                *count -= 1;
+            }
+        }
     }
 
     // Never more than this instance was set up for (see `PluginIo::max_block`).
