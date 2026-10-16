@@ -27,8 +27,10 @@
 //! linearly between boundary values, never above what either neighbouring chunk
 //! can take. So the gain is already down when the transient lands — there is no
 //! overshoot to clip, and no sample is touched by anything but a smooth,
-//! signal-wide level change. Recovery is a slow one-pole ([`RELEASE_MS`]), so
-//! one plosive does not audibly duck what follows it.
+//! signal-wide level change. The gain then holds ([`HOLD_MS`]) before it
+//! recovers on a slow one-pole ([`RELEASE_MS`]), so one plosive does not
+//! audibly duck what follows it, and a bass note does not pump within its own
+//! cycle.
 //!
 //! The price is [`Limiter::latency_frames`] of delay, two chunks' worth, which
 //! the caller has to account for: the transport adds it to the latency it
@@ -50,6 +52,14 @@ const LOOK_MS: f64 = 2.0;
 /// syllable behind it.
 const RELEASE_MS: f64 = 120.0;
 
+/// How long the gain stays where a peak put it before the release begins. It
+/// must outlast the longest period the mix plays: a 2 ms look-ahead sees each
+/// peak of a 30 Hz sub on its own, and without a hold the gain recovered
+/// between peaks and dipped again at every one — a gain kink once a cycle,
+/// which is a buzz at the note's own pitch (an 808 at row gain 3: 185 kinks
+/// in 4 s, recurring at f0). 50 ms covers anything down to 20 Hz.
+const HOLD_MS: f64 = 50.0;
+
 /// One held chunk: its samples and the most gain they may be played at.
 struct Chunk {
     samples: Vec<f32>,
@@ -68,6 +78,10 @@ pub struct Limiter {
     ceiling: f32,
     /// Per-frame release coefficient.
     release: f32,
+    /// Frames the gain is held for after it is pulled down.
+    hold: usize,
+    /// Frames of hold still to run before the release may start.
+    hold_left: usize,
     /// Input not yet forming a whole chunk.
     pending: Vec<f32>,
     /// The chunk waiting for its successor's peak. `None` only for the very
@@ -99,6 +113,8 @@ impl Limiter {
             chunk,
             ceiling,
             release: (-1.0 / (sample_rate * RELEASE_MS / 1000.0)).exp() as f32,
+            hold: (sample_rate * HOLD_MS / 1000.0).round() as usize,
+            hold_left: 0,
             pending,
             held: None,
             boundary: 1.0,
@@ -176,13 +192,16 @@ impl Limiter {
         for frame in samples.chunks(self.channels) {
             ramp += step;
             // The ramp is the ceiling on the gain; the envelope drops to it at
-            // once and comes back slowly. So the release never lets the gain
-            // exceed what the chunk can take.
-            self.env = if ramp <= self.env {
-                ramp
+            // once, holds, and comes back slowly. So the release never lets the
+            // gain exceed what the chunk can take.
+            if ramp <= self.env {
+                self.env = ramp;
+                self.hold_left = self.hold;
+            } else if self.hold_left > 0 {
+                self.hold_left -= 1;
             } else {
-                ramp + (self.env - ramp) * self.release
-            };
+                self.env = ramp + (self.env - ramp) * self.release;
+            }
             for s in frame {
                 self.out.push_back(s * self.env);
             }
